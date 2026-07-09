@@ -1,0 +1,552 @@
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: #1a1a2e;
+  color: #e0e0e0;
+  /* 100vh on mobile Chrome/Safari resolves to the *largest* possible
+     viewport (as if the address bar were hidden), which is taller than
+     what's actually visible when the bar is showing — with overflow:
+     hidden, that difference clips #input-area off the bottom of the
+     screen entirely (real-phone finding, Milestone 7 Phase 18). 100dvh
+     tracks the real visible viewport; 100vh remains as a fallback for
+     browsers that don't support dvh yet. */
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
+}
+
+#app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  height: 100dvh;
+  max-width: 600px;
+  margin: 0 auto;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  background: #16213e;
+  border-bottom: 1px solid #0f3460;
+  flex-shrink: 0;
+}
+
+header h1 {
+  font-size: 20px;
+  font-weight: 600;
+}
+
+#header-controls {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.icon-btn {
+  /* transparent 2px border reserved up front so the pressed-state border
+     below doesn't shift the button's size/position when it appears */
+  border: 2px solid transparent;
+  background: transparent;
+  font-size: 18px;
+  line-height: 1;
+  padding: 4px 6px;
+  border-radius: 8px;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  color: #e0e0e0;
+  position: relative;
+}
+
+.icon-btn:active {
+  background: #0f3460;
+}
+
+/* Real-phone finding (Milestone 7 Phase 18, 2026-07-09): emoji glyphs
+   (🔔🔊✅) don't respond to CSS `color` — they're pre-colored glyphs, not
+   text that inherits currentColor — so tinting the icon green had no
+   visible effect, and the only remaining difference between on/off was a
+   two-shades-apart background change. Use a strong, saturated background +
+   a solid colored ring instead, so on/off is unmistakable regardless of
+   the icon glyph itself. */
+.icon-btn[aria-pressed="true"] {
+  background: rgba(74, 222, 128, 0.22);
+  border-color: #4ade80;
+}
+
+.icon-btn[aria-pressed="true"]::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #4ade80;
+  box-shadow: 0 0 0 2px #16213e;
+}
+
+#status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+}
+
+#status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+.status-connected   { background: #4ade80; }
+.status-disconnected { background: #f87171; }
+.status-error       { background: #fbbf24; }
+
+/* ---- Needs Your Attention ---- */
+
+#needs-attention {
+  /* Real-phone finding (Milestone 7 Phase 18, 2026-07-09): flex-shrink: 0
+     here meant this panel (and #active-tasks) refused to shrink even when
+     there wasn't enough real screen height to also fit #input-area below
+     it — on a real device, #input-area (message box + mic button) was
+     pushed off the bottom of the screen entirely, with no way to type or
+     answer by voice, while a question was pending. This panel already
+     scrolls internally (overflow-y: auto), so it's the right one to
+     compress first — #input-area must always stay fully visible instead. */
+  flex-shrink: 3;
+  min-height: 0;
+  background: #16213e;
+  border-bottom: 2px solid #f59e0b;
+  padding: 8px 16px;
+  max-height: 50vh;
+  overflow-y: auto;
+}
+
+#needs-attention-header h3 {
+  font-size: 13px;
+  text-transform: uppercase;
+  color: #f59e0b;
+  margin-bottom: 6px;
+}
+
+.question-item {
+  background: #1a1a2e;
+  border: 1px solid #f59e0b;
+  border-radius: 6px;
+  padding: 10px;
+  margin-bottom: 8px;
+}
+
+.question-item:last-child {
+  margin-bottom: 0;
+}
+
+.question-task-name {
+  font-size: 11px;
+  text-transform: uppercase;
+  opacity: 0.6;
+  margin-bottom: 4px;
+}
+
+.question-text {
+  font-size: 14px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.question-context {
+  font-size: 12px;
+  opacity: 0.7;
+  margin-bottom: 8px;
+  font-style: italic;
+}
+
+.question-options {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+}
+
+.option-btn {
+  padding: 8px 20px;
+  border: 1px solid #533483;
+  border-radius: 16px;
+  background: transparent;
+  color: #c084fc;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.option-btn:active {
+  background: #533483;
+  color: #fff;
+}
+
+.option-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.question-custom-answer {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 8px;
+  align-items: center;
+}
+
+.question-mic-btn {
+  flex-shrink: 0;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  background: #1a1a2e;
+  border: 1px solid #0f3460;
+  font-size: 14px;
+  padding: 0;
+}
+
+.question-answer-input {
+  flex: 1;
+  padding: 8px 12px;
+  border: 1px solid #0f3460;
+  border-radius: 16px;
+  background: #16213e;
+  color: #e0e0e0;
+  font-size: 13px;
+  outline: none;
+}
+
+.question-answer-input:focus {
+  border-color: #533483;
+}
+
+.question-send-btn {
+  padding: 8px 16px;
+  border: 1px solid #22c55e;
+  border-radius: 16px;
+  background: transparent;
+  color: #22c55e;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.question-send-btn:active {
+  background: #22c55e;
+  color: #fff;
+}
+
+.question-send-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* ---- Active Tasks ---- */
+
+#active-tasks {
+  /* See #needs-attention above — same real-phone finding and fix. */
+  flex-shrink: 3;
+  min-height: 0;
+  background: #16213e;
+  border-bottom: 1px solid #0f3460;
+  padding: 8px 16px;
+  max-height: 30vh;
+  overflow-y: auto;
+}
+
+#active-tasks-header h3 {
+  font-size: 13px;
+  text-transform: uppercase;
+  opacity: 0.7;
+  margin-bottom: 6px;
+}
+
+.task-item {
+  background: #1a1a2e;
+  border: 1px solid #0f3460;
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin-bottom: 6px;
+}
+
+.task-item:last-child {
+  margin-bottom: 0;
+}
+
+.task-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.task-name {
+  font-weight: 600;
+  flex: 1;
+}
+
+.task-elapsed {
+  opacity: 0.6;
+  font-variant-numeric: tabular-nums;
+}
+
+.task-status-badge {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 8px;
+  text-transform: uppercase;
+}
+
+.status-running {
+  background: #0f3460;
+  color: #60a5fa;
+}
+
+.status-waiting {
+  background: #78350f;
+  color: #fbbf24;
+}
+
+.task-latest {
+  font-size: 12px;
+  opacity: 0.7;
+  margin-top: 4px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-family: monospace;
+}
+
+.cancel-btn {
+  margin-top: 6px;
+  padding: 4px 12px;
+  border: 1px solid #ef4444;
+  border-radius: 12px;
+  background: transparent;
+  color: #ef4444;
+  font-size: 11px;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.cancel-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.cancel-btn:active:not(:disabled) {
+  background: #ef4444;
+  color: #fff;
+}
+
+/* ---- Permission Buttons ---- */
+
+.permission-approve-btn, .permission-deny-btn {
+  padding: 8px 20px;
+  border-radius: 16px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.permission-approve-btn {
+  border: 1px solid #22c55e;
+  background: transparent;
+  color: #22c55e;
+}
+
+.permission-approve-btn:active {
+  background: #22c55e;
+  color: #fff;
+}
+
+.permission-approve-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.permission-deny-btn {
+  border: 1px solid #ef4444;
+  background: transparent;
+  color: #ef4444;
+}
+
+.permission-deny-btn:active {
+  background: #ef4444;
+  color: #fff;
+}
+
+.permission-deny-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* ---- Timeline ---- */
+
+#timeline {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.event {
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: #16213e;
+  max-width: 85%;
+}
+
+.event-user_message {
+  align-self: flex-end;
+  background: #0f3460;
+}
+
+.event-question_asked {
+  align-self: flex-start;
+  background: #78350f;
+  border: 1px solid #f59e0b;
+}
+
+.event strong {
+  display: block;
+  font-size: 11px;
+  text-transform: uppercase;
+  opacity: 0.7;
+  margin-bottom: 4px;
+}
+
+.event p {
+  font-size: 14px;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.event small {
+  display: block;
+  font-size: 10px;
+  opacity: 0.5;
+  margin-top: 4px;
+}
+
+/* ---- Notifications ---- */
+
+.event-notification {
+  align-self: flex-start;
+  background: #16213e;
+  border: 1px solid #533483;
+}
+
+.event-priority-high {
+  border-color: #f59e0b;
+}
+
+/* ---- Deep-link highlight ---- */
+
+.deep-link-highlight {
+  animation: deep-link-flash 1.6s ease-out 2;
+}
+
+@keyframes deep-link-flash {
+  0% { box-shadow: 0 0 0 2px #c084fc; }
+  100% { box-shadow: 0 0 0 0 transparent; }
+}
+
+/* ---- Voice status ---- */
+
+#voice-status {
+  flex-shrink: 0;
+  padding: 6px 16px;
+  font-size: 12px;
+  color: #c084fc;
+  background: #16213e;
+  border-top: 1px solid #0f3460;
+}
+
+/* ---- Input ---- */
+
+#input-area {
+  display: flex;
+  gap: 8px;
+  padding: 12px 16px;
+  background: #16213e;
+  border-top: 1px solid #0f3460;
+  flex-shrink: 0;
+}
+
+#mic-btn {
+  flex-shrink: 0;
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  background: #1a1a2e;
+  border: 1px solid #0f3460;
+  font-size: 16px;
+}
+
+/* Class-based (not #mic-btn-scoped) so the per-question mic button
+   (.question-mic-btn, Milestone 7 Phase 18) gets the same listening/
+   processing/error feedback as the main mic button. */
+.mic-listening {
+  background: #7f1d1d;
+  border-color: #ef4444;
+  animation: mic-pulse 1.2s ease-in-out infinite;
+}
+
+.mic-processing {
+  background: #1e3a5f;
+  border-color: #60a5fa;
+}
+
+.mic-error {
+  background: #78350f;
+  border-color: #f59e0b;
+}
+
+@keyframes mic-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.5); }
+  50% { box-shadow: 0 0 0 8px rgba(239, 68, 68, 0); }
+}
+
+#message-input {
+  flex: 1;
+  padding: 10px 14px;
+  border: 1px solid #0f3460;
+  border-radius: 20px;
+  background: #1a1a2e;
+  color: #e0e0e0;
+  font-size: 14px;
+  outline: none;
+}
+
+#message-input:focus {
+  border-color: #533483;
+}
+
+#send-btn {
+  padding: 10px 20px;
+  border: none;
+  border-radius: 20px;
+  background: #0f3460;
+  color: #e0e0e0;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+#send-btn:active {
+  background: #533483;
+}

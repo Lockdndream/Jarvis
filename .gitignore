@@ -1,0 +1,53 @@
+# Environment
+.env
+
+# Milestone 7: local dev HTTPS cert/key (self-signed, generated per-machine)
+cert.pem
+key.pem
+
+# Milestone 7 real-phone validation: mkcert-generated dev certs (per-machine,
+# never shared/committed — the mkcert root CA private key lives outside this
+# repo entirely, under mkcert's own CAROOT, never copied here)
+certs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Database
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Testing
+.pytest_cache/
+
+# Logs (dev/test server run output)
+*.log
+
+# Local machine-specific project aliases (see app/supervisor/projects.py)
+projects.json
+
+# Backup files
+*.bak-*
+
+# Tool caches / local agent state (not project source)
+.playwright/
+.playwright-cli/
+.remember/
+.claude/settings.local.json
+.claude/scheduled_tasks.lock

@@ -1,0 +1,248 @@
+"""Bounded supervisor tool registry for Jarvis.
+
+Tools are async methods registered with name, description, JSON schema.
+The registry is populated by the Supervisor at init time with references
+to existing service layers (TaskManager, OpenCodeSupervisor).
+"""
+import json
+import logging
+
+import app.database as db
+from app.supervisor.projects import resolve_project, get_projects
+
+logger = logging.getLogger(__name__)
+
+
+class ToolRegistry:
+    """Registry of bounded supervisor tools backed by service references."""
+
+    def __init__(self, task_manager=None, opencode_supervisor=None):
+        self._tm = task_manager
+        self._oc = opencode_supervisor
+        self._tools: dict[str, dict] = {}
+        self._register_all()
+
+    def _register(self, name: str, description: str, parameters: dict, handler):
+        self._tools[name] = {
+            "description": description,
+            "parameters": parameters,
+            "handler": handler,
+        }
+
+    def get(self, name: str) -> dict | None:
+        return self._tools.get(name)
+
+    def list_definitions(self) -> list[dict]:
+        return [
+            {"name": n, "description": t["description"], "parameters": t["parameters"]}
+            for n, t in self._tools.items()
+        ]
+
+    async def call(self, name: str, args: dict) -> str:
+        tool = self.get(name)
+        if not tool:
+            return f"Error: unknown tool '{name}'"
+        try:
+            return await tool["handler"](**args)
+        except TypeError as e:
+            return f"Error: invalid arguments for '{name}': {e}"
+        except Exception as e:
+            logger.exception("Tool %s failed", name)
+            return f"Error executing '{name}': {e}"
+
+    # ── Tool implementations ─────────────────────────────────────
+
+    # task_id/question_id are exact-match DB keys the LLM must echo back in
+    # later tool calls (send_opencode_instruction, cancel_task, answer_question,
+    # ...). Never truncate them in tool output, only free-text fields.
+    async def _get_attention(self) -> str:
+        """One coherent, deduplicated attention list.
+
+        A task needing attention has exactly one reason: a pending native
+        question, or a pending native permission request. Both are stored
+        as rows in the `questions` table (permissions prefixed "Permission:"
+        — see M4 known limitation on DB conflation), which is the single
+        source of truth here. There is deliberately no second "tasks
+        waiting for user" section derived from opencode_tasks.status — that
+        status is set by the exact same code path that creates the question
+        row, so listing both would just show the same item twice
+        (Milestone 6 Phase 8 fix).
+        """
+        pending_qs = db.get_pending_questions()
+        if not pending_qs:
+            return "Nothing needs your attention right now."
+
+        lines = [f"{len(pending_qs)} item(s) need your attention:"]
+        for q in pending_qs:
+            task = db.get_task(q["task_id"])
+            tn = task["name"] if task else "Unknown"
+            src = " (OpenCode)" if db.get_opencode_task(q["task_id"]) else ""
+            if q["question"].startswith("Permission:"):
+                detail = q["question"][len("Permission:"):].strip()
+                lines.append(f"  - [{q['question_id']}] {tn}{src} needs permission: {detail[:120]}")
+            else:
+                lines.append(f"  - [{q['question_id']}] {tn}{src} is waiting for your answer: {q['question'][:120]}")
+        return "\n".join(lines)
+
+    async def _list_tasks(self) -> str:
+        active = db.get_opencode_running_tasks()
+        recent = db.get_recent_tasks(10)
+        lines = ["Active OpenCode Tasks:"]
+        if active:
+            for t in active:
+                lines.append(f"  - {t['task_id']}: {t.get('instruction','')[:60]} ({t['status']})")
+        else:
+            lines.append("  (none)")
+        lines.append("")
+        lines.append("Recent Tasks:")
+        for t in recent:
+            lines.append(f"  - {t['task_id']}: {t['name']} ({t['status']})")
+        return "\n".join(lines)
+
+    async def _get_task_status(self, task_id: str) -> str:
+        task = db.get_task(task_id)
+        if not task:
+            return f"Task '{task_id}' not found"
+        lines = [f"Task: {task['name']}", f"Status: {task['status']}", f"Started: {task['started_at']}"]
+        if task.get("completed_at"):
+            lines.append(f"Completed: {task['completed_at']}")
+        if task.get("exit_code") is not None:
+            lines.append(f"Exit code: {task['exit_code']}")
+        oc_task = db.get_opencode_task(task_id)
+        if oc_task:
+            lines.append(f"OpenCode session: {oc_task['session_id'][:20]}")
+        pending_qs = db.get_pending_questions()
+        for q in pending_qs:
+            if q["task_id"] == task_id:
+                lines.append(f"Pending question: {q['question'][:100]} (id={q['question_id']})")
+        return "\n".join(lines)
+
+    async def _start_opencode_task(self, project_alias: str, instruction: str) -> str:
+        if not self._oc:
+            return "Error: OpenCode supervisor not available"
+        alias, path = resolve_project(project_alias)
+        if not alias:
+            return f"Cannot start task: {path}"
+        try:
+            result = await self._oc.start_session(path, instruction)
+            return f"Task started: {result['task_id']} (session {result['session_id'][:20]}). Instruction: {instruction[:100]}"
+        except Exception as e:
+            return f"Error starting task: {e}"
+
+    async def _send_opencode_instruction(self, task_id: str, instruction: str) -> str:
+        if not self._oc:
+            return "Error: OpenCode supervisor not available"
+        oc_task = db.get_opencode_task(task_id)
+        if not oc_task:
+            return f"Task '{task_id}' is not an OpenCode task"
+        try:
+            await self._oc.send_instruction(task_id, instruction)
+            return f"Instruction sent to task {task_id}"
+        except Exception as e:
+            return f"Error sending instruction: {e}"
+
+    async def _answer_question(self, question_id: str, answer: str) -> str:
+        q = db.get_question_record(question_id)
+        if not q:
+            return f"Question '{question_id}' not found"
+        if q["status"] != "pending":
+            return f"Question '{question_id}' is already {q['status']}"
+        oc_task = db.get_opencode_task(q["task_id"])
+        if oc_task and self._oc:
+            try:
+                return await self._oc.answer_question(question_id, answer)
+            except Exception as e:
+                return f"Error answering OpenCode question: {e}"
+        elif self._tm:
+            try:
+                return await self._tm.answer_question(question_id, answer)
+            except Exception as e:
+                return f"Error answering question: {e}"
+        return "Error: no available handler for this question"
+
+    async def _resolve_permission(self, permission_id: str, decision: str) -> str:
+        if decision not in ("approve", "reject"):
+            return "Decision must be 'approve' or 'reject'"
+        if not self._oc:
+            return "Error: OpenCode supervisor not available"
+        try:
+            return await self._oc.approve_permission(permission_id, decision == "approve")
+        except Exception as e:
+            return f"Error resolving permission: {e}"
+
+    async def _cancel_task(self, task_id: str) -> str:
+        oc_task = db.get_opencode_task(task_id)
+        if oc_task and self._oc:
+            try:
+                return await self._oc.cancel_session(task_id)
+            except Exception as e:
+                return f"Error cancelling OpenCode task: {e}"
+        elif self._tm:
+            try:
+                return await self._tm.cancel(task_id)
+            except Exception as e:
+                return f"Error cancelling task: {e}"
+        return "Error: no available handler for cancellation"
+
+    async def _recent_activity(self, count: int = 5) -> str:
+        if count < 1:
+            count = 5
+        if count > 50:
+            count = 50
+        events = db.get_recent_events(count * 3)
+        filtered = []
+        for ev in events:
+            ev_type = ev.get("type", "")
+            if ev_type in (
+                "task_started", "task_completed", "task_failed", "task_cancelled",
+                "question_asked", "question_answered", "question_cancelled",
+                "opencode_task_created", "opencode_task_completed", "opencode_task_cancelled",
+                "opencode_question_answered", "opencode_question_rejected", "opencode_permission_handled",
+            ):
+                filtered.append(ev)
+            if len(filtered) >= count:
+                break
+        if not filtered:
+            return "No recent activity."
+        lines = []
+        for ev in filtered:
+            ts = (ev.get("timestamp") or "")[11:19]
+            content = ev.get("content") or ""
+            if content:
+                try:
+                    c = json.loads(content)
+                    if "task_id" in c:
+                        content = f"{c.get('name','')} ({c.get('task_id','')[:8]})"
+                    elif "question" in c:
+                        content = f"{c['question'][:60]}"
+                    elif "answer" in c:
+                        content = f"answer: {c['answer'][:40]}"
+                    else:
+                        content = str(c)[:60]
+                except (json.JSONDecodeError, TypeError):
+                    content = content[:80]
+            lines.append(f"  [{ts}] {ev['type']}: {content}")
+        return "\n".join(lines)
+
+    async def _get_projects(self) -> str:
+        projects = get_projects()
+        if not projects:
+            return "No projects configured."
+        lines = []
+        for alias, info in projects.items():
+            dn = info.get("display_name", alias)
+            desc = info.get("description", "")
+            lines.append(f"  - {alias}: {dn}" + (f" — {desc}" if desc else ""))
+        return "\n".join(lines)
+
+    def _register_all(self):
+        self._register("get_attention", "Get summary of everything needing user attention", {"type": "object", "properties": {}, "required": []}, self._get_attention)
+        self._register("list_tasks", "List all active, waiting, and recent tasks", {"type": "object", "properties": {}, "required": []}, self._list_tasks)
+        self._register("get_task_status", "Get detailed status for a specific task", {"type": "object", "properties": {"task_id": {"type": "string", "description": "Task ID to inspect"}}, "required": ["task_id"]}, self._get_task_status)
+        self._register("start_opencode_task", "Start a new OpenCode task in a safe project. NEVER accept or invent filesystem paths — always use the project_alias.", {"type": "object", "properties": {"project_alias": {"type": "string", "description": "Project alias"}, "instruction": {"type": "string", "description": "Instruction for OpenCode"}}, "required": ["project_alias", "instruction"]}, self._start_opencode_task)
+        self._register("send_opencode_instruction", "Send a follow-up instruction to an existing OpenCode session", {"type": "object", "properties": {"task_id": {"type": "string", "description": "Task ID"}, "instruction": {"type": "string", "description": "Follow-up instruction"}}, "required": ["task_id", "instruction"]}, self._send_opencode_instruction)
+        self._register("answer_question", "Answer a pending question", {"type": "object", "properties": {"question_id": {"type": "string", "description": "Question ID"}, "answer": {"type": "string", "description": "Answer text"}}, "required": ["question_id", "answer"]}, self._answer_question)
+        self._register("resolve_permission", "Approve or reject a permission request", {"type": "object", "properties": {"permission_id": {"type": "string", "description": "Permission ID"}, "decision": {"type": "string", "enum": ["approve", "reject"], "description": "Decision"}}, "required": ["permission_id", "decision"]}, self._resolve_permission)
+        self._register("cancel_task", "Cancel a running task", {"type": "object", "properties": {"task_id": {"type": "string", "description": "Task ID"}}, "required": ["task_id"]}, self._cancel_task)
+        self._register("recent_activity", "Get recent meaningful events", {"type": "object", "properties": {"count": {"type": "integer", "description": "Number of events (max 50)", "default": 5}}, "required": []}, self._recent_activity)
+        self._register("get_projects", "List configured safe project aliases", {"type": "object", "properties": {}, "required": []}, self._get_projects)

@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Jarvis</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="manifest" href="/manifest.json">
+  <link rel="icon" href="/static/icons/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/static/icons/icon.svg">
+  <meta name="theme-color" content="#16213e">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+</head>
+<body>
+  <div id="app">
+    <header>
+      <h1>Jarvis</h1>
+      <div id="header-controls">
+        <button id="notify-opt-in-btn" class="icon-btn" type="button" aria-label="Enable push notifications" aria-pressed="false" title="Enable push notifications">🔔</button>
+        <button id="notify-completion-toggle-btn" class="icon-btn" type="button" aria-label="Toggle completion notifications" aria-pressed="true" title="Notify me when tasks complete">✅</button>
+        <button id="speech-toggle-btn" class="icon-btn" type="button" aria-label="Enable spoken responses" aria-pressed="false" title="Spoken responses off (tap to enable)">🔈</button>
+        <button id="speech-stop-btn" class="icon-btn" type="button" aria-label="Stop speaking" style="display:none">⏹</button>
+        <div id="status">
+          <span id="status-dot" class="status-disconnected"></span>
+          <span id="status-text">Connecting...</span>
+        </div>
+      </div>
+    </header>
+    <div id="needs-attention" style="display:none">
+      <div id="needs-attention-header"><h3>Needs Your Attention</h3></div>
+      <div id="question-list"></div>
+    </div>
+    <div id="active-tasks" style="display:none">
+      <div id="active-tasks-header"><h3>Active Tasks</h3></div>
+      <div id="task-list"></div>
+    </div>
+    <div id="timeline"></div>
+    <div id="voice-status" role="status" aria-live="polite" style="display:none"></div>
+    <div id="input-area">
+      <button id="mic-btn" class="icon-btn mic-idle" type="button" aria-label="Start voice input">🎤</button>
+      <input type="text" id="message-input" placeholder="Type a message..." autocomplete="off" aria-label="Message">
+      <button id="send-btn">Send</button>
+    </div>
+  </div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
