@@ -106,6 +106,101 @@ header h1 {
 .status-disconnected { background: #f87171; }
 .status-error       { background: #fbbf24; }
 
+/* ---- Attention Calls (Milestone 8) ---- */
+/* Call-style UI for a persistent AttentionRequest — distinct from
+   #needs-attention below (which is the M7 worker-question answer UI).
+   Same real-phone finding/fix as #needs-attention/#active-tasks applies
+   here too (Phase 14 explicit regression requirement): this panel must
+   compress before #input-area is ever pushed off-screen. */
+#attention-calls {
+  flex-shrink: 3;
+  min-height: 0;
+  background: #16213e;
+  border-bottom: 2px solid #818cf8;
+  padding: 8px 16px;
+  max-height: 50vh;
+  overflow-y: auto;
+}
+
+#attention-calls-header h3 {
+  font-size: 13px;
+  text-transform: uppercase;
+  color: #818cf8;
+  margin-bottom: 6px;
+}
+
+.attention-call-item {
+  background: #1a1a2e;
+  border: 1px solid #818cf8;
+  border-radius: 6px;
+  padding: 10px;
+  margin-bottom: 8px;
+}
+
+.attention-call-item:last-child {
+  margin-bottom: 0;
+}
+
+.attention-call-item.attention-call-deferred {
+  opacity: 0.7;
+  border-style: dashed;
+}
+
+.attention-call-summary {
+  font-size: 14px;
+  margin-bottom: 4px;
+}
+
+.attention-call-meta {
+  font-size: 11px;
+  opacity: 0.7;
+  margin-bottom: 8px;
+}
+
+.attention-call-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.attention-call-talk-btn {
+  padding: 8px 16px;
+  border-radius: 16px;
+  border: 1px solid #818cf8;
+  background: #818cf8;
+  color: #16213e;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.attention-call-talk-btn:active {
+  background: #6366f1;
+}
+
+.attention-call-snooze-btn,
+.attention-call-dismiss-btn {
+  padding: 8px 14px;
+  border-radius: 16px;
+  border: 1px solid #0f3460;
+  background: transparent;
+  color: #e0e0e0;
+  font-size: 12px;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.attention-call-snooze-btn:active,
+.attention-call-dismiss-btn:active {
+  background: #0f3460;
+}
+
+.attention-call-item button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
 /* ---- Needs Your Attention ---- */
 
 #needs-attention {
@@ -473,6 +568,36 @@ header h1 {
   color: #c084fc;
   background: #16213e;
   border-top: 1px solid #0f3460;
+}
+
+/* ---- Voice session bar (Milestone 8 Phase 10/11) ---- */
+
+#voice-session-bar {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 16px;
+  font-size: 12px;
+  color: #818cf8;
+  background: #16213e;
+  border-top: 1px solid #0f3460;
+}
+
+#voice-session-close-btn {
+  padding: 4px 12px;
+  border-radius: 12px;
+  border: 1px solid #818cf8;
+  background: transparent;
+  color: #818cf8;
+  font-size: 11px;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+#voice-session-close-btn:active {
+  background: #818cf8;
+  color: #16213e;
 }
 
 /* ---- Input ---- */

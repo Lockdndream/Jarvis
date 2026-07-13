@@ -1,8 +1,50 @@
 var ws = null;
 var reconnectTimer = null;
+var wsToken = null;
+var wsTokenExpiresAt = 0;
 var activeTasks = {};
 var pendingQuestions = {};
 var conversationId = null;
+
+/* Milestone 8: persistent AttentionRequest call-style UI + voice session
+   client state. Kept separate from pendingQuestions/pendingPermissions
+   above — those remain the M7 worker-question answer UI; this tracks
+   Jarvis's own "someone needs to be contacted" state. */
+var attentionRequests = {};
+var ATTENTION_TERMINAL_STATUSES = ["resolved", "cancelled", "expired"];
+var currentVoiceSessionId = null;
+var voiceSessionAttentionId = null;
+
+/* Milestone 9B.2 (ADR-014): persistent client identity for WS token flow. */
+function loadStoredClientId() {
+  try {
+    var id = window.localStorage.getItem("jarvis_client_id");
+    if (id) return id;
+    /* First visit — generate a UUID. crypto.randomUUID() is available in
+       secure contexts (HTTPS), which this app already requires. */
+    id = (crypto.randomUUID && crypto.randomUUID()) || generateFallbackId();
+    storeClientId(id);
+    return id;
+  } catch (e) {
+    return null;
+  }
+}
+
+function storeClientId(id) {
+  try {
+    window.localStorage.setItem("jarvis_client_id", id);
+  } catch (e) {
+    /* localStorage unavailable — best-effort only, not fatal. */
+  }
+}
+
+function generateFallbackId() {
+  /* crypto.randomUUID fallback for any non-secure-context edge case. */
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, function (c) {
+    var r = Math.random() * 16 | 0;
+    return (c === "x" ? r : (r & 0x3 | 0x8)).toString(16);
+  });
+}
 
 /* Milestone 6 Phase 7: stable conversation identity across reconnects.
    localStorage is acceptable for this prototype (single browser/user);
@@ -25,23 +67,64 @@ function storeConversationId(id) {
   }
 }
 
+/* Milestone 9B.2 (ADR-014): fetch a short-lived signed WS token. */
+function fetchToken(clientId) {
+  return fetch("/api/ws-token", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ client_id: clientId }),
+  }).then(function (r) {
+    if (!r.ok) throw new Error("Token fetch failed: " + r.status);
+    return r.json();
+  });
+}
+
 function sendUserMessage(content) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   ws.send(JSON.stringify({ type: "user_message", content: content, conversation_id: conversationId }));
 }
 
-function connect() {
+async function connect() {
   var proto = location.protocol === "https:" ? "wss:" : "ws:";
-  ws = new WebSocket(proto + "//" + location.host + "/ws");
+  var now = Math.floor(Date.now() / 1000);
 
+  if (!wsToken || !wsTokenExpiresAt || (wsTokenExpiresAt - now) < 120) {
+    var clientId = loadStoredClientId();
+    if (!clientId) {
+      /* localStorage unavailable — connect without a token; the server may
+         accept the connection or reject it (code 4003). */
+      ws = new WebSocket(proto + "//" + location.host + "/ws");
+      attachWsHandlers();
+      return;
+    }
+    try {
+      var data = await fetchToken(clientId);
+      wsToken = data.token;
+      wsTokenExpiresAt = data.expires_at;
+    } catch (e) {
+      setStatus("error");
+      scheduleReconnect();
+      return;
+    }
+  }
+
+  ws = new WebSocket(proto + "//" + location.host + "/ws?token=" + encodeURIComponent(wsToken));
+  attachWsHandlers();
+}
+
+function attachWsHandlers() {
   ws.onopen = function () {
     setStatus("connected");
     clearTimeout(reconnectTimer);
     ws.send(JSON.stringify({ type: "conversation_init", conversation_id: loadStoredConversationId() }));
   };
 
-  ws.onclose = function () {
+  ws.onclose = function (event) {
     setStatus("disconnected");
+    if (event.code === 4001 || event.code === 4002) {
+      wsToken = null;
+      wsTokenExpiresAt = 0;
+    }
     scheduleReconnect();
   };
 
@@ -147,6 +230,63 @@ function handleEvent(data) {
   }
   if (data.type === "pending_notifications") {
     (data.notifications || []).forEach(function (n) { renderNotificationInTimeline(n); });
+    return;
+  }
+  if (data.type === "pending_attention") {
+    (data.attention_requests || []).forEach(function (a) { handleAttentionUpdate(a); });
+    return;
+  }
+  if (
+    data.type === "attention_created" || data.type === "attention_contacting" ||
+    data.type === "attention_pending" || data.type === "attention_deferred" ||
+    data.type === "attention_resolving" || data.type === "attention_resolved" ||
+    data.type === "attention_cancelled" || data.type === "attention_expired"
+  ) {
+    handleAttentionUpdate(data);
+    return;
+  }
+  if (data.type === "voice_session_opened") {
+    currentVoiceSessionId = data.voice_session_id;
+    voiceSessionAttentionId = data.attention_request_id || null;
+    if (!conversationId && data.conversation_id) {
+      conversationId = data.conversation_id;
+      storeConversationId(conversationId);
+    }
+    if (data.greeting) {
+      // Real-phone finding (Milestone 8.1, 2026-07-10): a bound voice
+      // session used to go straight to listening with nothing spoken —
+      // a re-contacted user had no way to know what they were being
+      // asked about. speakForVoiceSession() shows+speaks the context,
+      // then starts listening itself once done.
+      showVoiceSessionBar("Jarvis is speaking…");
+      speakForVoiceSession(data.greeting);
+    } else {
+      showVoiceSessionBar("Listening…");
+      startVoiceSessionListening();
+    }
+    return;
+  }
+  if (data.type === "voice_session_response") {
+    if (data.voice_session_id !== currentVoiceSessionId) return; // stale/already-closed session
+    if (data.voice_session_state === "deferred") {
+      speakOnceThenCloseVoiceSession(data.response);
+    } else {
+      speakForVoiceSession(data.response);
+    }
+    return;
+  }
+  if (data.type === "voice_session_error") {
+    setTransientStatus(data.error || "Voice session error.");
+    return;
+  }
+  if (data.type === "voice_session_closed") {
+    return; // client already updates its own UI when it initiates a close
+  }
+  if (data.type === "voice_session_invitation") {
+    // Phase 13 architecture-bridge signal for a future proactive voice
+    // presence — the attention_* broadcasts already drive the call-style
+    // card (Talk now/snooze/dismiss) for this same event, so this is
+    // intentionally a no-op here rather than a raw timeline entry.
     return;
   }
 
@@ -449,6 +589,211 @@ function renderPendingPermissions() {
   });
 }
 
+/* ========== Attention Calls (Milestone 8) ========== */
+/* Call-style UI for a persistent AttentionRequest: reason, Talk now,
+   snooze options, dismiss. Distinct from the pendingQuestions/
+   pendingPermissions panel above, which remains the direct worker-answer
+   UI unchanged since Milestone 7 — this is about *contact*, not about
+   answering. Talk now opens a bound voice session (below); the snooze/
+   dismiss buttons reuse the exact same deterministic natural-language
+   defer fast path (app/deferral.py) a spoken "come back in 15 minutes"
+   would hit, scoped to this one request via bound_attention_request_id so
+   it never has to guess which item among several unrelated ones. */
+
+function handleAttentionUpdate(data) {
+  if (data.status && ATTENTION_TERMINAL_STATUSES.indexOf(data.status) !== -1) {
+    delete attentionRequests[data.attention_request_id];
+    renderAttentionCalls();
+    return;
+  }
+  var existing = attentionRequests[data.attention_request_id] || {};
+  var merged = {};
+  for (var k in existing) merged[k] = existing[k];
+  for (var k2 in data) merged[k2] = data[k2];
+  attentionRequests[data.attention_request_id] = merged;
+  renderAttentionCalls();
+}
+
+function sendAttentionCommand(attentionRequestId, phrase) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({
+    type: "user_message",
+    content: phrase,
+    conversation_id: conversationId,
+    bound_attention_request_id: attentionRequestId,
+  }));
+}
+
+function formatDeferredUntil(iso) {
+  try {
+    return new Date(iso).toLocaleString([], { hour: "2-digit", minute: "2-digit" });
+  } catch (e) {
+    return iso;
+  }
+}
+
+function renderAttentionCalls() {
+  var container = document.getElementById("attention-calls");
+  var list = document.getElementById("attention-call-list");
+  list.innerHTML = "";
+  var ids = Object.keys(attentionRequests);
+  if (ids.length === 0) {
+    container.style.display = "none";
+    return;
+  }
+  container.style.display = "block";
+  ids.forEach(function (id) {
+    var a = attentionRequests[id];
+    var deferred = a.status === "deferred";
+    var item = document.createElement("div");
+    item.className = "attention-call-item" + (deferred ? " attention-call-deferred" : "");
+    item.setAttribute("data-attention-request-id", id);
+    var html = '<div class="attention-call-summary">' + escapeHtml(a.summary || "Jarvis needs your input") + '</div>';
+    if (deferred && a.deferred_until) {
+      html += '<div class="attention-call-meta">Deferred until ' + escapeHtml(formatDeferredUntil(a.deferred_until)) + '</div>';
+    } else {
+      html += '<div class="attention-call-meta">' + escapeHtml(a.attention_type || "") + '</div>';
+    }
+    if (!deferred) {
+      html += '<div class="attention-call-actions">';
+      html += '<button class="attention-call-talk-btn" data-attention-request-id="' + escapeHtml(id) + '">Talk now</button>';
+      html += '<button class="attention-call-snooze-btn" data-attention-request-id="' + escapeHtml(id) + '" data-phrase="15 minutes">15 min</button>';
+      html += '<button class="attention-call-snooze-btn" data-attention-request-id="' + escapeHtml(id) + '" data-phrase="1 hour">1 hour</button>';
+      html += '<button class="attention-call-snooze-btn" data-attention-request-id="' + escapeHtml(id) + '" data-phrase="tomorrow morning">Tomorrow AM</button>';
+      html += '<button class="attention-call-dismiss-btn" data-attention-request-id="' + escapeHtml(id) + '" data-phrase="later">Dismiss</button>';
+      html += '</div>';
+    }
+    item.innerHTML = html;
+    list.appendChild(item);
+  });
+}
+
+/* ========== Voice Session Client (Milestone 8 Phase 10/11/12) ========== */
+/* Bridges the browser's existing SpeechRecognition/TTS (unchanged since
+   Milestone 7) to the server-side VoiceSessionManager state machine. This
+   is a second, independent conversational loop from the main-input mic
+   above — reuses the same `recognition`/`voiceCancelled` singleton so
+   "exactly one concurrent recognition session" still holds across every
+   mic entry point in the app, but drives it via voice_session_* WS
+   messages instead of a plain user_message. */
+
+function showVoiceSessionBar(label) {
+  var bar = document.getElementById("voice-session-bar");
+  var lbl = document.getElementById("voice-session-state-label");
+  if (lbl) lbl.textContent = label;
+  if (bar) bar.style.display = "flex";
+}
+
+function hideVoiceSessionBar() {
+  var bar = document.getElementById("voice-session-bar");
+  if (bar) bar.style.display = "none";
+}
+
+function openVoiceSession(attentionRequestId) {
+  if (!voiceSupported()) {
+    setTransientStatus("Voice input is not supported in this browser.");
+    return;
+  }
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  if (currentVoiceSessionId) return; // one voice session at a time
+  stopSpeaking();
+  ws.send(JSON.stringify({
+    type: "voice_session_open",
+    conversation_id: conversationId,
+    attention_request_id: attentionRequestId || null,
+  }));
+}
+
+function startVoiceSessionListening() {
+  if (!voiceSupported() || !currentVoiceSessionId) return;
+  if (recognition) {
+    try { recognition.abort(); } catch (e) {}
+    recognition = null;
+  }
+  voiceCancelled = false;
+  recognition = new SpeechRecognitionCtor();
+  recognition.lang = "en-US";
+  recognition.interimResults = false;
+  recognition.maxAlternatives = 1;
+
+  recognition.onstart = function () {
+    showVoiceSessionBar("Listening…");
+  };
+  recognition.onresult = function (event) {
+    if (voiceCancelled || !currentVoiceSessionId) return;
+    var transcript = (event.results[0][0].transcript || "").trim();
+    if (!transcript || !ws || ws.readyState !== WebSocket.OPEN) return;
+    // Real-phone finding (Milestone 8.1, 2026-07-10): unlike the main-mic
+    // flow (whose transcript is echoed via the normal user_message
+    // broadcast), a bound voice session's recognized transcript was never
+    // shown anywhere — the user could not tell what Jarvis heard, even
+    // though it acted on it correctly. Echo it into the timeline the same
+    // way a typed message would appear, before sending it to the server.
+    addToTimeline({ type: "user_message", content: transcript, timestamp: new Date().toISOString() });
+    showVoiceSessionBar("Thinking…");
+    ws.send(JSON.stringify({
+      type: "voice_session_transcript",
+      voice_session_id: currentVoiceSessionId,
+      transcript: transcript,
+    }));
+  };
+  recognition.onerror = function (event) {
+    recognition = null;
+    // Give the user another chance to speak rather than ending the call on
+    // a single recognition hiccup (e.g. transient "no-speech").
+    if (!voiceCancelled && currentVoiceSessionId) startVoiceSessionListening();
+  };
+  recognition.onend = function () {
+    recognition = null;
+  };
+
+  try {
+    recognition.start();
+  } catch (e) {}
+}
+
+function speakForVoiceSession(text) {
+  addToTimeline({ type: "supervisor_message", content: text, timestamp: new Date().toISOString() });
+  if (!ttsSupported || !speechEnabled) {
+    if (currentVoiceSessionId) startVoiceSessionListening();
+    return;
+  }
+  if (window.speechSynthesis.speaking) window.speechSynthesis.cancel();
+  var utter = new SpeechSynthesisUtterance(truncateForSpeech(text));
+  utter.onend = function () { if (currentVoiceSessionId) startVoiceSessionListening(); };
+  utter.onerror = function () { if (currentVoiceSessionId) startVoiceSessionListening(); };
+  window.speechSynthesis.speak(utter);
+}
+
+function speakOnceThenCloseVoiceSession(text) {
+  addToTimeline({ type: "supervisor_message", content: text, timestamp: new Date().toISOString() });
+  showVoiceSessionBar("Deferred");
+  var finish = function () { closeVoiceSession(); };
+  if (!ttsSupported || !speechEnabled) {
+    setTimeout(finish, 800);
+    return;
+  }
+  if (window.speechSynthesis.speaking) window.speechSynthesis.cancel();
+  var utter = new SpeechSynthesisUtterance(truncateForSpeech(text));
+  utter.onend = finish;
+  utter.onerror = finish;
+  window.speechSynthesis.speak(utter);
+}
+
+function closeVoiceSession() {
+  if (recognition) {
+    try { recognition.abort(); } catch (e) {}
+    recognition = null;
+  }
+  stopSpeaking();
+  if (ws && ws.readyState === WebSocket.OPEN && currentVoiceSessionId) {
+    ws.send(JSON.stringify({ type: "voice_session_close", voice_session_id: currentVoiceSessionId }));
+  }
+  currentVoiceSessionId = null;
+  voiceSessionAttentionId = null;
+  hideVoiceSessionBar();
+}
+
 /* ========== OpenCode Status ========== */
 
 function handleOpenCodeStatus(data) {
@@ -526,6 +871,23 @@ document.addEventListener("click", function (e) {
     if (qid && answer && ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: "user_message", content: "/answer " + qid + " " + answer }));
       input.value = "";
+      e.target.disabled = true;
+      e.target.textContent = "Sent";
+    }
+    return;
+  }
+  // Attention call: Talk now
+  if (e.target.classList.contains("attention-call-talk-btn")) {
+    var talkAid = e.target.getAttribute("data-attention-request-id");
+    if (talkAid) openVoiceSession(talkAid);
+    return;
+  }
+  // Attention call: snooze / dismiss
+  if (e.target.classList.contains("attention-call-snooze-btn") || e.target.classList.contains("attention-call-dismiss-btn")) {
+    var snoozeAid = e.target.getAttribute("data-attention-request-id");
+    var phrase = e.target.getAttribute("data-phrase");
+    if (snoozeAid && phrase) {
+      sendAttentionCommand(snoozeAid, phrase);
       e.target.disabled = true;
       e.target.textContent = "Sent";
     }
@@ -1004,6 +1366,7 @@ function parseDeepLinkParams() {
     question: params.get("question"),
     permission: params.get("permission"),
     notification: params.get("notification"),
+    attention: params.get("attention"),
   };
 }
 
@@ -1031,16 +1394,34 @@ function applyDeepLink(params) {
       });
     return;
   }
+  if (params.attention) {
+    fetch("/api/attention/" + encodeURIComponent(params.attention))
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (data) {
+        if (!data) return;
+        var resolved = {
+          conversation: data.conversation_id || params.conversation,
+          task: data.task_id || params.task,
+          attention: data.attention_request_id,
+        };
+        highlightDeepLinkTargets(resolved);
+        if (data.status && ["resolved", "cancelled", "expired"].indexOf(data.status) !== -1) {
+          setTransientStatus("That item was already " + data.status + ".");
+        }
+      });
+    return;
+  }
   highlightDeepLinkTargets(params);
 }
 
 function highlightDeepLinkTargets(params) {
-  var targetId = params.question || params.permission || params.task;
+  var targetId = params.attention || params.question || params.permission || params.task;
   if (!targetId) return;
   var attempts = 0;
   var timer = setInterval(function () {
     attempts++;
     var el =
+      document.querySelector('[data-attention-request-id="' + cssEscapeAttr(targetId) + '"]') ||
       document.querySelector('[data-question-id="' + cssEscapeAttr(targetId) + '"]') ||
       document.querySelector('[data-permission-id="' + cssEscapeAttr(targetId) + '"]') ||
       document.querySelector('[data-task-id="' + cssEscapeAttr(targetId) + '"]');
@@ -1093,6 +1474,7 @@ document.addEventListener("DOMContentLoaded", function () {
   }
 
   document.getElementById("speech-stop-btn").addEventListener("click", stopSpeaking);
+  document.getElementById("voice-session-close-btn").addEventListener("click", closeVoiceSession);
   document.getElementById("notify-opt-in-btn").addEventListener("click", enablePushNotifications);
   document.getElementById("notify-completion-toggle-btn").addEventListener("click", function () {
     var btn = this;
@@ -1118,7 +1500,7 @@ document.addEventListener("DOMContentLoaded", function () {
 
   connect();
 
-  if (deepLinkParams.notification || deepLinkParams.question || deepLinkParams.permission || deepLinkParams.task) {
+  if (deepLinkParams.notification || deepLinkParams.question || deepLinkParams.permission || deepLinkParams.task || deepLinkParams.attention) {
     setTimeout(function () { applyDeepLink(deepLinkParams); }, 900);
   }
 });

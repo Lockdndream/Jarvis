@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Global base-config only: cleartext traffic is never permitted, for any
+  host. This app talks to a runtime-entered LAN address (no cloud, no
+  discovery — see PairingRepository), so a static per-domain trust-anchor
+  entry (as spikes/android-presence used for its one hardcoded IP) does not
+  fit here. The actual certificate trust decision is TOFU pinning done in
+  code — see pairing.PinnedTrustManager — not this file.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+</network-security-config>

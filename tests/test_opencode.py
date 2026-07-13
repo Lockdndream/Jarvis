@@ -47,6 +47,7 @@ class FakeOpenCodeServer:
         self.questions: list[dict] = []
         self.permissions: list[dict] = []
         self.messages: dict[str, list] = {}
+        self.last_prompt_model: dict | None = None
         self._app = self._build_app()
         self._server = None
 
@@ -87,6 +88,7 @@ class FakeOpenCodeServer:
                 "content": text,
             })
             svc.sessions[session_id]["status"] = "running"
+            svc.last_prompt_model = body.get("model")
             return "", 204
 
         @app.post("/session/{session_id}/abort")
@@ -96,9 +98,29 @@ class FakeOpenCodeServer:
             return True
 
         @app.get("/api/session/{session_id}/message")
+        async def get_messages_event_log(session_id: str, limit: int = 20):
+            # Milestone 9A finding: this is the REAL server's actual shape for
+            # this URL — a session-lifecycle event log (model-switched/
+            # agent-switched), never the conversation itself. Modeled here
+            # deliberately so a regression test can prove the adapter no
+            # longer calls this wrong URL.
+            return {"items": [
+                {"id": "evt_fake_1", "type": "model-switched", "model": {"id": "fake-model"}},
+                {"id": "evt_fake_2", "type": "agent-switched", "agent": "build"},
+            ]}
+
+        @app.get("/session/{session_id}/message")
         async def get_messages(session_id: str, limit: int = 20):
+            # The REAL correct endpoint (no /api/ prefix) — real shape is a
+            # bare list of {"info": {..., "role": ...}, "parts": [...]}.
             msgs = svc.messages.get(session_id, [])
-            return {"items": msgs[-limit:]}
+            return [
+                {
+                    "info": {"id": m["id"], "role": m["role"]},
+                    "parts": [{"type": "text", "text": m["content"]}],
+                }
+                for m in msgs[-limit:]
+            ]
 
         @app.get("/question")
         async def get_questions():
@@ -222,7 +244,115 @@ async def test_adapter_send_prompt():
         await adapter.send_prompt(sid, "/tmp", "Say hello")
         messages = await adapter.get_messages(sid, "/tmp")
         assert len(messages) >= 1
-        assert messages[0]["role"] == "user"
+        assert messages[0]["info"]["role"] == "user"
+    finally:
+        await fake.stop()
+
+
+@pytest.mark.asyncio
+async def test_send_prompt_always_pins_an_explicit_free_model():
+    """Milestone 9B.0 finding: left unpinned, OpenCode picks its own default
+    provider/model among whatever credentials happen to be visible to the
+    subprocess — verified real to silently run a paid OpenAI model via an
+    inherited ambient OPENAI_API_KEY. send_prompt() must always send an
+    explicit model field so OpenCode never falls back to its own default
+    selection, and that model must pass the same free-only rules as
+    Jarvis's own supervisor LLM."""
+    from app.integrations import opencode_adapter as oca
+
+    fake = FakeOpenCodeServer()
+    await fake.start()
+    try:
+        adapter = OpenCodeAdapter(base_url=fake.base_url)
+        sid = await adapter.create_session(directory="/tmp")
+        await adapter.send_prompt(sid, "/tmp", "Say hello")
+
+        assert fake.last_prompt_model == {
+            "providerID": oca.DEFAULT_OPENCODE_PROVIDER_ID,
+            "modelID": oca.DEFAULT_OPENCODE_MODEL_ID,
+        }
+        assert (
+            oca.DEFAULT_OPENCODE_MODEL_ID.endswith(":free")
+            or oca.DEFAULT_OPENCODE_MODEL_ID == "openrouter/free"
+            # JARVIS_OPENCODE_ALLOW_PAID may be set (dev-only escape hatch,
+            # see validate_opencode_model) — the one explicitly-allowlisted
+            # paid model is a legitimate default too, still policy-bound,
+            # just not free.
+            or oca.DEFAULT_OPENCODE_MODEL_ID == oca.ALLOWED_PAID_OPENCODE_MODEL_ID
+        )
+    finally:
+        await fake.stop()
+
+
+def test_validate_opencode_model_rejects_paid_model_by_default(monkeypatch):
+    """Milestone 9B.0: JARVIS_OPENCODE_ALLOW_PAID is unset/false by
+    default — the paid-model escape hatch must not be implicitly open."""
+    from app.integrations.opencode_adapter import validate_opencode_model, ALLOWED_PAID_OPENCODE_MODEL_ID
+    from app.supervisor.llm import ModelNotAllowedError
+
+    monkeypatch.setenv("JARVIS_LLM_FREE_ONLY", "true")
+    monkeypatch.delenv("JARVIS_OPENCODE_ALLOW_PAID", raising=False)
+    with pytest.raises(ModelNotAllowedError):
+        validate_opencode_model(ALLOWED_PAID_OPENCODE_MODEL_ID)
+
+
+def test_validate_opencode_model_allows_exact_paid_model_when_flag_set(monkeypatch):
+    from app.integrations.opencode_adapter import validate_opencode_model, ALLOWED_PAID_OPENCODE_MODEL_ID
+
+    monkeypatch.setenv("JARVIS_LLM_FREE_ONLY", "true")
+    monkeypatch.setenv("JARVIS_OPENCODE_ALLOW_PAID", "true")
+    validate_opencode_model(ALLOWED_PAID_OPENCODE_MODEL_ID)  # must not raise
+
+
+def test_validate_opencode_model_still_rejects_other_paid_models_when_flag_set(monkeypatch):
+    """The flag allows exactly one named model, not "all paid models"."""
+    from app.integrations.opencode_adapter import validate_opencode_model
+    from app.supervisor.llm import ModelNotAllowedError
+
+    monkeypatch.setenv("JARVIS_LLM_FREE_ONLY", "true")
+    monkeypatch.setenv("JARVIS_OPENCODE_ALLOW_PAID", "true")
+    with pytest.raises(ModelNotAllowedError):
+        validate_opencode_model("openai/gpt-5.3-chat-latest")
+
+
+def test_validate_opencode_model_free_models_still_work_regardless_of_flag(monkeypatch):
+    from app.integrations.opencode_adapter import validate_opencode_model
+
+    monkeypatch.setenv("JARVIS_LLM_FREE_ONLY", "true")
+    for flag in ("true", "false", None):
+        if flag is None:
+            monkeypatch.delenv("JARVIS_OPENCODE_ALLOW_PAID", raising=False)
+        else:
+            monkeypatch.setenv("JARVIS_OPENCODE_ALLOW_PAID", flag)
+        validate_opencode_model("meta-llama/llama-3.3-70b-instruct:free")  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_get_messages_hits_the_real_conversation_endpoint_not_the_event_log():
+    """Milestone 9A finding, 2026-07-10: get_messages() used to call
+    /api/session/{id}/message, which is a session-lifecycle EVENT log
+    (model-switched/agent-switched entries — verified directly against the
+    real isolated OpenCode server) and never contains the actual
+    conversation. The real message history lives at the plain (no /api/
+    prefix) /session/{id}/message. This test would FAIL against the old
+    route (the event log never contains the submitted text at all) and
+    PASSES against the corrected route."""
+    fake = FakeOpenCodeServer()
+    await fake.start()
+    try:
+        adapter = OpenCodeAdapter(base_url=fake.base_url)
+        sid = await adapter.create_session(directory="/tmp")
+        marker = "UNIQUE_MARKER_b7f3a1"
+        await adapter.send_prompt(sid, "/tmp", marker)
+        messages = await adapter.get_messages(sid, "/tmp")
+        all_text = " ".join(
+            p.get("text", "") for m in messages for p in m.get("parts", [])
+        )
+        assert marker in all_text, (
+            f"submitted prompt text not found in retrieved messages "
+            f"(would be the case if still hitting the wrong /api/-prefixed "
+            f"event-log endpoint): {messages!r}"
+        )
     finally:
         await fake.stop()
 

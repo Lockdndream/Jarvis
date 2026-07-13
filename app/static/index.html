@@ -28,6 +28,10 @@
         </div>
       </div>
     </header>
+    <div id="attention-calls" style="display:none">
+      <div id="attention-calls-header"><h3>Jarvis is calling</h3></div>
+      <div id="attention-call-list"></div>
+    </div>
     <div id="needs-attention" style="display:none">
       <div id="needs-attention-header"><h3>Needs Your Attention</h3></div>
       <div id="question-list"></div>
@@ -38,6 +42,10 @@
     </div>
     <div id="timeline"></div>
     <div id="voice-status" role="status" aria-live="polite" style="display:none"></div>
+    <div id="voice-session-bar" role="status" aria-live="polite" style="display:none">
+      <span id="voice-session-state-label">Listening…</span>
+      <button id="voice-session-close-btn" type="button" aria-label="End voice session">End</button>
+    </div>
     <div id="input-area">
       <button id="mic-btn" class="icon-btn mic-idle" type="button" aria-label="Start voice input">🎤</button>
       <input type="text" id="message-input" placeholder="Type a message..." autocomplete="off" aria-label="Message">

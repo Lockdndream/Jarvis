@@ -5,7 +5,61 @@ import logging
 import os
 import time
 
+from app.supervisor.llm import validate_free_only_model
+
 logger = logging.getLogger(__name__)
+
+# Milestone 9B.0: OpenCode's own model-selection logic (Known Limitation
+# #27) is not something Jarvis controls implicitly — left unpinned, it
+# picks whatever provider/model it defaults to among whatever credentials
+# happen to be visible to the subprocess (verified real: this silently ran
+# a paid gpt-5.3-chat-latest via an inherited ambient OPENAI_API_KEY).
+# Every delegated prompt now explicitly pins provider+model instead of
+# relying on OpenCode's default. Reuses the same JARVIS_LLM_FREE_ONLY gate
+# and :free/openrouter-free allowlist as Jarvis's own supervisor LLM
+# (app/supervisor/llm.py) — one free-only boundary for all Jarvis-initiated
+# LLM spend, not two independently-configured ones.
+DEFAULT_OPENCODE_PROVIDER_ID = os.environ.get("JARVIS_OPENCODE_MODEL_PROVIDER_ID", "openrouter")
+
+# Milestone 9B.0 (temporary dev config, 2026-07-12): sustained free-tier
+# OpenRouter rate-limiting blocked D4 (independent review) delegation for
+# hours across every free model tried. JARVIS_OPENCODE_ALLOW_PAID is a
+# narrow, explicit escape hatch — it does NOT weaken validate_free_only_model()
+# itself (still shared, unchanged, still governs Jarvis's own supervisor
+# LLM in app/supervisor/llm.py) and does NOT allow paid models generally.
+# It allows exactly one specific, explicitly-named paid model for delegated
+# OpenCode worker sessions only. Default (unset/false): identical free-only
+# behavior as before this flag existed.
+ALLOWED_PAID_OPENCODE_MODEL_ID = "deepseek/deepseek-v4-flash"
+
+
+def _allow_paid_opencode() -> bool:
+    # Read fresh each call (same pattern as validate_free_only_model()'s
+    # own JARVIS_LLM_FREE_ONLY check) so tests can monkeypatch the env var
+    # without needing to reload this module.
+    return os.environ.get("JARVIS_OPENCODE_ALLOW_PAID", "").lower() in ("true", "1", "yes")
+
+
+_default_model_env = os.environ.get("JARVIS_OPENCODE_MODEL_ID")
+if _default_model_env:
+    DEFAULT_OPENCODE_MODEL_ID = _default_model_env
+elif _allow_paid_opencode():
+    DEFAULT_OPENCODE_MODEL_ID = ALLOWED_PAID_OPENCODE_MODEL_ID
+else:
+    DEFAULT_OPENCODE_MODEL_ID = "google/gemma-4-26b-a4b-it:free"
+
+
+def validate_opencode_model(model_id: str) -> None:
+    """Delegated-OpenCode-worker model validation. Free-only by default
+    (delegates entirely to the shared validate_free_only_model() guard);
+    if JARVIS_OPENCODE_ALLOW_PAID=true, additionally allows exactly
+    ALLOWED_PAID_OPENCODE_MODEL_ID — no other paid model is permitted."""
+    if _allow_paid_opencode() and model_id == ALLOWED_PAID_OPENCODE_MODEL_ID:
+        return
+    validate_free_only_model(model_id)
+
+
+validate_opencode_model(DEFAULT_OPENCODE_MODEL_ID)
 
 
 class OpenCodeAPIError(Exception):
@@ -72,9 +126,29 @@ class OpenCodeAdapter:
             r.raise_for_status()
             return r.json()
 
-    async def send_prompt(self, session_id: str, directory: str, text: str) -> None:
+    async def send_prompt(
+        self, session_id: str, directory: str, text: str,
+        provider_id: str | None = None, model_id: str | None = None,
+    ) -> None:
+        """Send a prompt to a session, always pinning provider+model
+        explicitly (Milestone 9B.0) rather than letting OpenCode fall back
+        to its own default selection among whatever credentials are
+        visible to it. An explicit (provider_id, model_id) override is
+        allowed (e.g. to spread concurrent delegated sessions across
+        different free-tier models instead of contending for the same
+        rate limit) but is still validated via validate_opencode_model() —
+        free-only unless JARVIS_OPENCODE_ALLOW_PAID=true and the model is
+        exactly ALLOWED_PAID_OPENCODE_MODEL_ID. Not a general bypass."""
         import httpx
-        body = {"parts": [{"type": "text", "text": text}]}
+        if model_id is not None:
+            validate_opencode_model(model_id)
+        body = {
+            "parts": [{"type": "text", "text": text}],
+            "model": {
+                "providerID": provider_id or DEFAULT_OPENCODE_PROVIDER_ID,
+                "modelID": model_id or DEFAULT_OPENCODE_MODEL_ID,
+            },
+        }
         async with httpx.AsyncClient() as client:
             r = await client.post(
                 f"{self.base_url}/session/{session_id}/prompt_async",
@@ -164,10 +238,17 @@ class OpenCodeAdapter:
             r.raise_for_status()
 
     async def get_messages(self, session_id: str, directory: str, limit: int = 20) -> list:
+        """Milestone 9A finding (2026-07-10): this previously called
+        `/api/session/{id}/message`, which is a session-lifecycle EVENT log
+        (model-switched/agent-switched entries), not the actual
+        conversation. Every other endpoint in this adapter uses the plain
+        (non-`/api/`) path — `/session/{id}/message` is the real message
+        history, verified directly against the live isolated server
+        (returns real user/assistant messages with role and text parts)."""
         import httpx
         async with httpx.AsyncClient() as client:
             r = await client.get(
-                f"{self.base_url}/api/session/{session_id}/message",
+                f"{self.base_url}/session/{session_id}/message",
                 params={"directory": directory, "limit": limit},
                 headers=self._headers(),
                 timeout=10,

@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Jarvis Companion</string>
+
+    <!-- Settings / pairing screen -->
+    <string name="pairing_title">Pair with Jarvis</string>
+    <string name="pairing_host_hint">Server host or LAN IP</string>
+    <string name="pairing_port_hint">Port (e.g. 8443)</string>
+    <string name="pairing_token_hint">API token (leave blank if none configured)</string>
+    <string name="pairing_probe_button">Probe &amp; Pair</string>
+    <string name="pairing_confirm_title">Confirm server identity</string>
+    <string name="pairing_confirm_message">SHA-256 fingerprint:\n%1$s\n\nConfirm this matches the certificate printed by the Jarvis server before trusting it.</string>
+    <string name="pairing_confirm_button">Trust and Pair</string>
+    <string name="pairing_cancel_button">Cancel</string>
+    <string name="pairing_probe_failed">Could not reach %1$s:%2$d — %3$s</string>
+    <string name="paired_status_paired">Paired with %1$s:%2$d</string>
+    <string name="paired_status_unpaired">Not paired</string>
+    <string name="unpair_button">Unpair</string>
+    <string name="start_service_button">Start companion</string>
+    <string name="stop_service_button">Stop companion</string>
+    <string name="notification_permission_status_granted">Notifications: granted</string>
+    <string name="notification_permission_status_denied">Notifications: not granted</string>
+    <string name="grant_notification_permission_button">Grant notification permission</string>
+    <string name="battery_status_unrestricted">Battery: unrestricted (recommended)</string>
+    <string name="battery_status_restricted">Battery: optimized — may drop the connection while the screen is off</string>
+    <string name="request_battery_exemption_button">Request unrestricted battery</string>
+    <string name="open_connection_status_button">Connection status</string>
+    <string name="open_diagnostics_button">Diagnostics</string>
+
+    <!-- Connection status screen -->
+    <string name="connection_status_title">Connection status</string>
+    <string name="connection_state_connected">Connected</string>
+    <string name="connection_state_connecting">Connecting…</string>
+    <string name="connection_state_reconnecting">Reconnecting…</string>
+    <string name="connection_state_disconnected">Disconnected</string>
+    <string name="connection_state_unpaired">Not paired</string>
+    <string name="connection_state_failed_permanent">Connection failed — re-pairing required</string>
+
+    <!-- Diagnostics screen -->
+    <string name="diagnostics_title">Diagnostics</string>
+    <string name="diagnostics_no_telemetry_yet">(no telemetry yet)</string>
+
+    <!-- Attention screen -->
+    <string name="attention_title">Attention requests</string>
+    <string name="attention_empty">No outstanding items.</string>
+</resources>

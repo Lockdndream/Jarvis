@@ -235,6 +235,74 @@ class ToolRegistry:
             lines.append(f"  - {alias}: {dn}" + (f" — {desc}" if desc else ""))
         return "\n".join(lines)
 
+    # ── Milestone 8: AttentionRequest / VoiceSession tools ─────────
+    # Bounded and deterministic-error: full IDs (never truncated), no
+    # unrestricted scheduler control, no silent source mutation.
+
+    async def _list_attention_requests(self) -> str:
+        rows = db.get_unresolved_attention_requests()
+        if not rows:
+            return "No unresolved attention requests."
+        lines = [f"{len(rows)} unresolved attention request(s):"]
+        for r in rows[:20]:
+            lines.append(
+                f"  - [{r['attention_request_id']}] {r['attention_type']} ({r['status']}): {r['summary'][:100]}"
+            )
+        return "\n".join(lines)
+
+    async def _get_attention_request(self, attention_request_id: str) -> str:
+        r = db.get_attention_request(attention_request_id)
+        if not r:
+            return f"Attention request '{attention_request_id}' not found"
+        lines = [
+            f"Attention: {r['attention_request_id']}",
+            f"Type: {r['attention_type']}",
+            f"Status: {r['status']}",
+            f"Summary: {r['summary']}",
+            f"Task: {r['task_id']}",
+        ]
+        if r.get("deferred_until"):
+            lines.append(f"Deferred until: {r['deferred_until']}")
+        if r.get("resolution_type"):
+            lines.append(f"Resolution: {r['resolution_type']} = {r.get('resolution_value')}")
+        return "\n".join(lines)
+
+    async def _defer_attention(self, attention_request_id: str, deferred_until: str) -> str:
+        from app import attention_manager
+        row = db.get_attention_request(attention_request_id)
+        if not row:
+            return f"Attention request '{attention_request_id}' not found"
+        ok = await attention_manager.defer(attention_request_id, deferred_until)
+        if not ok:
+            return f"Could not defer '{attention_request_id}' (it may already be resolved/cancelled)"
+        return f"Deferred {attention_request_id} until {deferred_until}"
+
+    async def _resume_attention(self, attention_request_id: str) -> str:
+        from app import attention_manager
+        row = db.get_attention_request(attention_request_id)
+        if not row:
+            return f"Attention request '{attention_request_id}' not found"
+        if row["status"] != "deferred":
+            return f"Attention request '{attention_request_id}' is not deferred (status: {row['status']})"
+        ok = await attention_manager.mark_due(attention_request_id)
+        if not ok:
+            return f"Could not resume '{attention_request_id}'"
+        fresh = db.get_attention_request(attention_request_id)
+        await attention_manager.initiate_contact(self._oc.cm, fresh)
+        return f"Resumed {attention_request_id}"
+
+    async def _open_voice_session(self, conversation_id: str, attention_request_id: str | None = None) -> str:
+        from app.main import voice_session_manager
+        session = voice_session_manager.open_session(conversation_id, attention_request_id)
+        return f"Voice session opened: {session['voice_session_id']} (state={session['state']})"
+
+    async def _close_voice_session(self, voice_session_id: str) -> str:
+        from app.main import voice_session_manager
+        ok = voice_session_manager.close_session(voice_session_id)
+        if not ok:
+            return f"Voice session '{voice_session_id}' not found"
+        return f"Voice session {voice_session_id} closed"
+
     def _register_all(self):
         self._register("get_attention", "Get summary of everything needing user attention", {"type": "object", "properties": {}, "required": []}, self._get_attention)
         self._register("list_tasks", "List all active, waiting, and recent tasks", {"type": "object", "properties": {}, "required": []}, self._list_tasks)
@@ -246,3 +314,9 @@ class ToolRegistry:
         self._register("cancel_task", "Cancel a running task", {"type": "object", "properties": {"task_id": {"type": "string", "description": "Task ID"}}, "required": ["task_id"]}, self._cancel_task)
         self._register("recent_activity", "Get recent meaningful events", {"type": "object", "properties": {"count": {"type": "integer", "description": "Number of events (max 50)", "default": 5}}, "required": []}, self._recent_activity)
         self._register("get_projects", "List configured safe project aliases", {"type": "object", "properties": {}, "required": []}, self._get_projects)
+        self._register("list_attention_requests", "List all unresolved AttentionRequests (pending/contacting/deferred/resolving)", {"type": "object", "properties": {}, "required": []}, self._list_attention_requests)
+        self._register("get_attention_request", "Get full detail for a specific AttentionRequest by ID", {"type": "object", "properties": {"attention_request_id": {"type": "string", "description": "Attention request ID"}}, "required": ["attention_request_id"]}, self._get_attention_request)
+        self._register("defer_attention", "Defer an AttentionRequest until a specific ISO-8601 UTC timestamp. Never answers or cancels the underlying source.", {"type": "object", "properties": {"attention_request_id": {"type": "string", "description": "Attention request ID"}, "deferred_until": {"type": "string", "description": "ISO-8601 UTC timestamp to re-contact at"}}, "required": ["attention_request_id", "deferred_until"]}, self._defer_attention)
+        self._register("resume_attention", "Mark a deferred AttentionRequest as due now, re-evaluating contact policy immediately", {"type": "object", "properties": {"attention_request_id": {"type": "string", "description": "Attention request ID"}}, "required": ["attention_request_id"]}, self._resume_attention)
+        self._register("open_voice_session", "Open a voice session, optionally bound to a specific AttentionRequest for scoped answer resolution", {"type": "object", "properties": {"conversation_id": {"type": "string", "description": "Conversation ID"}, "attention_request_id": {"type": "string", "description": "Optional AttentionRequest ID to bind"}}, "required": ["conversation_id"]}, self._open_voice_session)
+        self._register("close_voice_session", "Close an open voice session", {"type": "object", "properties": {"voice_session_id": {"type": "string", "description": "Voice session ID"}}, "required": ["voice_session_id"]}, self._close_voice_session)

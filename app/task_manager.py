@@ -22,6 +22,8 @@ from .database import (
 from .protocol import parse_line
 from . import notifications
 from . import attention_policy
+from . import worker_events
+from . import attention_manager
 
 logger = logging.getLogger("jarvis")
 
@@ -160,12 +162,18 @@ class TaskManager:
         await self._emit_event("question_asked", payload)
         logger.info("Question %s detected from task %s", question_id[:8], task_id[:8])
 
-        await notifications.notify(
-            self._conn_manager, attention_policy.KIND_QUESTION_CREATED,
-            conversation_id=None, task_id=task_id,
-            source_type="local_question", source_id=question_id,
-            title="Jarvis needs your answer",
-            body=f"{name} is waiting for your answer.",
+        # Milestone 8: AttentionRequest is the persistent representation
+        # that human attention is required; it owns contact policy and
+        # decides whether/how to notify (Notification remains just one
+        # possible delivery artifact — see app/worker_events.py and
+        # app/attention_manager.py).
+        await worker_events.create_attention(
+            self._conn_manager,
+            worker_events.WorkerAttentionEvent(
+                worker_type="mock_worker", worker_task_id=task_id,
+                event_type=worker_events.QUESTION_REQUIRED, source_id=question_id,
+                summary=f"{name} is waiting for your answer.", urgency="HIGH",
+            ),
         )
 
     # ── exit monitoring ────────────────────────────────────────────
@@ -192,14 +200,30 @@ class TaskManager:
 
             update_task_status(task_id, status, exit_code)
             await self._emit_task_event(ev_type, task_id, name, exit_code=exit_code)
-            kind = attention_policy.KIND_TASK_FAILED if status == "failed" else attention_policy.KIND_TASK_COMPLETED
-            await notifications.notify(
-                self._conn_manager, kind,
-                conversation_id=None, task_id=task_id,
-                source_type="local_task", source_id=task_id,
-                title=f"Jarvis task {status}",
-                body=f"{name} {status}.",
-            )
+
+            if status == "failed":
+                # Milestone 8 Phase 4: a task failure is user-actionable
+                # (the worker stopped; someone needs to know) — creates a
+                # real AttentionRequest, not just a Notification.
+                await worker_events.create_attention(
+                    self._conn_manager,
+                    worker_events.WorkerAttentionEvent(
+                        worker_type="mock_worker", worker_task_id=task_id,
+                        event_type=worker_events.TASK_FAILED, source_id=task_id,
+                        summary=f"{name} failed.", urgency="HIGH",
+                    ),
+                )
+            else:
+                # Milestone 8 Phase 4: completion never automatically
+                # creates unresolved attention — it may remain a timeline
+                # event / notification, unchanged from Milestone 7.
+                await notifications.notify(
+                    self._conn_manager, attention_policy.KIND_TASK_COMPLETED,
+                    conversation_id=None, task_id=task_id,
+                    source_type="local_task", source_id=task_id,
+                    title="Jarvis task completed",
+                    body=f"{name} completed.",
+                )
         except Exception as e:
             logger.error("Monitor error for task %s: %s", task_id, e)
         finally:
@@ -241,6 +265,10 @@ class TaskManager:
 
             update_task_status(task_id, "cancelled", -1)
             await self._emit_task_event("task_cancelled", task_id, task_name, exit_code=-1)
+            # Milestone 8 Phase 20: cancelling the underlying task
+            # invalidates any of its still-unresolved AttentionRequests —
+            # never keep contacting about a source that no longer exists.
+            await attention_manager.cancel_for_task(task_id)
 
             self._processes.pop(task_id, None)
             self._stdins.pop(task_id, None)
@@ -286,6 +314,10 @@ class TaskManager:
             "task_id": task_id,
             "answer": answer,
         })
+
+        # Milestone 8: resolve only after native delivery has already
+        # succeeded (stdin write+drain raised nothing) — never before.
+        await attention_manager.resolve_for_source("local_question", question_id, "answered", answer)
 
         logger.info("Question %s answered, task %s resumed", question_id[:8], task_id[:8])
         return f"Answer delivered to task {task_id[:8]}"

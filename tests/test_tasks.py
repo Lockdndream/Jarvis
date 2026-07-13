@@ -179,7 +179,8 @@ async def test_invalid_cancellation():
 async def test_mark_interrupted():
     """mark_running_tasks_interrupted updates stuck tasks."""
     db.create_task_record("interrupted-1", "Stuck Task", "test")
-    db.mark_running_tasks_interrupted()
+    affected = db.mark_running_tasks_interrupted()
+    assert "interrupted-1" in affected
 
     task = db.get_task("interrupted-1")
     assert task["status"] == "failed"
@@ -189,7 +190,8 @@ async def test_mark_interrupted():
     # Already-completed tasks should be unaffected
     db.create_task_record("interrupted-2", "Done Task", "test")
     db.update_task_status("interrupted-2", "completed", 0)
-    db.mark_running_tasks_interrupted()
+    affected2 = db.mark_running_tasks_interrupted()
+    assert "interrupted-2" not in affected2
     task2 = db.get_task("interrupted-2")
     assert task2["status"] == "completed"
     assert task2["exit_code"] == 0

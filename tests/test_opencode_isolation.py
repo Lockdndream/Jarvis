@@ -23,6 +23,7 @@ from app.integrations.opencode_server import (
     default_runtime_dir,
     resolve_runtime_dir,
     isolated_env_overrides,
+    isolated_subprocess_env,
     ensure_isolated_runtime_provisioned,
 )
 
@@ -96,6 +97,30 @@ def test_isolated_env_overrides_never_reference_desktop_paths(tmp_path):
     for v in overrides.values():
         assert ".local\\share\\opencode" not in v
         assert ".config\\opencode" not in v
+
+
+# ── isolated_subprocess_env (Milestone 9B.0: credential/cost isolation) ──
+
+def test_isolated_subprocess_env_excludes_ambient_provider_credentials(tmp_path, monkeypatch):
+    """The regression this guards: a machine-wide OPENAI_API_KEY (or any
+    other ambient credential) must never reach the isolated server's
+    subprocess env — only XDG_* storage isolation was previously applied,
+    leaving `{**os.environ, ...}` to leak every ambient credential through."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-should-never-appear")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-should-never-appear")
+    overrides = isolated_env_overrides(str(tmp_path))
+    env = isolated_subprocess_env(overrides, password="pw")
+    assert "OPENAI_API_KEY" not in env
+    assert "ANTHROPIC_API_KEY" not in env
+
+
+def test_isolated_subprocess_env_still_includes_os_essentials_and_isolation(tmp_path, monkeypatch):
+    monkeypatch.setenv("PATH", "C:\\some\\path")
+    overrides = isolated_env_overrides(str(tmp_path))
+    env = isolated_subprocess_env(overrides, password="pw")
+    assert env.get("PATH") == "C:\\some\\path"
+    assert env["OPENCODE_SERVER_PASSWORD"] == "pw"
+    assert env["XDG_DATA_HOME"] == overrides["XDG_DATA_HOME"]
 
 
 # ── ensure_isolated_runtime_provisioned ──────────────────────────────
@@ -178,6 +203,7 @@ def test_provisioning_does_not_touch_desktop_paths(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_owned_server_receives_isolation_env(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_OPENCODE_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-should-never-reach-owned-spawn")
 
     async def fake_classify(port, base_url, auth):
         return ServerClassification.NONE, {}
@@ -214,6 +240,9 @@ async def test_owned_server_receives_isolation_env(monkeypatch, tmp_path):
     assert captured_env.get("XDG_CACHE_HOME") == os.path.join(str(tmp_path), "cache")
     assert captured_env.get("XDG_STATE_HOME") == os.path.join(str(tmp_path), "state")
     assert mgr.runtime_dir == str(tmp_path)
+    assert "OPENAI_API_KEY" not in captured_env, (
+        "ambient provider credentials must never reach an owned server's subprocess env"
+    )
 
 
 @pytest.mark.asyncio

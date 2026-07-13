@@ -37,6 +37,21 @@ Storage isolation (Milestone 6.1 — compatibility recovery):
     variables entirely, applied only to the spawned subprocess's own
     environment dict, never mutating `os.environ` for the Jarvis process
     itself or anything else on the machine.
+
+Credential/cost isolation (Milestone 9B.0 — recon fix):
+  - Storage isolation alone does not stop the spawned server from
+    inheriting ambient provider credentials (e.g. a machine-wide
+    OPENAI_API_KEY) if the subprocess env is built as `{**os.environ, ...}`.
+    Verified real: an inherited OPENAI_API_KEY caused an isolated-runtime
+    session to actually run gpt-5.3-chat-latest/gpt-5-nano via OpenAI,
+    silently, despite only an OpenRouter key ever being provisioned into
+    the isolated auth.json.
+  - Fixed by building the owned-spawn subprocess env from an explicit
+    OS-essential allowlist (`isolated_subprocess_env`/`_OS_ESSENTIAL_ENV_VARS`)
+    instead of inheriting the full ambient environment. The isolated
+    server's own provider credential comes only from its isolated
+    auth.json (ensure_isolated_runtime_provisioned), never from the
+    process environment at spawn time.
 """
 import asyncio
 import json
@@ -77,6 +92,33 @@ def isolated_env_overrides(runtime_dir: str) -> dict:
         "XDG_CACHE_HOME": os.path.join(runtime_dir, "cache"),
         "XDG_STATE_HOME": os.path.join(runtime_dir, "state"),
     }
+
+
+# OS-essential variables a Windows Bun/Node binary needs to run at all.
+# Deliberately an allowlist: storage isolation (XDG_* above) isolates
+# *where* the server reads/writes, but `{**os.environ, ...}` would still
+# hand it every ambient credential on the machine (e.g. a machine-wide
+# OPENAI_API_KEY). The isolated server's own OpenRouter credential comes
+# from ensure_isolated_runtime_provisioned's isolated auth.json, never from
+# the process environment at spawn time, so no provider credential needs to
+# be in this list at all (Milestone 9B.0 — closes a real observed gap: an
+# inherited OPENAI_API_KEY caused a genuine paid gpt-5.3-chat-latest call).
+_OS_ESSENTIAL_ENV_VARS = (
+    "PATH", "SYSTEMROOT", "SYSTEMDRIVE", "COMSPEC", "PATHEXT",
+    "TEMP", "TMP", "USERPROFILE", "USERNAME", "APPDATA", "LOCALAPPDATA",
+    "HOMEDRIVE", "HOMEPATH", "WINDIR",
+    "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE", "PROCESSOR_IDENTIFIER",
+)
+
+
+def isolated_subprocess_env(isolation_env: dict, password: str) -> dict:
+    """Build the full env dict for a Jarvis-owned opencode serve subprocess.
+
+    Allowlist, not `{**os.environ, ...}` — see _OS_ESSENTIAL_ENV_VARS."""
+    env = {name: os.environ[name] for name in _OS_ESSENTIAL_ENV_VARS if name in os.environ}
+    env["OPENCODE_SERVER_PASSWORD"] = password
+    env.update(isolation_env)
+    return env
 
 
 def ensure_isolated_runtime_provisioned(runtime_dir: str) -> None:
@@ -289,7 +331,7 @@ class OpenCodeServerManager:
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
             cwd=self.project_dir,
-            env={**os.environ, "OPENCODE_SERVER_PASSWORD": self.password, **isolation_env},
+            env=isolated_subprocess_env(isolation_env, self.password),
         )
         await self._wait_for_healthy(timeout=30)
 

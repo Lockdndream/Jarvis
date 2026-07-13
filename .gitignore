@@ -42,6 +42,14 @@ Thumbs.db
 # Local machine-specific project aliases (see app/supervisor/projects.py)
 projects.json
 
+# Android (spikes/android-presence, android/) — machine-specific SDK path,
+# Gradle's local cache, and any dev keystore (not a secret, just noise/
+# per-machine state; not meant to be reproduced from source control)
+local.properties
+.gradle/
+*.jks
+*.keystore
+
 # Backup files
 *.bak-*
 

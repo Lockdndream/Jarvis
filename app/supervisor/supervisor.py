@@ -13,6 +13,8 @@ import app.database as db
 from app.supervisor.tools import ToolRegistry
 from app.supervisor.llm import LLMProvider, FakeLLMProvider
 from app.supervisor.context import build_context
+from app import deferral
+from app import attention_manager
 
 logger = logging.getLogger(__name__)
 
@@ -63,8 +65,20 @@ class Supervisor:
     def llm(self):
         return self._llm
 
-    async def process_message(self, user_message: str, conversation_id: str | None = None) -> dict:
+    async def process_message(
+        self, user_message: str, conversation_id: str | None = None,
+        bound_attention_request_id: str | None = None,
+    ) -> dict:
         """Process a user message through the supervisor.
+
+        `bound_attention_request_id` (Milestone 8 Phase 12): set only when
+        this message came from a voice session opened *from* a specific
+        AttentionRequest (e.g. tapping its mic). Deterministic
+        answer/approve/reject/stop/defer resolution then targets that
+        exact source directly — no global ambiguity resolution against
+        unrelated attention items. Never overrides safety: if the bound
+        request is already resolved/cancelled, that's reported instead of
+        acting on a stale source.
 
         Returns dict with:
           - "response": the assistant's conversational response text
@@ -85,6 +99,29 @@ class Supervisor:
             _persist_conversation(conversation_id, "user", user_message)
             _persist_conversation(conversation_id, "assistant", fast)
             return {"response": fast, "conversation_id": conversation_id}
+
+        # Milestone 8 Phase 18: deterministic deferral phrases ("Come back
+        # in 15 minutes", "remind me tomorrow morning") are checked before
+        # both the answer/approve/stop grammar and the LLM — a defer
+        # intent is syntactically distinctive enough that checking it
+        # first cannot plausibly misfire against an unrelated answer.
+        deferred = await _resolve_defer_command(user_message, bound_attention_request_id)
+        if deferred:
+            _persist_conversation(conversation_id, "user", user_message)
+            _persist_conversation(conversation_id, "assistant", deferred)
+            return {"response": deferred, "conversation_id": conversation_id}
+
+        # Milestone 8 Phase 12: when this turn came from a voice session
+        # bound to a specific AttentionRequest, resolve answer/approve/
+        # reject/stop against *that exact source* — no ambiguity check
+        # against unrelated pending items, but also never act on a stale
+        # (already resolved/cancelled) source.
+        if bound_attention_request_id:
+            bound = await _resolve_bound_command(user_message, self.tools, bound_attention_request_id)
+            if bound:
+                _persist_conversation(conversation_id, "user", user_message)
+                _persist_conversation(conversation_id, "assistant", bound)
+                return {"response": bound, "conversation_id": conversation_id}
 
         # Milestone 7 Phase 10: deterministic voice/text command resolution
         # for "Answer B", "Approve it", "Reject it", "Stop it" and close
@@ -267,6 +304,109 @@ def _match_pending_option(cleaned: str, pending_question: dict) -> str | None:
     words = set(re.findall(r"[a-z0-9']+", cleaned.lower()))
     matched = [opt for opt in options if str(opt).strip().lower() in words]
     return str(matched[0]) if len(matched) == 1 else None
+
+
+# ── Milestone 8 Phase 18: deterministic deferral fast path ──────────
+
+def _describe_relative(deferred_until_iso: str) -> str:
+    """Only ever used in a confirmation message, only after defer state
+    has already been successfully persisted (Phase 7/18)."""
+    from datetime import datetime, timezone as _tz
+
+    target = datetime.fromisoformat(deferred_until_iso.replace("Z", "+00:00"))
+    now = datetime.now(_tz.utc)
+    minutes = int((target - now).total_seconds() // 60)
+    if minutes <= 0:
+        return "shortly"
+    if minutes < 60:
+        return f"in {minutes} minute{'s' if minutes != 1 else ''}"
+    hours = round(minutes / 60)
+    if hours < 20:
+        return f"in about {hours} hour{'s' if hours != 1 else ''}"
+    local_target = target.astimezone()
+    return "around " + local_target.strftime("%A %I:%M %p").lstrip("0")
+
+
+async def _resolve_defer_command(msg: str, bound_attention_request_id: str | None) -> str | None:
+    """Milestone 8 Phase 18. If bound to a specific AttentionRequest
+    (Phase 12), defers exactly that one. Otherwise: exactly one active
+    (pending/contacting) AttentionRequest -> defer it; zero -> defer
+    entirely to ordinary conversation (returns None, matching the same
+    "nothing to guess about" philosophy as Phase 10's answer/stop paths);
+    more than one -> ask which, never guess."""
+    result = deferral.parse_defer_phrase(msg)
+    if result.kind == "none":
+        return None
+
+    if bound_attention_request_id:
+        row = db.get_attention_request(bound_attention_request_id)
+        if not row or row["status"] in ("resolved", "cancelled", "expired"):
+            return "That item is already resolved — there's nothing to come back to."
+        target_id = bound_attention_request_id
+    else:
+        candidates = [r for r in db.get_unresolved_attention_requests() if r["status"] in ("pending", "contacting")]
+        if not candidates:
+            return None
+        if len(candidates) > 1:
+            return f"I have {len(candidates)} things needing attention — which one should I come back to later?"
+        target_id = candidates[0]["attention_request_id"]
+
+    if result.kind == "vague":
+        return result.message
+
+    ok = await attention_manager.defer(target_id, result.deferred_until)
+    if not ok:
+        return "I couldn't defer that — it may have already been resolved."
+    return f"Okay. I'll come back to this {_describe_relative(result.deferred_until)}."
+
+
+async def _resolve_bound_command(msg: str, tools, attention_request_id: str) -> str | None:
+    """Milestone 8 Phase 12: same grammar as _resolve_deterministic_command,
+    but always targets the bound AttentionRequest's exact source — never
+    counts pending items, never asks "which one". If the bound request is
+    already resolved/cancelled/expired, reports that instead of acting on
+    a stale source (safety always wins over context binding)."""
+    row = db.get_attention_request(attention_request_id)
+    if not row:
+        return None
+    if row["status"] in ("resolved", "cancelled", "expired"):
+        return f"That item is already {row['status']} — nothing more to do there."
+
+    cleaned = msg.strip().rstrip(".!?")
+    lowered = cleaned.lower()
+    source_id = row["source_id"]
+
+    if row["attention_type"] == "QUESTION":
+        answer_text = None
+        m = _ANSWER_RE.match(lowered)
+        if m:
+            answer_text = cleaned[m.start(1):].strip()
+        else:
+            question = db.get_question_record(source_id)
+            if question:
+                answer_text = _match_pending_option(cleaned, question)
+        if answer_text:
+            result = await tools.call("answer_question", {"question_id": source_id, "answer": answer_text})
+            if result.startswith("Error"):
+                return f"I couldn't deliver that answer: {result}"
+            return f'Delivered your answer: "{answer_text}"'
+
+    if row["attention_type"] == "PERMISSION":
+        m = _PERMISSION_RE.match(lowered)
+        if m:
+            decision = "reject" if m.group(1) in ("reject", "deny") else "approve"
+            result = await tools.call("resolve_permission", {"permission_id": source_id, "decision": decision})
+            if result.startswith("Error"):
+                return f"I couldn't {decision} that: {result}"
+            return "Permission approved." if decision == "approve" else "Permission rejected."
+
+    if _STOP_RE.match(lowered) and row.get("task_id"):
+        result = await tools.call("cancel_task", {"task_id": row["task_id"]})
+        if result.startswith("Error"):
+            return f"I couldn't stop that task: {result}"
+        return "Task stopped."
+
+    return None
 
 
 async def _resolve_deterministic_command(msg: str, tools) -> str | None:

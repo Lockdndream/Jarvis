@@ -9,6 +9,8 @@ import uuid
 import app.database as db
 from app import notifications
 from app import attention_policy
+from app import worker_events
+from app import attention_manager
 from app.integrations.opencode_server import OpenCodeServerManager
 from app.integrations.opencode_adapter import OpenCodeAdapter
 from app.integrations.opencode_events import normalize_question, normalize_permission, process_sse_event
@@ -102,8 +104,16 @@ class OpenCodeSupervisor:
         await self.server.stop()
         logger.info("OpenCode supervisor stopped")
 
-    async def start_session(self, project_dir: str, instruction: str) -> dict:
+    async def start_session(
+        self, project_dir: str, instruction: str,
+        provider_id: str | None = None, model_id: str | None = None,
+    ) -> dict:
         """Create a new OpenCode session and link it to a Jarvis task.
+
+        provider_id/model_id optionally override the default pinned
+        free-only model (still validated free-only) — e.g. to spread
+        concurrent delegated sessions across different free-tier models
+        instead of contending for the same rate limit.
 
         Returns dict with task_id, session_id, and name.
         """
@@ -124,7 +134,7 @@ class OpenCodeSupervisor:
         self._completion_events[task_id] = asyncio.Event()
         self._error_since_prompt[task_id] = False
 
-        await self.adapter.send_prompt(session_id, project_dir, instruction)
+        await self.adapter.send_prompt(session_id, project_dir, instruction, provider_id=provider_id, model_id=model_id)
         logger.info("opencode instruction submitted: task_id=%s session_id=%s", task_id, session_id)
 
         return {"task_id": task_id, "session_id": session_id, "name": f"OpenCode: {instruction[:50]}"}
@@ -160,6 +170,10 @@ class OpenCodeSupervisor:
             "type": "opencode_task_cancelled",
             "task_id": task_id,
         })
+        # Milestone 8 Phase 20: invalidate any still-unresolved
+        # AttentionRequests tied to this task — never keep contacting
+        # about a source that no longer exists.
+        await attention_manager.cancel_for_task(task_id)
         return f"OpenCode task {task_id} cancelled"
 
     def _clear_waiting_state(self, task_id: str) -> None:
@@ -195,6 +209,9 @@ class OpenCodeSupervisor:
             "question_id": question_id,
             "task_id": record["task_id"],
         })
+        # Milestone 8: resolve only after adapter.reply_question() above
+        # has already succeeded without raising — never before.
+        await attention_manager.resolve_for_source("opencode_question", question_id, "answered", answer)
         return f"Answered question {question_id}"
 
     async def reject_question(self, question_id: str) -> str:
@@ -213,6 +230,11 @@ class OpenCodeSupervisor:
             "question_id": question_id,
             "task_id": record["task_id"],
         })
+        # A reject is a real user decision (native delivery already
+        # succeeded above), not a source invalidation — resolve, don't
+        # cancel (Phase 20: "answered elsewhere -> RESOLVED or CANCELLED
+        # according to semantics").
+        await attention_manager.resolve_for_source("opencode_question", question_id, "rejected", None)
         return f"Rejected question {question_id}"
 
     async def approve_permission(self, permission_id: str, approved: bool) -> str:
@@ -237,6 +259,11 @@ class OpenCodeSupervisor:
             "task_id": record["task_id"],
             "approved": approved,
         })
+        # Milestone 8: resolve only after adapter.reply_permission() above
+        # has already succeeded without raising — never before.
+        await attention_manager.resolve_for_source(
+            "opencode_permission", permission_id, "approved" if approved else "denied", None,
+        )
         return f"Permission {permission_id} {'approved' if approved else 'denied'}"
 
     async def get_status(self) -> dict:
@@ -420,12 +447,13 @@ class OpenCodeSupervisor:
 
         task = db.get_task(task_id)
         task_name = task["name"] if task else "A task"
-        await notifications.notify(
-            self.cm, attention_policy.KIND_QUESTION_CREATED,
-            conversation_id=None, task_id=task_id,
-            source_type="opencode_question", source_id=request_id,
-            title="Jarvis needs your answer",
-            body=f"{task_name} is waiting for your answer.",
+        await worker_events.create_attention(
+            self.cm,
+            worker_events.WorkerAttentionEvent(
+                worker_type="opencode", worker_task_id=task_id,
+                event_type=worker_events.QUESTION_REQUIRED, source_id=request_id,
+                summary=f"{task_name} is waiting for your answer.", urgency="HIGH",
+            ),
         )
 
     async def _emit_permission(self, event: dict) -> None:
@@ -460,12 +488,13 @@ class OpenCodeSupervisor:
         # detail here. Full context is already visible in the authenticated
         # app's Needs Your Attention panel (the task_permission WS message
         # above carries the real path/action for that surface).
-        await notifications.notify(
-            self.cm, attention_policy.KIND_PERMISSION_CREATED,
-            conversation_id=None, task_id=task_id,
-            source_type="opencode_permission", source_id=request_id,
-            title="Jarvis needs a permission decision",
-            body=f"{task_name} needs your permission to continue.",
+        await worker_events.create_attention(
+            self.cm,
+            worker_events.WorkerAttentionEvent(
+                worker_type="opencode", worker_task_id=task_id,
+                event_type=worker_events.PERMISSION_REQUIRED, source_id=request_id,
+                summary=f"{task_name} needs your permission to continue.", urgency="HIGH",
+            ),
         )
 
     async def _emit_message(self, event: dict) -> None:
@@ -506,12 +535,13 @@ class OpenCodeSupervisor:
             "source": "opencode",
         })
         task_name = task["name"] if task else "A task"
-        await notifications.notify(
-            self.cm, attention_policy.KIND_TASK_FAILED,
-            conversation_id=None, task_id=task_id,
-            source_type="opencode_task", source_id=task_id,
-            title="Jarvis task failed",
-            body=f"{task_name} failed.",
+        await worker_events.create_attention(
+            self.cm,
+            worker_events.WorkerAttentionEvent(
+                worker_type="opencode", worker_task_id=task_id,
+                event_type=worker_events.TASK_FAILED, source_id=task_id,
+                summary=f"{task_name} failed.", urgency="HIGH",
+            ),
         )
 
     async def _handle_session_idle(self, event: dict) -> None:

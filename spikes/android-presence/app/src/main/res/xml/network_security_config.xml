@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Trusts the real Jarvis dev server's mkcert LAN certificate, scoped only
+  to that specific LAN IP — not a general trust-everything override. This
+  is the same certificate the browser-based PWA already prompts a user to
+  accept once (README.md's mkcert setup); this just does the equivalent
+  for this native test client. Per the spike's own scope boundary: test-
+  only, uses the existing Jarvis-compatible endpoint, no new auth/pairing
+  system, no weakening of production Jarvis security.
+-->
+<network-security-config>
+    <domain-config>
+        <domain includeSubdomains="false">192.168.1.27</domain>
+        <trust-anchors>
+            <certificates src="@raw/jarvis_lan_cert" />
+        </trust-anchors>
+    </domain-config>
+</network-security-config>

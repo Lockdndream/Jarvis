@@ -6,6 +6,9 @@ python-dotenv>=1.1.0
 # Milestone 7: Web Push (VAPID) — no paid dependency, open-source library
 pywebpush>=2.0.0
 
+# Milestone 9B.2: short-lived signed WebSocket tokens (ADR-014)
+PyJWT>=2.10.0
+
 # testing
 pytest>=8.0
 pytest-asyncio>=0.24.0

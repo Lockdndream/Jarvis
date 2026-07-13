@@ -80,18 +80,60 @@ def get_recent_tasks(limit: int = 20) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def mark_running_tasks_interrupted():
+def mark_running_tasks_interrupted() -> list[str]:
+    """Milestone 8 reconnaissance finding (real pre-existing bug, fixed
+    here): this used to unconditionally fail every running/waiting task and
+    cancel every pending question on restart — including OpenCode-backed
+    ones. That's correct for a local subprocess (its stdin pipe and process
+    are genuinely gone after a Jarvis restart), but wrong for an OpenCode
+    task: the session lives in OpenCode's own persistent, isolated storage
+    (Milestone 6.1) independent of the Jarvis process, so a pending
+    OpenCode question is still real and still answerable after Jarvis
+    restarts. Scoped here to exclude any task_id present in opencode_tasks
+    — those are handled instead by mark_running_opencode_tasks_interrupted()
+    ('degraded', not a false failure) and, as of Milestone 8, by
+    AttentionRequest's own restart-survival (deferred/pending state is
+    preserved verbatim across restart).
+
+    Milestone 8.1 real-phone finding (2026-07-10): for a *local* task, this
+    function's own cancellation here is itself a genuine source
+    invalidation (Phase 20: "source disappears -> terminal state, not
+    indefinite contact") — a deferred AttentionRequest whose local question
+    just got force-cancelled here must not be left pointing at a dead
+    source, waiting to re-contact the user about a question that no longer
+    exists. Returns the affected task_ids so the caller (app/main.py's
+    lifespan) can cancel any associated AttentionRequest — done at the call
+    site, not here, since app/database.py cannot import attention_manager
+    (which itself imports this module) without a circular import."""
     conn = get_conn()
+    now = utcnow()
+    affected = {
+        r["task_id"] for r in conn.execute(
+            "SELECT task_id FROM tasks WHERE status IN ('running', 'waiting_for_user') "
+            "AND task_id NOT IN (SELECT task_id FROM opencode_tasks)"
+        ).fetchall()
+    }
+    affected |= {
+        r["task_id"] for r in conn.execute(
+            "SELECT task_id FROM questions WHERE status='pending' "
+            "AND task_id NOT IN (SELECT task_id FROM opencode_tasks)"
+        ).fetchall()
+    }
     conn.execute(
-        "UPDATE tasks SET status='failed', completed_at=?, exit_code=-1 WHERE status IN ('running', 'waiting_for_user')",
-        (utcnow(),),
+        "UPDATE tasks SET status='failed', completed_at=?, exit_code=-1 "
+        "WHERE status IN ('running', 'waiting_for_user') "
+        "AND task_id NOT IN (SELECT task_id FROM opencode_tasks)",
+        (now,),
     )
     conn.execute(
-        "UPDATE questions SET status='cancelled', answered_at=? WHERE status='pending'",
-        (utcnow(),),
+        "UPDATE questions SET status='cancelled', answered_at=? "
+        "WHERE status='pending' "
+        "AND task_id NOT IN (SELECT task_id FROM opencode_tasks)",
+        (now,),
     )
     conn.commit()
     conn.close()
+    return sorted(affected)
 
 
 def create_question_record(question_id, task_id, question_text, context, options_json):
@@ -376,6 +418,60 @@ def init_db():
             value TEXT NOT NULL
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS attention_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            attention_request_id TEXT UNIQUE NOT NULL,
+            conversation_id TEXT,
+            task_id TEXT,
+            source_type TEXT NOT NULL,
+            source_id TEXT NOT NULL,
+            attention_type TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            urgency TEXT NOT NULL DEFAULT 'NORMAL',
+            summary TEXT NOT NULL,
+            context_json TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            deferred_until TEXT,
+            resolved_at TEXT,
+            resolution_type TEXT,
+            resolution_value TEXT,
+            contact_policy TEXT,
+            last_contact_at TEXT,
+            next_contact_at TEXT,
+            contact_attempt_count INTEGER NOT NULL DEFAULT 0,
+            dedup_key TEXT UNIQUE NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS contact_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            contact_attempt_id TEXT UNIQUE NOT NULL,
+            attention_request_id TEXT NOT NULL,
+            channel TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'planned',
+            created_at TEXT NOT NULL,
+            started_at TEXT,
+            completed_at TEXT,
+            result TEXT,
+            error_code TEXT,
+            notification_id TEXT,
+            voice_session_id TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS voice_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            voice_session_id TEXT UNIQUE NOT NULL,
+            conversation_id TEXT NOT NULL,
+            attention_request_id TEXT,
+            state TEXT NOT NULL DEFAULT 'idle',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            closed_at TEXT
+        )
+    """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_events_id ON events(id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_task_id ON tasks(task_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_questions_question_id ON questions(question_id)")
@@ -387,6 +483,14 @@ def init_db():
     conn.execute("CREATE INDEX IF NOT EXISTS idx_notifications_dedup_key ON notifications(dedup_key)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_notifications_task_id ON notifications(task_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_push_subscriptions_endpoint ON push_subscriptions(endpoint)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_attention_dedup_key ON attention_requests(dedup_key)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_attention_source ON attention_requests(source_type, source_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_attention_task_id ON attention_requests(task_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_attention_conversation_id ON attention_requests(conversation_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_attention_status ON attention_requests(status)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_contact_attempts_attention_id ON contact_attempts(attention_request_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_voice_sessions_conversation_id ON voice_sessions(conversation_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_voice_sessions_attention_id ON voice_sessions(attention_request_id)")
     conn.commit()
     conn.close()
 
@@ -590,6 +694,302 @@ def set_setting(key: str, value: str) -> None:
         "INSERT INTO settings (key, value) VALUES (?, ?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         (key, value),
+    )
+    conn.commit()
+    conn.close()
+
+
+# ── AttentionRequest (Milestone 8) ────────────────────────────────────
+#
+# The persistent representation that human attention is required — distinct
+# from a Notification (a delivery artifact) and from the underlying
+# WorkerQuestion/permission/task (the source). See app/attention_manager.py
+# for the state machine and orchestration; this module is pure data access,
+# same convention as the rest of database.py. Idempotent creation by
+# dedup_key (INSERT OR IGNORE), same pattern as create_notification().
+
+
+def create_attention_request(
+    attention_request_id: str,
+    conversation_id: str | None,
+    task_id: str | None,
+    source_type: str,
+    source_id: str,
+    attention_type: str,
+    urgency: str,
+    summary: str,
+    context_json: str | None,
+    contact_policy: str | None,
+    dedup_key: str,
+) -> dict:
+    """Idempotent by dedup_key. Returns the resulting row plus a 'created'
+    flag (False if an AttentionRequest for this exact source already
+    existed — the pre-existing row is returned unchanged)."""
+    conn = get_conn()
+    now = utcnow()
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO attention_requests "
+        "(attention_request_id, conversation_id, task_id, source_type, source_id, "
+        " attention_type, status, urgency, summary, context_json, created_at, updated_at, "
+        " contact_policy, contact_attempt_count, dedup_key) "
+        "VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, 0, ?)",
+        (attention_request_id, conversation_id, task_id, source_type, source_id,
+         attention_type, urgency, summary, context_json, now, now, contact_policy, dedup_key),
+    )
+    created = cur.rowcount == 1
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM attention_requests WHERE dedup_key=?", (dedup_key,)
+    ).fetchone()
+    conn.close()
+    result = dict(row)
+    result["created"] = created
+    return result
+
+
+def get_attention_request(attention_request_id: str) -> dict | None:
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT * FROM attention_requests WHERE attention_request_id=?", (attention_request_id,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_attention_request_by_dedup_key(dedup_key: str) -> dict | None:
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT * FROM attention_requests WHERE dedup_key=?", (dedup_key,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_attention_request_by_source(source_type: str, source_id: str) -> dict | None:
+    """Deterministic source correlation (Milestone 8 Phase 3) — the exact
+    mapping a later action (defer, answer, cancel) must route through,
+    never inferred from UI order, truncated IDs, or LLM memory."""
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT * FROM attention_requests WHERE source_type=? AND source_id=? "
+        "ORDER BY id DESC LIMIT 1",
+        (source_type, source_id),
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def transition_attention_status(
+    attention_request_id: str,
+    from_statuses: tuple[str, ...],
+    to_status: str,
+    **extra_fields,
+) -> bool:
+    """Guarded conditional UPDATE: only transitions if the row's *current*
+    status is one of `from_statuses` — this is the concurrency protection
+    (Phase 21) against two racing transitions (e.g. answer + defer at the
+    same time, or a scheduler tick firing while the user opens the item):
+    whichever UPDATE's WHERE clause matches first wins (SQLite's WAL-mode
+    single-writer semantics make this atomic); the loser's rowcount is 0
+    and it must not report success. Legal-transition *validation* (which
+    from_statuses are meaningful for a given to_status) lives in
+    app/attention_manager.py, not here — this function only enforces
+    whatever the caller asked for, atomically."""
+    conn = get_conn()
+    now = utcnow()
+    set_clauses = ["status=?", "updated_at=?"]
+    params: list = [to_status, now]
+    for field, value in extra_fields.items():
+        set_clauses.append(f"{field}=?")
+        params.append(value)
+    placeholders = ",".join("?" for _ in from_statuses)
+    params.append(attention_request_id)
+    params.extend(from_statuses)
+    cur = conn.execute(
+        f"UPDATE attention_requests SET {', '.join(set_clauses)} "
+        f"WHERE attention_request_id=? AND status IN ({placeholders})",
+        params,
+    )
+    conn.commit()
+    conn.close()
+    return cur.rowcount == 1
+
+
+def record_attention_contact(attention_request_id: str) -> None:
+    conn = get_conn()
+    conn.execute(
+        "UPDATE attention_requests SET contact_attempt_count=contact_attempt_count+1, "
+        "last_contact_at=?, updated_at=? WHERE attention_request_id=?",
+        (utcnow(), utcnow(), attention_request_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def set_attention_next_contact(attention_request_id: str, next_contact_at: str | None) -> None:
+    conn = get_conn()
+    conn.execute(
+        "UPDATE attention_requests SET next_contact_at=?, updated_at=? WHERE attention_request_id=?",
+        (next_contact_at, utcnow(), attention_request_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_due_attention_requests(now: str | None = None) -> list[dict]:
+    """Deferred requests whose deferred_until has passed, plus pending/
+    contacting requests whose retry-backoff next_contact_at has passed.
+    `now` is an injectable ISO-timestamp string (Phase 8: deterministic
+    clock for tests — never real-time sleep in a unit test) defaulting to
+    the real current time."""
+    now = now or utcnow()
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM attention_requests WHERE "
+        "(status='deferred' AND deferred_until IS NOT NULL AND deferred_until <= ?) "
+        "OR (status IN ('pending', 'contacting') AND next_contact_at IS NOT NULL AND next_contact_at <= ?) "
+        "ORDER BY id ASC",
+        (now, now),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_unresolved_attention_requests() -> list[dict]:
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM attention_requests WHERE status IN "
+        "('pending', 'contacting', 'deferred', 'resolving') ORDER BY created_at ASC"
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_attention_requests_for_task(task_id: str) -> list[dict]:
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM attention_requests WHERE task_id=? ORDER BY created_at ASC", (task_id,)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_attention_requests_for_conversation(conversation_id: str) -> list[dict]:
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM attention_requests WHERE conversation_id=? ORDER BY created_at ASC",
+        (conversation_id,),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+# ── ContactAttempt (Milestone 8) ──────────────────────────────────────
+
+
+def create_contact_attempt(
+    contact_attempt_id: str,
+    attention_request_id: str,
+    channel: str,
+    notification_id: str | None = None,
+    voice_session_id: str | None = None,
+) -> dict:
+    conn = get_conn()
+    now = utcnow()
+    conn.execute(
+        "INSERT INTO contact_attempts "
+        "(contact_attempt_id, attention_request_id, channel, status, created_at, "
+        " notification_id, voice_session_id) "
+        "VALUES (?, ?, ?, 'planned', ?, ?, ?)",
+        (contact_attempt_id, attention_request_id, channel, now, notification_id, voice_session_id),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM contact_attempts WHERE contact_attempt_id=?", (contact_attempt_id,)
+    ).fetchone()
+    conn.close()
+    return dict(row)
+
+
+def update_contact_attempt_status(
+    contact_attempt_id: str,
+    status: str,
+    result: str | None = None,
+    error_code: str | None = None,
+) -> None:
+    conn = get_conn()
+    now = utcnow()
+    started_at = now if status == "attempted" else None
+    completed_at = now if status in ("delivered", "opened", "failed") else None
+    conn.execute(
+        "UPDATE contact_attempts SET status=?, result=COALESCE(?, result), error_code=COALESCE(?, error_code), "
+        "started_at=COALESCE(started_at, ?), completed_at=COALESCE(?, completed_at) "
+        "WHERE contact_attempt_id=?",
+        (status, result, error_code, started_at, completed_at, contact_attempt_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_contact_attempts_for_attention(attention_request_id: str) -> list[dict]:
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM contact_attempts WHERE attention_request_id=? ORDER BY id ASC",
+        (attention_request_id,),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_most_recent_contact_attempt(attention_request_id: str) -> dict | None:
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT * FROM contact_attempts WHERE attention_request_id=? ORDER BY id DESC LIMIT 1",
+        (attention_request_id,),
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+# ── VoiceSession (Milestone 8) ─────────────────────────────────────────
+
+
+def create_voice_session(
+    voice_session_id: str, conversation_id: str, attention_request_id: str | None = None
+) -> dict:
+    conn = get_conn()
+    now = utcnow()
+    conn.execute(
+        "INSERT INTO voice_sessions "
+        "(voice_session_id, conversation_id, attention_request_id, state, created_at, updated_at) "
+        "VALUES (?, ?, ?, 'idle', ?, ?)",
+        (voice_session_id, conversation_id, attention_request_id, now, now),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM voice_sessions WHERE voice_session_id=?", (voice_session_id,)
+    ).fetchone()
+    conn.close()
+    return dict(row)
+
+
+def get_voice_session(voice_session_id: str) -> dict | None:
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT * FROM voice_sessions WHERE voice_session_id=?", (voice_session_id,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def update_voice_session_state(voice_session_id: str, state: str) -> None:
+    conn = get_conn()
+    now = utcnow()
+    closed_at = now if state == "closed" else None
+    conn.execute(
+        "UPDATE voice_sessions SET state=?, updated_at=?, closed_at=COALESCE(?, closed_at) "
+        "WHERE voice_session_id=?",
+        (state, now, closed_at, voice_session_id),
     )
     conn.commit()
     conn.close()

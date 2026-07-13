@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import uuid
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
@@ -31,12 +32,18 @@ from .database import (
     delete_push_subscription,
     get_setting,
     set_setting,
+    get_unresolved_attention_requests,
+    get_attention_request,
 )
 from .executor import Executor
 from .task_manager import TaskManager
 from .integrations.opencode_supervisor import OpenCodeSupervisor
 from .supervisor.supervisor import Supervisor
 from . import push as push_module
+from .attention_scheduler import AttentionScheduler
+from . import attention_manager
+from .voice_session_manager import VoiceSessionManager, VoiceSessionError
+from .integrations.ws_tokens import issue_ws_token, verify_ws_token
 
 logging.basicConfig(
     level=logging.INFO,
@@ -53,16 +60,29 @@ task_manager = TaskManager(conn_manager)
 opencode_supervisor = OpenCodeSupervisor(conn_manager, task_manager)
 executor = Executor(task_manager, opencode_supervisor)
 supervisor = Supervisor(task_manager, opencode_supervisor)
+attention_scheduler = AttentionScheduler(conn_manager)
+voice_session_manager = VoiceSessionManager(supervisor)
+attention_manager.set_broadcast_hook(conn_manager)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
-    mark_running_tasks_interrupted()
+    interrupted_task_ids = mark_running_tasks_interrupted()
     mark_running_opencode_tasks_interrupted()
+    # Milestone 8.1 real-phone finding: a local task's question/task rows
+    # just got force-cancelled/failed above (genuine source invalidation,
+    # not an OpenCode task — those keep their AttentionRequest alive via
+    # mark_running_opencode_tasks_interrupted()'s 'degraded' state
+    # instead) — any AttentionRequest still pointing at that now-dead
+    # source must not be left to re-contact the user about it later.
+    for task_id in interrupted_task_ids:
+        await attention_manager.cancel_for_task(task_id)
     await opencode_supervisor.start()
+    await attention_scheduler.start()
     logger.info("Jarvis server started")
     yield
+    await attention_scheduler.stop()
     await opencode_supervisor.stop()
     await task_manager.shutdown()
     logger.info("Jarvis server shut down")
@@ -105,6 +125,52 @@ def _require_api_token(authorization: str | None = Header(default=None)) -> None
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
+WS_CLOSE_TOKEN_EXPIRED = 4001
+WS_CLOSE_TOKEN_INVALID = 4002
+WS_CLOSE_TOKEN_MISSING = 4003
+WS_CLOSE_AUTH_FAILED = 4004
+
+
+def _resolve_ws_close_code(ws: WebSocket) -> int | None:
+    """Milestone 9B.2 (ADR-014): unified WebSocket authentication. Returns
+    None if the handshake may proceed, otherwise the close code to send
+    (application-defined range 4000-4999, RFC 6455) — sent AFTER
+    ws.accept(), not before, so it reaches the client as a real close
+    frame. A pre-accept ws.close() discards its code entirely (uvicorn
+    always rejects with a bare HTTP 403 — see the /ws handler's own
+    history, and ADR-012's uvicorn-source finding).
+
+    A `?token=` query param, if present, is ALWAYS verified via
+    verify_ws_token() regardless of whether JARVIS_API_TOKEN is set — a
+    client that fetched a real signed token gets real verification either
+    way, not a silent pass-through. Falls back to the deprecated
+    Authorization-header path (ADR-011) only when no token param is
+    present, preserving that path for already-paired clients during
+    migration; still a no-op when JARVIS_API_TOKEN is unset, unchanged
+    from ADR-011's original behavior."""
+    token = ws.query_params.get("token")
+    if token:
+        result = verify_ws_token(token)
+        if result.ok:
+            return None
+        return WS_CLOSE_TOKEN_EXPIRED if result.reason == "expired" else WS_CLOSE_TOKEN_INVALID
+
+    required = os.environ.get("JARVIS_API_TOKEN")
+    if not required:
+        return None
+    auth_header = ws.headers.get("authorization")
+    if not auth_header:
+        return WS_CLOSE_TOKEN_MISSING
+    if auth_header == f"Bearer {required}":
+        logger.warning("/ws authenticated via deprecated Authorization header — migrate to ?token= (ADR-014)")
+        return None
+    return WS_CLOSE_AUTH_FAILED
+
+
+class WsTokenRequest(BaseModel):
+    client_id: str | None = None
+
+
 class PushSubscribeRequest(BaseModel):
     endpoint: str
     keys: dict
@@ -123,6 +189,19 @@ class SettingsUpdateRequest(BaseModel):
 async def vapid_public_key():
     key = push_module.get_vapid_public_key()
     return {"vapid_public_key": key, "push_configured": push_module.vapid_configured()}
+
+
+@app.post("/api/ws-token")
+async def issue_ws_token_endpoint(body: WsTokenRequest, _=Depends(_require_api_token)):
+    """Milestone 9B.2 (ADR-014): issues a short-lived signed token for the
+    /ws handshake's ?token= query param. Gated by the same
+    _require_api_token dependency as the push endpoints — a no-op when
+    JARVIS_API_TOKEN is unset (today's default deployment), a real check
+    when set. client_id is informational only (becomes the token's `sub`
+    claim); nothing server-side makes an authorization decision based on
+    its value."""
+    subject = body.client_id or str(uuid.uuid4())
+    return issue_ws_token(subject)
 
 
 @app.post("/api/push/subscribe")
@@ -212,8 +291,41 @@ async def api_get_notification(notification_id: str):
     }
 
 
+@app.get("/api/attention/{attention_request_id}")
+async def api_get_attention(attention_request_id: str):
+    """Deep-link resolution target for a persistent AttentionRequest
+    (Milestone 8 analog of the existing /api/question and /api/notification
+    endpoints — Phase 9's "no stale answer controls for an already-resolved
+    item" requirement applies here too). Never returns raw prompt/context
+    text beyond what the in-app UI already shows once authenticated."""
+    row = get_attention_request(attention_request_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Attention request not found")
+    return {
+        "attention_request_id": row["attention_request_id"],
+        "conversation_id": row["conversation_id"],
+        "task_id": row["task_id"],
+        "attention_type": row["attention_type"],
+        "status": row["status"],
+        "summary": row["summary"],
+        "urgency": row["urgency"],
+        "deferred_until": row["deferred_until"],
+    }
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
+    close_code = _resolve_ws_close_code(ws)
+    if close_code is not None:
+        # Accept first, then close with a real application close code
+        # (ADR-014) — a pre-accept ws.close() discards its code entirely
+        # (ADR-012's uvicorn-source finding: always a bare HTTP 403).
+        # Accepting first means the client's onClosed(code, ...) actually
+        # receives WS_CLOSE_TOKEN_EXPIRED/INVALID/MISSING/AUTH_FAILED,
+        # which the required error taxonomy needs.
+        await ws.accept()
+        await ws.close(code=close_code)
+        return
     await conn_manager.connect(ws)
     # Stable per-connection conversation identity (Milestone 6 Phase 7).
     # Set by an explicit "conversation_init" handshake if the client sends
@@ -261,6 +373,27 @@ async def websocket_endpoint(ws: WebSocket):
             })
         )
 
+    pending_attention = get_unresolved_attention_requests()
+    if pending_attention:
+        await ws.send_text(
+            json.dumps({
+                "type": "pending_attention",
+                "attention_requests": [
+                    {
+                        "attention_request_id": a["attention_request_id"],
+                        "attention_type": a["attention_type"],
+                        "status": a["status"],
+                        "summary": a["summary"],
+                        "task_id": a["task_id"],
+                        "conversation_id": a["conversation_id"],
+                        "urgency": a["urgency"],
+                        "deferred_until": a["deferred_until"],
+                    }
+                    for a in pending_attention
+                ],
+            })
+        )
+
     oc_status = await opencode_supervisor.get_status()
     await ws.send_text(
         json.dumps({
@@ -296,9 +429,69 @@ async def websocket_endpoint(ws: WebSocket):
                 )
                 continue
 
+            if data.get("type") == "device_status":
+                # Milestone 9B.2 (ADR-012): capability-advertisement/state-
+                # sync message from a native companion (see
+                # android/.../core/DeviceStatus.kt). Stored in-memory only,
+                # keyed by connection — no DB table, no reasoning about the
+                # contents. Not yet read by anything; this is the
+                # communication primitive multi-device routing will later
+                # build on, not routing logic itself. No reply is sent
+                # (fire-and-forget, matching the heartbeat frame's shape).
+                conn_manager.set_device_status(ws, data)
+                continue
+
+            if data.get("type") == "voice_session_open":
+                vs_conv_id = data.get("conversation_id")
+                if vs_conv_id and is_valid_conversation_id(vs_conv_id):
+                    conversation_id = vs_conv_id
+                elif conversation_id is None:
+                    conversation_id = new_conversation_id()
+                session = voice_session_manager.open_session(conversation_id, data.get("attention_request_id"))
+                await ws.send_text(json.dumps({
+                    "type": "voice_session_opened",
+                    "voice_session_id": session["voice_session_id"],
+                    "state": session["state"],
+                    "conversation_id": conversation_id,
+                    "attention_request_id": session.get("attention_request_id"),
+                    "greeting": session.get("greeting"),
+                }))
+                continue
+
+            if data.get("type") == "voice_session_transcript":
+                vsid = data.get("voice_session_id")
+                transcript = data.get("transcript", "")
+                if not vsid:
+                    continue
+                try:
+                    result = await voice_session_manager.handle_transcript(vsid, transcript)
+                except VoiceSessionError as e:
+                    await ws.send_text(json.dumps({
+                        "type": "voice_session_error", "voice_session_id": vsid, "error": str(e),
+                    }))
+                    continue
+                conversation_id = result.get("conversation_id") or conversation_id
+                await ws.send_text(json.dumps({
+                    "type": "voice_session_response",
+                    "voice_session_id": vsid,
+                    "response": result.get("response", ""),
+                    "conversation_id": result.get("conversation_id"),
+                    "attention_request_id": result.get("attention_request_id"),
+                    "voice_session_state": result.get("voice_session_state"),
+                }))
+                continue
+
+            if data.get("type") == "voice_session_close":
+                vsid = data.get("voice_session_id")
+                if vsid:
+                    voice_session_manager.close_session(vsid)
+                await ws.send_text(json.dumps({"type": "voice_session_closed", "voice_session_id": vsid}))
+                continue
+
             if data.get("type") == "user_message":
                 content = data.get("content", "")
                 msg_conv_id = data.get("conversation_id")
+                bound_attention_request_id = data.get("bound_attention_request_id")
                 if msg_conv_id and is_valid_conversation_id(msg_conv_id):
                     conversation_id = msg_conv_id
                 elif conversation_id is None:
@@ -330,7 +523,9 @@ async def websocket_endpoint(ws: WebSocket):
                     await ws.send_text(
                         json.dumps({"type": "supervisor_thinking", "timestamp": _now()})
                     )
-                    result = await supervisor.process_message(content, conversation_id)
+                    result = await supervisor.process_message(
+                        content, conversation_id, bound_attention_request_id=bound_attention_request_id,
+                    )
                     conversation_id = result.get("conversation_id") or conversation_id
                     response_text = result.get("response", "")
                     await ws.send_text(
@@ -343,8 +538,15 @@ async def websocket_endpoint(ws: WebSocket):
                             }
                         )
                     )
-    except WebSocketDisconnect:
-        conn_manager.disconnect(ws)
+    except WebSocketDisconnect as e:
+        conn_manager.disconnect(ws, code=e.code, reason=e.reason)
+    except Exception as e:
+        # Milestone 9B.0 Phase 2: a non-WebSocketDisconnect transport error
+        # (e.g. a TLS/protocol-level failure) must still be logged with the
+        # same connection-lifecycle detail as a clean disconnect, not left
+        # to whatever uvicorn's own generic error path happens to show.
+        logger.error("WebSocket transport error: %s: %s", type(e).__name__, e)
+        conn_manager.disconnect(ws, code=None, reason=f"{type(e).__name__}: {e}")
 
 
 def _now() -> str:

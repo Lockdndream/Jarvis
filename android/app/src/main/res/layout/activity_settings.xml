@@ -1,0 +1,110 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="24dp">
+
+        <TextView
+            android:id="@+id/pairedStatusText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:textSize="16sp"
+            android:layout_marginBottom="16dp" />
+
+        <LinearLayout
+            android:id="@+id/pairingFormGroup"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical">
+
+            <EditText
+                android:id="@+id/hostInput"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:inputType="textUri"
+                android:hint="@string/pairing_host_hint" />
+
+            <EditText
+                android:id="@+id/portInput"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:inputType="number"
+                android:hint="@string/pairing_port_hint" />
+
+            <EditText
+                android:id="@+id/tokenInput"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:inputType="textPassword"
+                android:hint="@string/pairing_token_hint" />
+
+            <Button
+                android:id="@+id/probeButton"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/pairing_probe_button" />
+        </LinearLayout>
+
+        <Button
+            android:id="@+id/unpairButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/unpair_button" />
+
+        <Button
+            android:id="@+id/startServiceButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="@string/start_service_button" />
+
+        <Button
+            android:id="@+id/stopServiceButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/stop_service_button" />
+
+        <TextView
+            android:id="@+id/notificationPermissionStatusText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp" />
+
+        <Button
+            android:id="@+id/grantNotificationPermissionButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/grant_notification_permission_button" />
+
+        <TextView
+            android:id="@+id/batteryStatusText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp" />
+
+        <Button
+            android:id="@+id/requestBatteryExemptionButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/request_battery_exemption_button" />
+
+        <Button
+            android:id="@+id/openConnectionStatusButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="24dp"
+            android:text="@string/open_connection_status_button" />
+
+        <Button
+            android:id="@+id/openDiagnosticsButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/open_diagnostics_button" />
+
+    </LinearLayout>
+</ScrollView>

@@ -16,7 +16,7 @@
 // of sw.js itself is what makes the browser notice an update is available
 // (cache-first serving of app.js/style.css otherwise means edits to those
 // files alone go unnoticed indefinitely; real-phone finding, Phase 18).
-const CACHE_NAME = "jarvis-shell-v4";
+const CACHE_NAME = "jarvis-shell-v7";
 const SHELL_FILES = ["/", "/static/style.css", "/static/app.js", "/manifest.json"];
 
 self.addEventListener("install", function (event) {
