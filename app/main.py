@@ -447,6 +447,7 @@ async def websocket_endpoint(ws: WebSocket):
                 continue
 
             if data.get("type") == "voice_session_open":
+                client_request_id = data.get("client_request_id")
                 vs_conv_id = data.get("conversation_id")
                 if vs_conv_id and is_valid_conversation_id(vs_conv_id):
                     conversation_id = vs_conv_id
@@ -457,8 +458,13 @@ async def websocket_endpoint(ws: WebSocket):
                 except VoiceSessionError as e:
                     # TD-002: most commonly, another device already holds
                     # the lease on the requested attention_request_id.
+                    # client_request_id (ADR-017): a generic, optional
+                    # correlation primitive echoed back unchanged so the
+                    # specific request that failed can be identified even
+                    # though no session was ever created.
                     await ws.send_text(json.dumps({
                         "type": "voice_session_error", "voice_session_id": None, "error": str(e),
+                        "client_request_id": client_request_id,
                     }))
                     continue
                 open_voice_session_id = session["voice_session_id"]
@@ -469,6 +475,7 @@ async def websocket_endpoint(ws: WebSocket):
                     "conversation_id": conversation_id,
                     "attention_request_id": session.get("attention_request_id"),
                     "greeting": session.get("greeting"),
+                    "client_request_id": client_request_id,
                 }))
                 continue
 

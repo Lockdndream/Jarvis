@@ -165,10 +165,20 @@ def test_voice_session_error_echoes_client_request_id(client):
         # second open against the same id hits VoiceSessionError (TD-002
         # lease contention) — the actual, real rejection path this
         # correlation mechanism exists to make identifiable.
-        row_id = db.create_attention_request(
-            source_type="task", source_id="t1", attention_type="question",
-            summary="test", urgency="normal",
+        db.create_attention_request(
+            attention_request_id="ar_test1",
+            conversation_id=None,
+            task_id=None,
+            source_type="test",
+            source_id="s1",
+            attention_type="question",
+            urgency="normal",
+            summary="test",
+            context_json=None,
+            contact_policy=None,
+            dedup_key="dedup_test1",
         )
+        row_id = "ar_test1"
         ws1.send_json({
             "type": "voice_session_open",
             "conversation_id": None,
