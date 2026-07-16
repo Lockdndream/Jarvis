@@ -26,6 +26,7 @@ object VoiceSessionParser {
                 conversationId = root.optString("conversation_id", null)?.ifEmpty { null },
                 attentionRequestId = root.optString("attention_request_id", null)?.ifEmpty { null },
                 greeting = root.optString("greeting", null)?.ifEmpty { null },
+                clientRequestId = root.optString("client_request_id", null)?.ifEmpty { null },
             )
         } catch (_: Exception) {
             null
@@ -61,6 +62,7 @@ object VoiceSessionParser {
             VoiceSessionError(
                 voiceSessionId = root.optString("voice_session_id", null)?.ifEmpty { null },
                 error = error,
+                clientRequestId = root.optString("client_request_id", null)?.ifEmpty { null },
             )
         } catch (_: Exception) {
             null

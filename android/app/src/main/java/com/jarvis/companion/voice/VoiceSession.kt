@@ -6,6 +6,7 @@ data class VoiceSession(
     val conversationId: String?,
     val attentionRequestId: String?,
     val greeting: String?,
+    val clientRequestId: String? = null,
 )
 
 data class VoiceSessionResponse(
@@ -19,6 +20,7 @@ data class VoiceSessionResponse(
 data class VoiceSessionError(
     val voiceSessionId: String?,
     val error: String,
+    val clientRequestId: String? = null,
 )
 
 data class VoiceSessionClosed(

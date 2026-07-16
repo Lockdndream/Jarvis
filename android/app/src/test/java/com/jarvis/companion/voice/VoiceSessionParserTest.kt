@@ -304,4 +304,25 @@ class VoiceSessionParserTest {
     fun `isVoiceSessionEventType rejects unrecognized string`() {
         assertTrue(!VoiceSessionParser.isVoiceSessionEventType("user_message"))
     }
+
+    @Test
+    fun `parseOpened extracts clientRequestId when present`() {
+        val json = """{"type":"voice_session_opened","voice_session_id":"vs_1","state":"listening","client_request_id":"req-1"}"""
+        val session = VoiceSessionParser.parseOpened(json)
+        assertEquals("req-1", session?.clientRequestId)
+    }
+
+    @Test
+    fun `parseOpened yields null clientRequestId when absent`() {
+        val json = """{"type":"voice_session_opened","voice_session_id":"vs_1","state":"listening"}"""
+        val session = VoiceSessionParser.parseOpened(json)
+        assertNull(session?.clientRequestId)
+    }
+
+    @Test
+    fun `parseError extracts clientRequestId when present`() {
+        val json = """{"type":"voice_session_error","error":"lease held","client_request_id":"req-2"}"""
+        val error = VoiceSessionParser.parseError(json)
+        assertEquals("req-2", error?.clientRequestId)
+    }
 }
