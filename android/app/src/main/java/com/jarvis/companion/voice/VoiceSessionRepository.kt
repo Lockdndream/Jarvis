@@ -1,7 +1,10 @@
 package com.jarvis.companion.voice
 
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 
@@ -12,6 +15,12 @@ class VoiceSessionRepository {
     private val _lastResponse = MutableStateFlow<String?>(null)
     val lastResponse: StateFlow<String?> = _lastResponse.asStateFlow()
 
+    // extraBufferCapacity so a slow/late collector (e.g. PresenceService
+    // mid-timeout-wait, ADR-017) doesn't cause emit() to suspend or drop
+    // under normal single-digit concurrent-open scenarios.
+    private val _openOutcomes = MutableSharedFlow<VoiceSessionOpenOutcome>(extraBufferCapacity = 8)
+    val openOutcomes: SharedFlow<VoiceSessionOpenOutcome> = _openOutcomes.asSharedFlow()
+
     fun applyOpened(session: VoiceSession) {
         _current.value = session
         // A new session starts with no turn response yet — without this, a
@@ -21,6 +30,17 @@ class VoiceSessionRepository {
         // caller that speaks on any lastResponse change could speak stale
         // content immediately alongside the new session's greeting.
         _lastResponse.value = null
+        if (session.clientRequestId != null) {
+            _openOutcomes.tryEmit(VoiceSessionOpenOutcome.Opened(session.clientRequestId, session))
+        }
+    }
+
+    /** ADR-017: separate from applyError(voiceSessionId) — this is
+     * specifically for the immediate voice_session_error reply to a
+     * voice_session_open request, correlating on clientRequestId rather
+     * than voiceSessionId (which doesn't exist yet for a rejected open). */
+    fun applyOpenError(error: VoiceSessionError) {
+        _openOutcomes.tryEmit(VoiceSessionOpenOutcome.Failed(error.clientRequestId, error.error))
     }
 
     fun applyResponse(response: VoiceSessionResponse) {

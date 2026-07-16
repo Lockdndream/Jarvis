@@ -1,5 +1,9 @@
 package com.jarvis.companion.voice
 
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.advanceUntilIdle
+import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
@@ -7,6 +11,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 
+@OptIn(ExperimentalCoroutinesApi::class)
 class VoiceSessionRepositoryTest {
 
     private lateinit var repository: VoiceSessionRepository
@@ -179,5 +184,50 @@ class VoiceSessionRepositoryTest {
         repository.applyOpened(VoiceSession("vs_1", "listening", "conv_1", null, null))
         repository.applyClosed(null)
         assertNull(repository.current.value)
+    }
+
+    @Test
+    fun `applyOpened with clientRequestId emits Opened outcome`() = runTest {
+        val session = VoiceSession("vs_1", "listening", "conv_1", null, null, clientRequestId = "req-1")
+        val outcomes = mutableListOf<VoiceSessionOpenOutcome>()
+        val job = launch { repository.openOutcomes.collect { outcomes.add(it) } }
+        advanceUntilIdle()
+        repository.applyOpened(session)
+        advanceUntilIdle()
+        job.cancel()
+
+        assertEquals(1, outcomes.size)
+        val outcome = outcomes[0] as VoiceSessionOpenOutcome.Opened
+        assertEquals("req-1", outcome.clientRequestId)
+        assertEquals(session, outcome.session)
+    }
+
+    @Test
+    fun `applyOpened without clientRequestId emits no outcome`() = runTest {
+        val session = VoiceSession("vs_1", "listening", "conv_1", null, null, clientRequestId = null)
+        val outcomes = mutableListOf<VoiceSessionOpenOutcome>()
+        val job = launch { repository.openOutcomes.collect { outcomes.add(it) } }
+        advanceUntilIdle()
+        repository.applyOpened(session)
+        advanceUntilIdle()
+        job.cancel()
+
+        assertEquals(0, outcomes.size)
+    }
+
+    @Test
+    fun `applyOpenError emits Failed outcome with matching clientRequestId`() = runTest {
+        val error = VoiceSessionError(voiceSessionId = null, error = "lease held", clientRequestId = "req-2")
+        val outcomes = mutableListOf<VoiceSessionOpenOutcome>()
+        val job = launch { repository.openOutcomes.collect { outcomes.add(it) } }
+        advanceUntilIdle()
+        repository.applyOpenError(error)
+        advanceUntilIdle()
+        job.cancel()
+
+        assertEquals(1, outcomes.size)
+        val outcome = outcomes[0] as VoiceSessionOpenOutcome.Failed
+        assertEquals("req-2", outcome.clientRequestId)
+        assertEquals("lease held", outcome.error)
     }
 }

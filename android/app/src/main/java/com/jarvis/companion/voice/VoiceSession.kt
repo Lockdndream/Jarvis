@@ -34,6 +34,16 @@ data class VoiceSessionInvitation(
     val attentionType: String,
 )
 
+sealed class VoiceSessionOpenOutcome {
+    data class Opened(val clientRequestId: String, val session: VoiceSession) : VoiceSessionOpenOutcome()
+    data class Failed(val clientRequestId: String?, val error: String) : VoiceSessionOpenOutcome()
+}
+
+fun VoiceSessionOpenOutcome.matchesRequestId(requestId: String): Boolean = when (this) {
+    is VoiceSessionOpenOutcome.Opened -> clientRequestId == requestId
+    is VoiceSessionOpenOutcome.Failed -> clientRequestId == requestId
+}
+
 object VoiceSessionState {
     const val OPENING = "opening"
     const val LISTENING = "listening"
