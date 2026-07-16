@@ -158,12 +158,23 @@ class CompanionWebSocketClient(
     /** Milestone 9B.4: mirrors sendAttentionCommand()'s shape/no-op-when-
      * disconnected style for the three voice_session_* client-originated
      * message types (see docs/protocols/websocket-protocol-v1.md and
-     * app/main.py's voice_session_open/transcript/close handlers). */
-    fun sendVoiceSessionOpen(conversationId: String?, attentionRequestId: String?): Boolean {
+     * app/main.py's voice_session_open/transcript/close handlers).
+     * clientRequestId (Milestone 9B.6, ADR-017): optional generic
+     * correlation token, echoed back unchanged on both
+     * voice_session_opened and voice_session_error — lets a caller (e.g.
+     * WakeWordManager's detection handoff) positively identify the
+     * response to *this* specific open request, not just "a session
+     * became active." */
+    fun sendVoiceSessionOpen(
+        conversationId: String?,
+        attentionRequestId: String?,
+        clientRequestId: String? = null,
+    ): Boolean {
         val payload = JSONObject().apply {
             put("type", "voice_session_open")
             if (conversationId != null) put("conversation_id", conversationId)
             if (attentionRequestId != null) put("attention_request_id", attentionRequestId)
+            if (clientRequestId != null) put("client_request_id", clientRequestId)
         }
         return webSocket?.send(payload.toString()) ?: false
     }
@@ -377,7 +388,10 @@ class CompanionWebSocketClient(
         when (type) {
             "voice_session_opened" -> VoiceSessionParser.parseOpened(text)?.let { voiceSessionRepository.applyOpened(it) }
             "voice_session_response" -> VoiceSessionParser.parseResponse(text)?.let { voiceSessionRepository.applyResponse(it) }
-            "voice_session_error" -> VoiceSessionParser.parseError(text)?.let { voiceSessionRepository.applyError(it.voiceSessionId) }
+            "voice_session_error" -> VoiceSessionParser.parseError(text)?.let {
+                voiceSessionRepository.applyError(it.voiceSessionId)
+                voiceSessionRepository.applyOpenError(it)
+            }
             "voice_session_closed" -> VoiceSessionParser.parseClosed(text)?.let { voiceSessionRepository.applyClosed(it.voiceSessionId) }
             "voice_session_invitation" -> voiceSessionRepository.applyInvitation()
         }
