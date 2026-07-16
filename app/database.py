@@ -441,7 +441,8 @@ def init_db():
             last_contact_at TEXT,
             next_contact_at TEXT,
             contact_attempt_count INTEGER NOT NULL DEFAULT 0,
-            dedup_key TEXT UNIQUE NOT NULL
+            dedup_key TEXT UNIQUE NOT NULL,
+            active_voice_session_id TEXT
         )
     """)
     conn.execute("""
@@ -488,6 +489,11 @@ def init_db():
     conn.execute("CREATE INDEX IF NOT EXISTS idx_attention_task_id ON attention_requests(task_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_attention_conversation_id ON attention_requests(conversation_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_attention_status ON attention_requests(status)")
+    # Milestone 9B.4 / TD-002 / ADR-007: nullable set-if-null ownership
+    # lease so two clients (e.g. the PWA and the Android companion) cannot
+    # each independently open a VoiceSession bound to the same
+    # AttentionRequest with no coordination between them.
+    _ensure_column(conn, "attention_requests", "active_voice_session_id", "TEXT")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_contact_attempts_attention_id ON contact_attempts(attention_request_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_voice_sessions_conversation_id ON voice_sessions(conversation_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_voice_sessions_attention_id ON voice_sessions(attention_request_id)")
@@ -990,6 +996,40 @@ def update_voice_session_state(voice_session_id: str, state: str) -> None:
         "UPDATE voice_sessions SET state=?, updated_at=?, closed_at=COALESCE(?, closed_at) "
         "WHERE voice_session_id=?",
         (state, now, closed_at, voice_session_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def try_claim_voice_session_lease(attention_request_id: str, voice_session_id: str) -> bool:
+    """Atomic set-if-null ownership claim (Milestone 9B.4, TD-002/ADR-007):
+    only succeeds if no other VoiceSession currently holds the lease for
+    this AttentionRequest. Same conditional-UPDATE-with-WHERE-guard pattern
+    as transition_attention_status() — whichever UPDATE's WHERE clause
+    matches first wins under SQLite's single-writer semantics, so this is
+    the real concurrency guard, not just a check-then-set race."""
+    conn = get_conn()
+    now = utcnow()
+    cur = conn.execute(
+        "UPDATE attention_requests SET active_voice_session_id=?, updated_at=? "
+        "WHERE attention_request_id=? AND active_voice_session_id IS NULL",
+        (voice_session_id, now, attention_request_id),
+    )
+    conn.commit()
+    conn.close()
+    return cur.rowcount == 1
+
+
+def release_voice_session_lease(attention_request_id: str, voice_session_id: str) -> None:
+    """Only releases if this exact session still holds the lease — a lease
+    held by a *different* (later) voice_session_id must never be cleared by
+    a stale release call."""
+    conn = get_conn()
+    now = utcnow()
+    conn.execute(
+        "UPDATE attention_requests SET active_voice_session_id=NULL, updated_at=? "
+        "WHERE attention_request_id=? AND active_voice_session_id=?",
+        (now, attention_request_id, voice_session_id),
     )
     conn.commit()
     conn.close()

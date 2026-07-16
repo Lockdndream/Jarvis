@@ -21,7 +21,7 @@ class DeviceStatusTest {
             "\"type\":\"device_status\"," +
             "\"device_id\":\"cc8342c5-7981-4c8d-b215-104dba061cee\"," +
             "\"capabilities\":{" +
-            "\"voice\":false," +
+            "\"voice\":true," +
             "\"wakeword\":false," +
             "\"widget\":false," +
             "\"notifications\":true," +
@@ -64,7 +64,7 @@ class DeviceStatusTest {
         val json = status.toJson()
         assertEquals(
             "{\"type\":\"device_status\",\"device_id\":\"weird\\\"id\\\\with\\\\escapes\"," +
-                "\"capabilities\":{\"voice\":false,\"wakeword\":false,\"widget\":false," +
+                "\"capabilities\":{\"voice\":true,\"wakeword\":false,\"widget\":false," +
                 "\"notifications\":true,\"foreground_service\":true},\"pairing_state\":\"paired\"," +
                 "\"battery_optimization_exempt\":false,\"notification_permission_granted\":false," +
                 "\"connection_generation\":1}",

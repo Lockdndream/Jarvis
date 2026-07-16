@@ -121,6 +121,7 @@ class PresenceService : Service() {
                     )
                 },
                 attentionRepository = app.attentionRepository,
+                voiceSessionRepository = app.voiceSessionRepository,
             )
             client.onStateChange = { state ->
                 app.updateConnectionState(state)

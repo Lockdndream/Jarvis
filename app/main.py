@@ -333,6 +333,11 @@ async def websocket_endpoint(ws: WebSocket):
     # clients (e.g. validation scripts) that never opted into the handshake
     # keep working exactly as before, just without cross-turn continuity.
     conversation_id: str | None = None
+    # Milestone 9B.4 / TD-002: this connection's currently-open voice
+    # session, if any — tracked here (not just client-side) so an abrupt
+    # disconnect can release its AttentionRequest lease instead of leaving
+    # it permanently held (see the `finally` block below).
+    open_voice_session_id: str | None = None
 
     events = get_recent_events(100)
     await ws.send_text(json.dumps({"type": "history", "events": events}))
@@ -447,7 +452,16 @@ async def websocket_endpoint(ws: WebSocket):
                     conversation_id = vs_conv_id
                 elif conversation_id is None:
                     conversation_id = new_conversation_id()
-                session = voice_session_manager.open_session(conversation_id, data.get("attention_request_id"))
+                try:
+                    session = voice_session_manager.open_session(conversation_id, data.get("attention_request_id"))
+                except VoiceSessionError as e:
+                    # TD-002: most commonly, another device already holds
+                    # the lease on the requested attention_request_id.
+                    await ws.send_text(json.dumps({
+                        "type": "voice_session_error", "voice_session_id": None, "error": str(e),
+                    }))
+                    continue
+                open_voice_session_id = session["voice_session_id"]
                 await ws.send_text(json.dumps({
                     "type": "voice_session_opened",
                     "voice_session_id": session["voice_session_id"],
@@ -485,6 +499,8 @@ async def websocket_endpoint(ws: WebSocket):
                 vsid = data.get("voice_session_id")
                 if vsid:
                     voice_session_manager.close_session(vsid)
+                    if vsid == open_voice_session_id:
+                        open_voice_session_id = None
                 await ws.send_text(json.dumps({"type": "voice_session_closed", "voice_session_id": vsid}))
                 continue
 
@@ -547,6 +563,15 @@ async def websocket_endpoint(ws: WebSocket):
         # to whatever uvicorn's own generic error path happens to show.
         logger.error("WebSocket transport error: %s: %s", type(e).__name__, e)
         conn_manager.disconnect(ws, code=None, reason=f"{type(e).__name__}: {e}")
+    finally:
+        # Milestone 9B.4 / TD-002: an abrupt disconnect (app killed, network
+        # loss) never sends voice_session_close — without this, a session's
+        # AttentionRequest lease would stay held forever, permanently
+        # blocking any future voice session (on this device or another) for
+        # that item. close_session() is itself idempotent/guarded (no-op if
+        # already closed), so this is safe even if a close already ran.
+        if open_voice_session_id:
+            voice_session_manager.close_session(open_voice_session_id)
 
 
 def _now() -> str:

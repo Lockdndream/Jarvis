@@ -493,6 +493,27 @@ implementation gap).
   designed: audio focus, ducking, and routing decisions are device-local
   concerns that affect *how* a voice session's audio reaches the user,
   never *what* the Supervisor decides to say or do.
+- **VoiceSession ownership lease** (Milestone 9B.4, closing TD-002/ADR-007's
+  disclosed gap): `attention_requests.active_voice_session_id`, an atomic
+  set-if-null claim (`db.try_claim_voice_session_lease()`), prevents two
+  clients (the PWA and the Android companion, now that both are
+  voice-capable) from each independently opening an uncoordinated
+  `VoiceSession` bound to the same `AttentionRequest`. A second client's
+  `open_session()` call raises `VoiceSessionError` instead of silently
+  proceeding. The lease is released on `close_session()`/`fail_session()`,
+  and — since nothing previously cleaned up a session left open by an
+  abruptly disconnected WebSocket — `app/main.py`'s connection handler now
+  closes any still-open session for that connection in a `finally` block,
+  so a lease can never be held forever by a connection that no longer
+  exists.
+- **Android speech input** (Milestone 9B.4): `SpeechInputController`
+  (`android/.../voice/SpeechInputController.kt`) wraps
+  `android.speech.SpeechRecognizer` for foreground, user-initiated (tap-to-
+  talk) capture only — one tap, one recognition attempt, the recognizer is
+  destroyed immediately on result/error/cancel. No wake word, no
+  continuous/background listening; this is a deliberately narrower
+  scope than the eventual wake-word milestone (9B.5), explicitly confirmed
+  with the project owner before implementation.
 
 **Why the phone never owns reasoning** (restating §1/§2 in voice-specific
 terms): a phone-side wake word, once it fires, does exactly one thing —
@@ -564,10 +585,13 @@ Worker event (question/permission/failure)
 reference only). The production companion (`android/`, `com.jarvis.companion`)
 now has: pairing, transport/reconnect, presence service, telemetry, config
 storage, notification channels, runtime permissions (Milestone 9B.1); unified
-short-lived-token WebSocket authentication (Milestone 9B.2, ADR-014); and its
-first user-facing capability, a home-screen attention widget plus a full-list
-in-app screen (Milestone 9B.3, ADR-015) — see below. Audio integration and
-wake word are not yet built (see Roadmap, §18).
+short-lived-token WebSocket authentication (Milestone 9B.2, ADR-014); a
+home-screen attention widget plus a full-list in-app screen (Milestone
+9B.3, ADR-015); and now a full voice infrastructure — `VoiceActivity`, a
+`VoiceSession` client mirror, `AudioFocusManager`, `PlaybackManager`
+(Android TTS), and foreground tap-to-talk speech input (Milestone 9B.4,
+ADR-016), real-device-validated end-to-end on the S20 FE. Wake word remains
+not yet built (see Roadmap, §18 — Milestone 9B.5).
 
 **The M9A Hybrid decision** (the architectural decision this whole
 component rests on): the PWA remains the rich conversational client. A
@@ -598,15 +622,20 @@ state), all persistence, all scheduling. The companion's actual module
 boundary is a single Gradle module (`android/app/`) with Kotlin packages
 `core`, `pairing`, `network`, `telemetry`, `service`, `settings`,
 `diagnostics`, `ui`, `attention` (Milestone 9B.3), `widget` (Milestone
-9B.3) under `com.jarvis.companion` — a deliberate departure from the M9A
-proposal's separate-Gradle-module names: multi-module Gradle adds real
-build-complexity overhead not justified for a companion this size.
-`attention`/`widget` are a **client-side rendering mirror only**
-(`AttentionRepository`, rebuilt from server broadcasts, never a second
-source of truth) — not reasoning, not a state machine of their own.
-`audio`/`wakeword` are not yet built at all. Explicitly, none of the built
-packages contain Supervisor logic. This is not a preference; it is the
-same constraint stated in §1 and §2, applied to a specific device.
+9B.3), `voice` and `audio` (Milestone 9B.4) under `com.jarvis.companion`
+— a deliberate departure from the M9A proposal's separate-Gradle-module
+names: multi-module Gradle adds real build-complexity overhead not
+justified for a companion this size. `attention`/`widget` are a
+**client-side rendering mirror only** (`AttentionRepository`, rebuilt from
+server broadcasts, never a second source of truth) — not reasoning, not a
+state machine of their own. `voice.VoiceSessionRepository` follows the
+exact same mirror-only pattern for `VoiceSession` state; `voice.PlaybackManager`
+and `audio.AudioFocusManager` own real Android system resources (TTS
+engine, audio focus) but no conversational logic — they speak text and
+manage focus/routing, they never decide what to say. `wakeword` is not
+yet built. Explicitly, none of the built packages contain Supervisor logic.
+This is not a preference; it is the same constraint stated in §1 and §2,
+applied to a specific device.
 The backend has been independently code-reviewed (Milestone 9A's D2) and
 confirmed to support a native client without any reasoning duplication or
 architecture change.

@@ -2120,7 +2120,7 @@ Used for browser smoke testing of Milestone 3. May later be useful for Jarvis br
 
 ## Current Milestone
 
-**Milestones 6 through 9B.2 complete and closed (Unified WebSocket Authentication real-device-validated on the S20 FE and Milestone 9B.2 formally closed 2026-07-13). Milestone 9B.3 (Android Widget & Attention Surface) built, real-device-validated, and closed 2026-07-14 — see below. Awaiting explicit approval before Milestone 9B.4.**
+**Milestones 6 through 9B.4 complete and closed. Milestone 9B.5 (Wake-Word Feasibility, D5 spike) real-device-validated and its feasibility gate closed 2026-07-16 — see the Milestone 9B.5 entry below for the full narrative. The spike remains disposable (`spikes/android-wakeword/`), not production code; production wake-word integration remains a separate, not-yet-approved milestone.**
 
 Milestone 9B.0 closed with: architecture frozen and documented across `ARCHITECTURE.md`, 10 ADRs (`docs/decisions/`), and this file; `docs/TECHNICAL_DEBT.md` (20 items) and `docs/RELEASE_CHECKPOINT_M9B0.md` established; `README.md` rewritten to match. See the Milestone 9B.0 section below for the full narrative (cost-boundary fix, D0–D4, Phase 1–3 investigation, Transport Reachability).
 
@@ -2183,6 +2183,260 @@ Not part of this milestone, investigated as a side issue and left unresolved at 
 15. ~~Real-device install/validation of the M9B.1 production companion~~ — **DONE 2026-07-13**: 15/15 acceptance items PASS on the real S20 FE. See `android/docs/device-acceptance-checklist.md`.
 16. **Resolve the PWA/companion `JARVIS_API_TOKEN` asymmetry** (see TD-018's Milestone 9B.1 update) before enabling the token in any deployment using both the browser PWA and the Android companion — browsers cannot set a custom `Authorization` header on a WebSocket handshake, so enabling the token today protects the companion but breaks the PWA.
 17. **Implement the VoiceSession ownership guard** (Known Limitation #46, TD-002) before the Android companion gains voice capability — still the standing precondition; M9B.2 added no voice/business logic either.
+
+### Milestone 9B.4 — Android Voice Infrastructure (closed 2026-07-14)
+
+The companion's second user-facing capability and its first voice
+capability: a production voice screen (`VoiceActivity`), a client-side
+`VoiceSession` mirror, native audio focus (`AudioFocusManager`), spoken-
+response playback via Android's standard TTS (`PlaybackManager`), and
+foreground tap-to-talk speech input (`SpeechInputController`) — explicitly
+confirmed in scope by the project owner, mirroring the PWA's own tap-to-talk
+model exactly. Wake word, Bluetooth routing, and background microphone
+capture remain out of scope (Milestone 9B.5+). See ADR-016 for the full
+architecture decision.
+
+**Required precondition closed first**: TD-002 (VoiceSession multi-client
+ownership guard), which ADR-007 had already flagged as a hard precondition
+before a second voice-capable client could safely connect — this milestone
+is exactly that trigger. `attention_requests.active_voice_session_id`
+(nullable, atomic set-if-null claim) now prevents the PWA and Android from
+racing to open uncoordinated sessions against the same `AttentionRequest`;
+a rejected `open_session()` call raises `VoiceSessionError` instead of
+silently proceeding. A related gap found and fixed in the same pass: an
+abruptly disconnected WebSocket never closed its still-open voice session,
+which would have let a lease be held forever — `app/main.py`'s connection
+handler now does so in a `finally` block. 5 new server-side tests
+(`tests/test_voice_session_manager.py`), 441/441 full suite pass.
+
+Built via the Chief-Engineer/DeepSeek-delegation workforce model (ADR-013)
+across two delegated waves plus direct Claude implementation for the
+TD-002 server-side fix and all wiring between already-existing
+security/lifecycle-sensitive files:
+
+- **Wave 1 (delegated, parallel)**: `voice.VoiceSession`/`VoiceSessionParser`/
+  `VoiceSessionRepository` (mirrors `attention/`'s exact pattern from
+  Milestone 9B.3), `audio.AudioFocusManager`, `voice.PlaybackManager`
+  (Android TTS wrapper). Running three parallel Builders against the same
+  project directory caused two real cross-contamination incidents: the
+  `VoiceSession` Builder found and "fixed" a compile error in the
+  `PlaybackManager` Builder's concurrently in-progress file (a real,
+  legitimate fix, but a genuine race), and the `PlaybackManager` task
+  actually timed out (900s) mid-cleanup. Both Builders' self-reported
+  "BUILD SUCCESSFUL" claims were independently re-verified from scratch
+  (not trusted) — the real, final state compiled clean and 142/142 unit
+  tests passed, but this is the reason later waves in this milestone were
+  either run one-at-a-time or split across genuinely non-overlapping
+  package directories.
+- **Wave 2 (delegated, W2a+W2c run in parallel across non-overlapping
+  directories; W2b run alone)**: `voice.SpeechInputController`
+  (`SpeechRecognizer` wrapper, tap-to-talk only, destroys the recognizer
+  immediately on result/error/cancel), a diagnostics extension
+  (`DiagnosticsSnapshot.VoiceDiagnostics`, a pure `buildVoiceDiagnostics()`
+  builder function, `DiagnosticsActivity` rendering — deliberately
+  decoupled from "where do the live values come from," which the wiring
+  step resolved separately), and `ui.VoiceActivity` (the production voice
+  screen, built against a fixed, pre-specified method-name contract for
+  the not-yet-wired `CompanionWebSocketClient` methods — correctly reported
+  the exact expected unresolved-reference compile errors rather than
+  inventing a workaround). Even running W2a/W2c in genuinely different
+  package directories did not fully prevent cross-file editing — W2a's
+  Builder also patched a real naming mismatch in W2c's files
+  (`DiagnosticsSnapshot.VoiceDiagnostics` referenced as nested vs.
+  top-level) — confirming that isolation requires either running one
+  Builder at a time or accepting that any parallel Builder can read/write
+  anywhere in the repository regardless of assigned directory.
+- **Claude-direct**: `CompanionWebSocketClient` gained
+  `sendVoiceSessionOpen/Transcript/Close()` and inbound
+  `voice_session_*` frame dispatch to `voiceSessionRepository` (including an
+  unconditional reset-on-connect, since a voice session can never survive a
+  reconnect — the server-side session is categorically already gone by
+  then, unlike attention's conditional-snapshot-dependent equivalent);
+  `JarvisCompanionApp` gained the `voiceSessionRepository` singleton;
+  `AndroidManifest.xml` gained `VoiceActivity` and `RECORD_AUDIO`;
+  `DeviceCapabilities.voice` flipped to `true`; a runtime `RECORD_AUDIO`
+  permission request wired into `VoiceActivity`'s mic button (not built by
+  any delegated task — needed for real-device testing to be possible at
+  all); an "Talk to Jarvis" entry point added to `SettingsActivity` (no
+  other screen could reach `VoiceActivity` otherwise).
+
+**Real bugs found during independent review, before any device testing**
+(none from the delegated Builders' own self-reports — all from directly
+reading the resulting code, this project's standing practice):
+1. `VoiceActivity`'s TTS trigger was gated on
+   `session?.state == VoiceSessionState.SPEAKING` — but
+   `voice_session_manager.py::handle_transcript()` never actually
+   transitions to `STATE_SPEAKING` in its real code path (only
+   `listening`/`deferred`). Spoken responses would never have fired in
+   practice. Fixed to match the PWA's own behavior: speak whenever new
+   response text arrives, regardless of reported state.
+2. A session's `greeting` (the M8.1 fix for bound-session context) was
+   never spoken or displayed by `VoiceActivity` at all — only `lastResponse`
+   was wired. Fixed, including a repository fix so a leftover `lastResponse`
+   from a just-closed previous session can't collide with a new session's
+   greeting (`applyOpened()` now resets it).
+3. `VoiceSessionRepository.applyClosed()`/`applyError()` had no
+   stale-session-id guard, unlike `applyResponse()` — a delayed close/error
+   frame for an already-superseded session could have wiped a newer one.
+4. Setting `userFacingError` in `VoiceActivity` never actually triggered a
+   re-render (only the session/response/connectionState `combine()` did) —
+   a real speech-recognition error would have silently never reached the
+   screen. Fixed with an explicit re-render call.
+
+**Real-device validation (S20 FE, this milestone)**: the full pipeline
+exercised against genuinely live data — permission grant flow (system
+dialog screenshotted), a real "no speech" error round-trip (mic released
+correctly, error text displayed, confirming bug #4's fix), a full
+successful voice turn with real human speech ("Hi Naitik!" response spoken
+and displayed), confirmed server-side via `voice_session_manager` state-
+transition logs (opening → listening → processing → waiting → listening,
+twice), rotation (status + response text both survived), background/
+foreground (WebSocket connection and session both survived — no
+`sendVoiceSessionClose` fired while backgrounded, confirmed via server log
+silence), phone lock/unlock (connection survived), and a clean explicit
+close (server-side `closing → closed` transition confirmed in logs).
+**Not independently real-device-validated**: wired-headset routing (the
+S20 FE has no 3.5mm jack) and Bluetooth-headset routing (no paired device
+available) — both disclosed, not regressions, consistent with the
+milestone's own "if available" framing. The diagnostics live-value path
+(as opposed to its already-confirmed "n/a" fallback) was code-reviewed but
+not separately screenshotted.
+
+173/173 Android unit tests pass (63 pre-9B.4 baseline + 110 new across this
+milestone's two delegated waves plus the review fixes above),
+`./gradlew assembleDebug` clean, 441/441 pytest (5 new TD-002 tests, zero
+regressions). Total delegation: 6 Builder tasks across this milestone
+(5 completed + 1 timeout requiring no re-run since its real output was
+still usable after independent verification); exact OpenRouter spend not
+separately isolated from ambient balance checks in this session (balance
+before: $4.771 per M9B.3's close; confirmed still above the $1.00
+guardrail threshold throughout).
+
+### Milestone 9B.5 — Wake-Word Feasibility Spike, D5 (closed 2026-07-16)
+
+**Goal**: execute the D5 build spike that had been gated on approval since
+M9A/M9B.0 — prove, with real evidence, whether the `home-assistant/android`
+microWakeWord reference architecture (NDK/CMake + TensorFlow Lite Micro's
+JNI-only API) can actually be integrated and run on the real Samsung
+Galaxy S20 FE. Explicitly disposable and feasibility-only per the user's
+own framing of the gate: no threshold tuning, no production integration,
+no architectural changes to Jarvis itself.
+
+**Phase 0 reconnaissance** (delegated to a research fork, "wakeword-lib-recon")
+independently re-verified — not merely re-cited — the prior M9B.0 D1
+research, and surfaced one materially important correction: the real
+`home-assistant/android` reference implementation is **native C++
+(NDK/CMake) against TensorFlow Lite *Micro*'s JNI-only API**, not a
+Kotlin/Java TFLite wrapper as the original D1 research's phrasing implied.
+TFLite Micro has no official Kotlin/Java API at all, so native code is
+structurally required, not a stylistic choice — a materially bigger,
+riskier undertaking than originally scoped. Also confirmed directly from
+source (not assumed): both the microWakeWord code and the pretrained
+`hey_jarvis.tflite` model declare Apache-2.0; the model runs streaming
+inference on a 40-feature spectrogram (not MFCC) with built-in noise
+suppression/AGC; and Android 14's mandatory foreground-service-typing
+(`targetSdk`-gated, applies regardless of the S20 FE's own Android 13)
+means any future production always-listening capability will require
+`FOREGROUND_SERVICE_MICROPHONE` plus a permanently-visible system mic
+indicator with no legitimate suppression method — a real, disclosed UX
+consequence for any future production milestone, not a bug to fix now.
+
+Given this finding, the fork asked the user directly how to proceed and
+was told explicitly: treat this as the deferred D5 gate, build the native
+spike directly (not delegated), keep it disposable, and gate any
+production wake-word work on the spike's success criteria (clean
+NDK/CMake integration; builds with the existing Android project; loads
+the `hey_jarvis` model; runs inference successfully; captures basic
+latency/CPU/memory observations; no architectural changes to Jarvis).
+
+**What the fork built** (`spikes/android-wakeword/`, vendored directly
+from the real `home-assistant/android` source — `CMakeLists.txt`,
+`MicroFrontendWrapper`, `MicroWakeWordEngine`, JNI bridge — fetched via
+direct `curl`, not paraphrased): a standalone Kotlin/NDK spike app
+(`WakeWordSpikeActivity`, `MicroWakeWord.kt` JNI wrapper) that captures
+16kHz mono audio via `AudioRecord`, feeds it through the vendored native
+engine every 10ms, and displays live inference-count/latency/detection/
+memory stats. It reached a clean `BUILD SUCCESSFUL` and attempted a
+real-device install, but the interactive session hit its weekly usage
+limit in the same turn the fork's completion notification arrived —
+**the build's own device-install attempt, and all real-device validation,
+were never done in that session.** `spikes/android-wakeword/` sat
+uncommitted and undocumented until this milestone's session resumed it.
+
+**Real bug found and fixed on first real-device run**: the app crashed
+immediately on Start with `UnsatisfiedLinkError: dlopen failed: library
+"libclang_rt.hwasan-aarch64-android.so" not found`. Root cause: the
+vendored `CMakeLists.txt` unconditionally enables HWAddressSanitizer for
+any `Debug` + `arm64-v8a` build (`home-assistant/android`'s own reference
+CI most likely runs against Google's HWASan-flashed AOSP/Pixel test
+images, which ship that sanitizer runtime as part of the OS) — retail
+firmware, including the real S20 FE's Samsung One UI, does not carry that
+library, so `dlopen` fails outright the moment the native library loads.
+Fixed by gating the HWASan block behind an explicit
+`-DJARVIS_ENABLE_HWASAN=ON` flag (off by default), not by weakening or
+removing the sanitizer capability itself.
+
+**Real-device validation (S20 FE, this milestone)** — four controlled
+tests run against the rebuilt spike, per an explicit user-specified
+protocol (FACT / CODE EVIDENCE / REAL DEVICE EVIDENCE / ASSUMPTION /
+REQUIRES EXPERIMENT classification, no implementation changes during
+testing):
+
+- **Test A — Controlled Recall**: two runs of 10 deliberate "Hey Jarvis"
+  utterances each, real-device-evidenced via exact `logcat` detection
+  timestamps (not screen-reading or self-count) — **8/10** in a
+  non-quiet room, **10/10** after moving to a quiet room. Both exactly
+  matched the user's own live count.
+- **Test B — False Positive**: 22.7 minutes (1,363s) of continuous
+  listening with the phone stationary on a desk, mostly quiet ambient
+  (confirmed with the user, not assumed) — **zero false-positive
+  detections**. Required disabling screen timeout and setting the spike
+  app's battery mode to Unrestricted first; an earlier, shorter attempt
+  at this test lost its in-memory counters when Android recreated the
+  backgrounded (but not-yet-configured) activity — a real, disclosed
+  finding that this bare spike has no foreground service or wake lock,
+  unlike the production `PresenceService`, so it does not survive
+  ordinary backgrounding without those OS-level mitigations.
+- **Test C — Resource Verification**: over the Test B run,
+  `inference_calls=136291` against an expected ~136,300 at the 10ms hop
+  rate (match within 0.01%, confirming continuous streaming inference
+  with no stalls); `avg_latency_ms=0.12`, `max_latency_ms=9.04` (new
+  observed ceiling under sustained load, vs. 1.05ms in an earlier
+  shorter/uncontrolled run — still inside the 10ms budget); native heap
+  14.7–17.9MB and process PSS 88–94MB across every run today, no
+  monotonic growth pattern suggesting a leak.
+- **Test D — Stability**: zero crashes (crash buffer empty on every
+  check), zero JNI failures, zero inference stalls, across all sessions
+  this milestone.
+
+**All D5 success criteria are now satisfied with real device evidence**:
+clean NDK/CMake integration (after the HWASan fix), builds with the
+existing Android project, loads the `hey_jarvis` model, runs inference
+successfully, and captures real latency/CPU/memory observations. The
+architecture proposed since M9A — a native NDK/CMake wrapper around
+TFLite Micro — is now proven to actually build, install, and run
+inference on the real target hardware, which had never been demonstrated
+before this milestone.
+
+**Explicitly not proven, correctly carried forward as open** (see
+TD-022): behavior under actual screen-lock/Doze (Test B deliberately
+avoided this via stay-awake+charging, so real backgrounding survival
+remains untested); multi-hour battery drain; recall in noisier, farther,
+or multi-speaker conditions; true end-to-end wake-to-action latency
+(speech-end to detection, as opposed to raw per-inference latency); the
+permanently-visible mic-in-use indicator's real-world acceptability. None
+of these block the narrow feasibility question D5 existed to answer, but
+all are hard prerequisites before any future production wake-word
+milestone.
+
+No automated tests exist for this spike (deliberately — it is a disposable,
+manually-validated feasibility artifact, not production code with its own
+CI surface, consistent with how `spikes/android-presence/` was handled in
+M9B.0). Full server-side `pytest tests/` suite unaffected — no Python files
+were touched this milestone. `.jarvis_opencode_owner.json` (a stale
+ownership marker for a since-dead delegated OpenCode process from the
+interrupted prior session) was left in place as a harmless, disclosed
+leftover — not a live process, confirmed via `netstat`/`tasklist`.
 
 ### Milestone 9B.3 — Android Widget & Attention Surface (closed 2026-07-14)
 
@@ -2263,7 +2517,9 @@ New candidate identified during Milestone 9B.0 (see Known Limitation #50, "Trans
 - **Unified WebSocket authentication (M9B.2, ADR-014)**: short-lived signed tokens (`POST /api/ws-token` + `?token=`, `app/integrations/ws_tokens.py`) work identically for the browser PWA and the Android companion, closing the mechanism asymmetry from M9B.1 (browsers cannot set custom WebSocket handshake headers). Real-browser-validated end-to-end (Playwright): token fetch, connection acceptance cross-verified against the server's own log, and token reuse on reconnect (no redundant fetch). Legacy Authorization-header path kept working, deprecated. `docs/protocols/websocket-protocol-v1.md` documents the wire format for the first time. Built via the new Chief-Engineer/delegated-workforce model (ADR-013) — see "Operating model change" above for the pilot and real bugs the delegation pipeline caught.
 - **Chief Engineer / DeepSeek delegation workforce (M9B.2, ADR-013)**: Claude's role for future work shifts to planning/architecture/review/acceptance; bounded implementation delegates to `deepseek/deepseek-v4-flash` via the isolated OpenCode runtime, with independent Builder/Reviewer separation and a real credit-threshold spend guardrail (`app/integrations/openrouter_credits.py`, checked against the live OpenRouter API).
 - **Android home-screen attention widget + full-list screen (M9B.3, ADR-015)**: `attention.AttentionRepository` mirrors server attention state client-side (`pending_attention` snapshot + 8 live `attention_*` event types), feeding both `widget.AttentionWidgetProvider` (single-item summary + Dismiss/Refresh, push-driven updates from `PresenceService`) and `ui.AttentionActivity` (full list). Dismiss reuses the PWA's exact existing `bound_attention_request_id`/`user_message` mechanism — no new server message type. Real-device-validated on the S20 FE, including two bugs (`PendingIntent.FLAG_UPDATE_CURRENT`, and a client-side fix for the server's conditional `pending_attention` send) found only through real hardware testing.
-- **All 436 tests pass** (server); **63/63 Android unit tests pass**: see Testing Status above for the full breakdown
+- **Android voice infrastructure (M9B.4, ADR-016)**: `VoiceActivity` (production voice screen), `voice.VoiceSessionRepository` (client-side `VoiceSession` mirror), `audio.AudioFocusManager` (native focus/routing), `voice.PlaybackManager` (Android TTS wrapper), `voice.SpeechInputController` (foreground tap-to-talk speech input via `SpeechRecognizer`). Server-side precondition closed first: TD-002's VoiceSession multi-client ownership lease (`active_voice_session_id`, atomic set-if-null), required since this milestone is the first time a second voice-capable client (Android) exists alongside the PWA. Real-device-validated end-to-end on the S20 FE, including a full successful voice turn with real human speech, confirmed via both UI screenshot and server-side state-transition logs.
+- **All 441 tests pass** (server, +5 from M9B.4's TD-002 tests); **173/173 Android unit tests pass** (+110 from M9B.4): see Testing Status above for the full breakdown
+- **Wake-word feasibility spike, real-device-validated (M9B.5)**: `spikes/android-wakeword/` — a disposable NDK/CMake spike vendoring `home-assistant/android`'s real microWakeWord reference (TFLite Micro JNI, `hey_jarvis.tflite`). Proven on the real S20 FE: clean build, model loads, controlled recall 8/10 → 10/10 (room-quality dependent), zero false positives over 22.7 minutes continuous ambient listening, zero crashes/JNI failures/stalls, stable memory (14.7–17.9MB native heap). Not production code, not wired into Jarvis; background/Doze survival and multi-hour battery remain untested (TD-022).
 
 ### What Was Most Recently Verified
 
@@ -2279,11 +2535,14 @@ New candidate identified during Milestone 9B.0 (see Known Limitation #50, "Trans
 - `./gradlew assembleDebug` — **BUILD SUCCESSFUL**; `./gradlew testDebugUnitTest` — **28/28 PASSED** (14 new: `DisconnectClassifierTest` ×11, `DeviceStatusTest` ×3), Milestone 9B.2
 - TD-021 fix real-device-confirmed: regenerated server cert → `WS_PERMANENT_FAILURE reason=CERTIFICATE`, zero further reconnect attempts, correct notification text and Diagnostics-screen state, confirmed manual recovery after restoring the correct cert
 - `device_status` message cross-verified end-to-end: client `DEVICE_STATUS_SENT` ↔ server `Device status received conn_id=1 device_id=<uuid> capabilities={...}`, matching device ID and capabilities on both sides
-- **New, not yet done**: the wake-word build spike (D5, still gated on approval); the real physical S20 FE has not yet had `spikes/android-presence/`'s wake-word capability built or tested at all; TD-002 (VoiceSession multi-client guard) remains open, not yet triggered since the companion has no voice capability.
+- Full `pytest tests/` suite — **441/441 PASSED, 0 failed, 0 skipped, 3 warnings, 697.73s** (2026-07-14, Milestone 9B.4)
+- `./gradlew assembleDebug` — **BUILD SUCCESSFUL**; `./gradlew testDebugUnitTest` — **173/173 PASSED** (110 new: `VoiceSessionParserTest` ×29, `VoiceSessionRepositoryTest` ×20 (17 delegated + 3 from the stale-close/error-id review fix), `AudioFocusManagerTest` ×17, `PlaybackManagerTest` ×14, `SpeechInputControllerTest` ×15, `VoiceDiagnosticsTest` ×4, `VoiceActivityTest` ×11), Milestone 9B.4
+- Real-device validation, S20 FE — a full successful voice turn with real human speech (RECORD_AUDIO permission grant → tap-to-talk → real transcript → server round trip → spoken+displayed response "Hi Naitik!"), a real "no speech" error round trip (mic released cleanly), rotation survival (status + response text both preserved), background/foreground survival (WebSocket connection and server-side session both survived — confirmed via absence of a `close` event in server logs while backgrounded), phone lock/unlock survival, and a clean explicit close (server-side `closing → closed` confirmed in logs) — all 2026-07-14, Milestone 9B.4. Not independently validated: wired-headset routing (device has no 3.5mm jack) and Bluetooth-headset routing (no paired device available).
+- **D5 wake-word spike, real-device-validated, S20 FE (2026-07-16, Milestone 9B.5)**: after fixing a real `UnsatisfiedLinkError` (vendored `CMakeLists.txt` unconditionally enabled HWAddressSanitizer, whose runtime doesn't exist on retail firmware), four controlled tests all passed with real device evidence — Test A recall 8/10 (non-quiet room) → 10/10 (quiet room), both cross-verified against exact `logcat` detection timestamps; Test B zero false positives over 22.7 minutes continuous ambient listening; Test C `inference_calls=136291` (matches the expected ~136,300 at the 10ms hop rate within 0.01%), avg latency 0.12ms/max 9.04ms, native heap 14.7–17.9MB, process PSS 88–94MB, all stable across runs; Test D zero crashes/JNI failures/stalls across every session. Not tested: screen-lock/Doze survival (deliberately avoided via stay-awake+charging), multi-hour battery, adverse-acoustic recall — see TD-022.
 
 ### What Should Be Built Next
 
-**Immediately**: D4, the spike-quality review, and D1's final wake-word-candidate decision are all now done (see Milestone 9B.0 above) — the remaining gate is explicit user approval to begin the wake-word build spike (D5), which stays scoped to research/proof-of-buildability (does the pretrained `hey_jarvis.tflite` model actually run via a custom TFLite-interpreter wrapper on the real S20 FE), not M9B production implementation. `JARVIS_OPENCODE_ALLOW_PAID` (Known Limitation #55) is already reverted to `false` — re-enabling it in the future requires explicit user approval each time, same as this one. See "Immediate priorities before any new milestone work" under Next Planned Work above for the full carried-over list (background-push gap #35, installed-PWA cache-staleness #42, etc.).
+**Immediately**: D4, the spike-quality review, D1's final wake-word-candidate decision, and now D5's real-device feasibility validation are all done (see Milestone 9B.5 above) — the D5 gate is closed. The next gate is explicit user approval to begin **production** wake-word integration, which should first resolve TD-022's open items (background/Doze survival, multi-hour battery, adverse-acoustic recall, end-to-end latency) rather than assume the spike's quiet-room/plugged-in results generalize. Milestone 9B.4 built the `PlaybackManager`/`AudioFocusManager` infrastructure any production follow-up should reuse as-is, not rebuild. `JARVIS_OPENCODE_ALLOW_PAID` (Known Limitation #55) requires explicit user approval each time it's enabled, same as this milestone. See "Immediate priorities before any new milestone work" under Next Planned Work above for the full carried-over list (background-push gap #35, installed-PWA cache-staleness #42, etc.).
 
 Carried-over cleanup items (still open):
 1. **Separate permissions table**: Stop conflating permissions in the `questions` table.
@@ -2322,6 +2581,8 @@ Carried-over cleanup items (still open):
 27. **A `PushChannel` contact attempt must never claim more delivery certainty than the platform provides** (M8, directly honoring the M7.1 S24 FE Doze-idle finding, Known Limitation #35): `status="attempted"` + `"PUSH_ACCEPTED_BY_PUSH_SERVICE (delivery to device not confirmed)"` when a real subscription exists — never `"delivered"` unless the platform actually confirms delivery, which it currently cannot.
 28. **`#attention-calls`/`#voice-session-bar` must follow the same `flex-shrink`/`min-height: 0` rules as `#needs-attention`/`#active-tasks`** (M8, extending Architecture Decision #17 to the new panels): `#input-area` must never be pushed off-screen by the new call-style card either — regression-tested by `tests/m8_browser_validate.py` Scenario A.
 29. **A Jarvis-owned OpenCode server's subprocess env must be an explicit OS-essential allowlist, never `{**os.environ, ...}`, and every delegated `send_prompt()` call must always carry an explicit, free-only-validated `model` field** (M9B.0): storage isolation (M6.1) does not isolate credentials — a real, live-verified incident showed an ambient `OPENAI_API_KEY` reaching the isolated server and being used for a real paid call. `isolated_subprocess_env()`/`_OS_ESSENTIAL_ENV_VARS` (`app/integrations/opencode_server.py`) and the mandatory `model` field in `OpenCodeAdapter.send_prompt()` are the two load-bearing fixes; do not revert either, and do not let OpenCode fall back to its own default provider/model selection for delegated work again.
+30. **A `VoiceSession` bound to an `AttentionRequest` must hold `attention_requests.active_voice_session_id` for its entire lifetime, claimed atomically and released only by the session that holds it** (M9B.4, TD-002/ADR-007): `db.try_claim_voice_session_lease()`/`release_voice_session_lease()` are the load-bearing set-if-null/release-if-matching primitives; do not replace them with a plain read-then-write (a real race two simultaneous voice-capable clients — the PWA and Android — can now actually trigger, not a hypothetical). `app/main.py`'s WebSocket handler must keep closing any still-open voice session for a connection in its `finally` block — removing it would let a lease from an abruptly disconnected client be held forever, permanently blocking that `AttentionRequest` from ever getting a new voice session.
+31. **Parallel delegated OpenCode Builders must never be assumed isolated to their assigned package/directory** (M9B.4): every Builder has full filesystem access to the whole project directory, not just the files it was asked to touch — two real cross-contamination incidents this milestone (one Builder "fixing" a compile error in a different, concurrently-in-progress Builder's file; another patching a genuine naming-mismatch bug in a third Builder's already-completed files) both happened despite prompts explicitly telling each Builder not to touch the others' files. Either run one Builder at a time, or independently re-verify the *actual final file contents* (not the Builder's own transcript/self-report) after any parallel wave before trusting it.
 
 ### Files a New Agent Should Inspect First
 

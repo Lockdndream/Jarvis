@@ -284,3 +284,85 @@ async def test_handle_transcript_after_close_raises():
     vsm.close_session(session["voice_session_id"])
     with pytest.raises(VoiceSessionError):
         await vsm.handle_transcript(session["voice_session_id"], "hello")
+
+
+# ── TD-002 / ADR-007 ownership lease guard (Milestone 9B.4) ────────────
+
+@pytest.mark.asyncio
+async def test_second_client_cannot_bind_a_session_to_an_already_leased_attention_request():
+    """The core TD-002 scenario: the PWA and the Android companion each
+    call open_session() against the same bound AttentionRequest. The first
+    must succeed and claim the lease; the second must be rejected outright
+    rather than silently opening a second, uncoordinated session."""
+    row = await _attention_row()
+    aid = row["attention_request_id"]
+    vsm = VoiceSessionManager(FakeSupervisor())
+
+    first = vsm.open_session("c1", aid)
+    assert first["attention_request_id"] == aid
+    assert db.get_attention_request(aid)["active_voice_session_id"] == first["voice_session_id"]
+
+    with pytest.raises(VoiceSessionError):
+        vsm.open_session("c2", aid)
+
+    # The rejected attempt must not have created a second VoiceSession row
+    # bound to the same AttentionRequest, and must not have disturbed the
+    # first session's lease.
+    assert db.get_attention_request(aid)["active_voice_session_id"] == first["voice_session_id"]
+
+
+@pytest.mark.asyncio
+async def test_closing_a_bound_session_releases_the_lease_for_a_new_one():
+    row = await _attention_row()
+    aid = row["attention_request_id"]
+    vsm = VoiceSessionManager(FakeSupervisor())
+
+    first = vsm.open_session("c1", aid)
+    vsm.close_session(first["voice_session_id"])
+    assert db.get_attention_request(aid)["active_voice_session_id"] is None
+
+    second = vsm.open_session("c2", aid)  # must not raise now that the lease is free
+    assert second["attention_request_id"] == aid
+    assert db.get_attention_request(aid)["active_voice_session_id"] == second["voice_session_id"]
+
+
+@pytest.mark.asyncio
+async def test_failing_a_bound_session_releases_the_lease():
+    row = await _attention_row()
+    aid = row["attention_request_id"]
+    vsm = VoiceSessionManager(FakeSupervisor())
+
+    first = vsm.open_session("c1", aid)
+    assert vsm.fail_session(first["voice_session_id"])
+    assert db.get_attention_request(aid)["active_voice_session_id"] is None
+
+    second = vsm.open_session("c2", aid)  # must not raise
+    assert second["attention_request_id"] == aid
+
+
+@pytest.mark.asyncio
+async def test_releasing_a_stale_session_never_clears_a_newer_lease():
+    """Defense-in-depth: a delayed close() call for a session that no
+    longer holds the (already-reassigned) lease must not clear whichever
+    session currently does hold it."""
+    row = await _attention_row()
+    aid = row["attention_request_id"]
+    vsm = VoiceSessionManager(FakeSupervisor())
+
+    first = vsm.open_session("c1", aid)
+    vsm.close_session(first["voice_session_id"])
+    second = vsm.open_session("c2", aid)
+
+    # A late/duplicate release call for the already-closed first session
+    # (calling the DB function directly, since close_session() itself is
+    # idempotent and already released its own lease correctly above).
+    db.release_voice_session_lease(aid, first["voice_session_id"])
+    assert db.get_attention_request(aid)["active_voice_session_id"] == second["voice_session_id"]
+
+
+def test_unbound_sessions_never_touch_any_lease():
+    vsm = VoiceSessionManager(FakeSupervisor())
+    a = vsm.open_session("c1")
+    b = vsm.open_session("c2")
+    assert a["attention_request_id"] is None
+    assert b["attention_request_id"] is None  # no lease contention for unbound sessions

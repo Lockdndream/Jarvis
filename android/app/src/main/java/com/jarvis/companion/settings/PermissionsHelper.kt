@@ -29,6 +29,16 @@ object PermissionsHelper {
         ) == PackageManager.PERMISSION_GRANTED
     }
 
+    /** Milestone 9B.4: foreground, user-initiated speech input needs
+     * RECORD_AUDIO. Always a real runtime permission (not gated by SDK
+     * version like POST_NOTIFICATIONS above). */
+    fun hasRecordAudioPermission(context: Context): Boolean {
+        return ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.RECORD_AUDIO,
+        ) == PackageManager.PERMISSION_GRANTED
+    }
+
     fun isIgnoringBatteryOptimizations(context: Context): Boolean {
         val powerManager = context.getSystemService(Context.POWER_SERVICE) as PowerManager
         return powerManager.isIgnoringBatteryOptimizations(context.packageName)

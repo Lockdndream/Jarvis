@@ -41,3 +41,41 @@ class DiagnosticsRepository(
         )
     }
 }
+
+/**
+ * Pure-function builder for [VoiceDiagnostics]. Takes already-extracted
+ * primitive values so this file has zero dependency on any voice/audio
+ * package's types. The [lastVoiceEventAtMs] parameter is the absolute
+ * epoch millis of the most recent voice event; this function converts it
+ * to a relative "how long ago" value (matching the existing
+ * [DiagnosticsSnapshot] pattern where relative times are computed from
+ * absolute timestamps).
+ *
+ * Integration step: call this function from somewhere in the Activity /
+ * Repository once the live [AudioFocusManager], [PlaybackManager] and
+ * [VoiceSessionRepository] instances have a defined owner.
+ */
+fun buildVoiceDiagnostics(
+    audioFocusState: String?,
+    audioRoute: String?,
+    ttsReady: Boolean?,
+    ttsSpeaking: Boolean?,
+    voiceSessionState: String?,
+    voiceSessionId: String?,
+    playbackQueueDepth: Int?,
+    speechInputState: String?,
+    lastVoiceEventAtMs: Long?,
+): VoiceDiagnostics {
+    val lastVoiceEventAgoMs = lastVoiceEventAtMs?.let { System.currentTimeMillis() - it }
+    return VoiceDiagnostics(
+        audioFocusState = audioFocusState,
+        audioRoute = audioRoute,
+        ttsReady = ttsReady,
+        ttsSpeaking = ttsSpeaking,
+        voiceSessionState = voiceSessionState,
+        voiceSessionId = voiceSessionId,
+        playbackQueueDepth = playbackQueueDepth,
+        speechInputState = speechInputState,
+        lastVoiceEventAgoMs = lastVoiceEventAgoMs,
+    )
+}

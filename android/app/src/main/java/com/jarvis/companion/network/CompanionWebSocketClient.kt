@@ -8,6 +8,8 @@ import com.jarvis.companion.core.DeviceStatus
 import com.jarvis.companion.pairing.PairingConfig
 import com.jarvis.companion.pairing.PinnedTrustManager
 import com.jarvis.companion.telemetry.TelemetryRecorder
+import com.jarvis.companion.voice.VoiceSessionParser
+import com.jarvis.companion.voice.VoiceSessionRepository
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -85,6 +87,7 @@ class CompanionWebSocketClient(
     private val deviceId: String,
     private val statusInputs: DeviceStatusInputs,
     private val attentionRepository: AttentionRepository,
+    private val voiceSessionRepository: VoiceSessionRepository,
 ) {
     private val generationTracker = ConnectionGenerationTracker()
     private val backoff = BackoffPolicy()
@@ -147,8 +150,39 @@ class CompanionWebSocketClient(
         webSocket = null
         connectedSinceMs = null
         attentionRepository.clear()
+        voiceSessionRepository.clear()
         telemetry.record(TelemetryRecorder.WS_DISCONNECTED, "reason=${DisconnectReason.USER_STOPPED}")
         setState(ConnectionState.DISCONNECTED)
+    }
+
+    /** Milestone 9B.4: mirrors sendAttentionCommand()'s shape/no-op-when-
+     * disconnected style for the three voice_session_* client-originated
+     * message types (see docs/protocols/websocket-protocol-v1.md and
+     * app/main.py's voice_session_open/transcript/close handlers). */
+    fun sendVoiceSessionOpen(conversationId: String?, attentionRequestId: String?): Boolean {
+        val payload = JSONObject().apply {
+            put("type", "voice_session_open")
+            if (conversationId != null) put("conversation_id", conversationId)
+            if (attentionRequestId != null) put("attention_request_id", attentionRequestId)
+        }
+        return webSocket?.send(payload.toString()) ?: false
+    }
+
+    fun sendVoiceSessionTranscript(voiceSessionId: String, transcript: String): Boolean {
+        val payload = JSONObject().apply {
+            put("type", "voice_session_transcript")
+            put("voice_session_id", voiceSessionId)
+            put("transcript", transcript)
+        }
+        return webSocket?.send(payload.toString()) ?: false
+    }
+
+    fun sendVoiceSessionClose(voiceSessionId: String): Boolean {
+        val payload = JSONObject().apply {
+            put("type", "voice_session_close")
+            put("voice_session_id", voiceSessionId)
+        }
+        return webSocket?.send(payload.toString()) ?: false
     }
 
     /** Sends the same `user_message`/`bound_attention_request_id` shape
@@ -244,6 +278,7 @@ class CompanionWebSocketClient(
             // No automatic recovery is coming, so (ADR-015) the attention
             // mirror is cleared here too rather than left stale forever.
             attentionRepository.clear()
+            voiceSessionRepository.clear()
             telemetry.record(TelemetryRecorder.WS_PERMANENT_FAILURE, "reason=$reason")
             setState(ConnectionState.FAILED_PERMANENT)
             return
@@ -328,6 +363,26 @@ class CompanionWebSocketClient(
         }
     }
 
+    /** Milestone 9B.4: sniffs an inbound frame's "type" for the five
+     * voice_session_* frame types and, if matched, applies it to
+     * [voiceSessionRepository] — same one-place-only pattern as
+     * [applyAttentionFrame]. Never throws. */
+    private fun applyVoiceSessionFrame(text: String) {
+        val type = try {
+            JSONObject(text).optString("type", "")
+        } catch (_: Exception) {
+            return
+        }
+        if (!VoiceSessionParser.isVoiceSessionEventType(type)) return
+        when (type) {
+            "voice_session_opened" -> VoiceSessionParser.parseOpened(text)?.let { voiceSessionRepository.applyOpened(it) }
+            "voice_session_response" -> VoiceSessionParser.parseResponse(text)?.let { voiceSessionRepository.applyResponse(it) }
+            "voice_session_error" -> VoiceSessionParser.parseError(text)?.let { voiceSessionRepository.applyError(it.voiceSessionId) }
+            "voice_session_closed" -> VoiceSessionParser.parseClosed(text)?.let { voiceSessionRepository.applyClosed(it.voiceSessionId) }
+            "voice_session_invitation" -> voiceSessionRepository.applyInvitation()
+        }
+    }
+
     private inner class Listener(private val generation: Int) : WebSocketListener() {
         private fun stillCurrent(event: String): Boolean {
             if (generationTracker.isCurrent(generation)) return true
@@ -368,6 +423,19 @@ class CompanionWebSocketClient(
             // reconnect) — the push must see lastContactAtMs already
             // updated, not read it moments before this line runs.
             attentionRepository.applyPendingAttention(emptyList())
+            // Milestone 9B.4: a voice session can never survive a
+            // disconnect — app/main.py's WS handler unconditionally closes
+            // whatever voice session that connection had open (via the
+            // finally block added alongside the TD-002 lease guard) before
+            // the handler unwinds, and there is no pending-voice-session
+            // snapshot message to tell a reconnecting client otherwise.
+            // Unlike attention (which has a real, if conditional, snapshot
+            // message), correctness here does not even depend on server
+            // behavior sending anything — the server-side session is
+            // categorically already gone by the time any reconnect can
+            // happen, so resetting is always correct, not just a safe
+            // default.
+            voiceSessionRepository.clear()
             setState(ConnectionState.CONNECTED)
             telemetry.record(
                 if (wasReconnect) TelemetryRecorder.WS_RECONNECTED else TelemetryRecorder.WS_CONNECTED,
@@ -381,6 +449,7 @@ class CompanionWebSocketClient(
             if (!stillCurrent("onMessage")) return
             telemetry.record(TelemetryRecorder.WS_FRAME_RECEIVED, "bytes=${text.length} generation=$generation")
             applyAttentionFrame(text)
+            applyVoiceSessionFrame(text)
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {

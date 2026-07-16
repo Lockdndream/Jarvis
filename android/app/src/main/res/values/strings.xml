@@ -26,6 +26,7 @@
     <string name="request_battery_exemption_button">Request unrestricted battery</string>
     <string name="open_connection_status_button">Connection status</string>
     <string name="open_diagnostics_button">Diagnostics</string>
+    <string name="open_voice_button">Talk to Jarvis</string>
 
     <!-- Connection status screen -->
     <string name="connection_status_title">Connection status</string>

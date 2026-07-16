@@ -8,6 +8,7 @@ import com.jarvis.companion.JarvisCompanionApp
 import com.jarvis.companion.R
 import com.jarvis.companion.databinding.ActivityDiagnosticsBinding
 import com.jarvis.companion.diagnostics.DiagnosticsRepository
+import com.jarvis.companion.diagnostics.buildVoiceDiagnostics
 
 private const val REFRESH_INTERVAL_MS = 2_000L
 private const val TAIL_LINE_COUNT = 200
@@ -48,6 +49,20 @@ class DiagnosticsActivity : AppCompatActivity() {
 
     private fun refresh() {
         binding.snapshotText.text = diagnostics.snapshot().formatted()
+        val app = applicationContext as JarvisCompanionApp
+        val session = app.voiceSessionRepository.current.value
+        val voice = buildVoiceDiagnostics(
+            audioFocusState = VoiceActivity.activeAudioFocusManager?.focusState?.value?.name,
+            audioRoute = VoiceActivity.activeAudioFocusManager?.currentRoute?.value?.name,
+            ttsReady = VoiceActivity.activePlaybackManager?.isReady?.value,
+            ttsSpeaking = VoiceActivity.activePlaybackManager?.isSpeaking?.value,
+            voiceSessionState = session?.state,
+            voiceSessionId = session?.voiceSessionId,
+            playbackQueueDepth = VoiceActivity.activePlaybackManager?.queueDepth,
+            speechInputState = VoiceActivity.activeSpeechInputController?.state?.value?.name,
+            lastVoiceEventAtMs = null,
+        )
+        binding.voiceText.text = voice.formatted()
         val lines = diagnostics.tail(TAIL_LINE_COUNT)
         binding.telemetryText.text = if (lines.isEmpty()) {
             getString(R.string.diagnostics_no_telemetry_yet)

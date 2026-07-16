@@ -116,6 +116,21 @@ class VoiceSessionManager:
                 attention_request_id = None
             else:
                 bound_row = row
+
+        if attention_request_id and not db.try_claim_voice_session_lease(attention_request_id, voice_session_id):
+            # TD-002/ADR-007 ownership guard: a second client (e.g. the PWA
+            # and the Android companion simultaneously) cannot each open an
+            # independent, uncoordinated VoiceSession bound to the same
+            # AttentionRequest. Raise instead of silently opening unbound —
+            # the whole point is to surface the conflict, not hide it.
+            logger.info(
+                "voice session open rejected: attention_request_id=%s already has an active session",
+                attention_request_id,
+            )
+            raise VoiceSessionError(
+                f"AttentionRequest {attention_request_id} already has an active voice session on another device"
+            )
+
         db.create_voice_session(voice_session_id, conversation_id, attention_request_id)
         self._transition(voice_session_id, STATE_OPENING)
         self._transition(voice_session_id, STATE_LISTENING)
@@ -209,10 +224,18 @@ class VoiceSessionManager:
         if session["state"] == STATE_CLOSED:
             return True
         self._transition(voice_session_id, STATE_CLOSING)
-        return self._transition(voice_session_id, STATE_CLOSED)
+        ok = self._transition(voice_session_id, STATE_CLOSED)
+        if ok and session.get("attention_request_id"):
+            # Release the TD-002 lease so a future session (this device or
+            # another) can bind to the same AttentionRequest again.
+            db.release_voice_session_lease(session["attention_request_id"], voice_session_id)
+        return ok
 
     def fail_session(self, voice_session_id: str) -> bool:
+        session = db.get_voice_session(voice_session_id)
         ok = self._transition(voice_session_id, STATE_FAILED)
         if ok:
             logger.info("voice session failed: id=%s", voice_session_id)
+            if session and session.get("attention_request_id"):
+                db.release_voice_session_lease(session["attention_request_id"], voice_session_id)
         return ok

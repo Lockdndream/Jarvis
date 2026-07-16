@@ -50,22 +50,25 @@ not urgently), **Low** (cosmetic or very low probability of mattering).
 - **Description**: Two clients could each successfully call
   `open_session()` against the same bound `AttentionRequest`
   simultaneously, creating two independent `VoiceSession`s with no
-  coordination. Designed fix exists (nullable
-  `attention_requests.active_voice_session_id`, atomic set-if-null) but
-  is not implemented.
-- **Severity**: High — specifically **before** a second simultaneous
-  voice-capable client exists; currently Low in practice since only the
-  PWA is a real client today.
-- **Owner**: `app/voice_session_manager.py`, `app/attention_manager.py`
+  coordination. Fixed: a nullable `attention_requests.active_voice_session_id`
+  column, claimed atomically (set-if-null,
+  `db.try_claim_voice_session_lease()`) by `open_session()`, released by
+  `close_session()`/`fail_session()`. A second client's attempt to bind an
+  already-leased `AttentionRequest` now raises `VoiceSessionError` instead
+  of silently proceeding.
+- **Severity**: Was High before a second simultaneous voice-capable client
+  existed — now resolved, since Milestone 9B.4 is exactly that trigger
+  (the Android companion gained real voice capability).
+- **Owner**: `app/voice_session_manager.py`, `app/attention_manager.py`,
+  `app/database.py`
 - **Origin milestone**: Milestone 9A (found by independent code review)
-- **Risk**: A production Android companion connecting simultaneously
-  with the PWA would hit this immediately — two uncoordinated voice
-  sessions racing to answer the same attention item, with undefined
-  precedence.
-- **Recommended milestone**: **Must land before or during Milestone 9B**
-  (production Android companion) — this is a hard precondition, not a
-  nice-to-have, per ADR-007's own Future Revisit Conditions.
-- **Status**: Open, designed, not implemented (ADR-007, Known Limitation #46)
+- **Resolved milestone**: Milestone 9B.4 (ADR-016), 2026-07-14. A related
+  gap found and fixed during the same milestone: nothing previously closed
+  a voice session left open by an abruptly disconnected WebSocket, which
+  would have let a lease be held forever — `app/main.py`'s connection
+  handler now closes any still-open session for that connection in a
+  `finally` block.
+- **Status**: Resolved (ADR-007, ADR-016, Known Limitation #46)
 
 ### TD-003 — Transport Reachability (remote/non-LAN connectivity)
 
@@ -466,6 +469,42 @@ not urgently), **Low** (cosmetic or very low probability of mattering).
   restarting the companion (Stop → Start) after the correct certificate
   is restored reconnects normally.
 
+### TD-022 — Wake-word background/Doze survival, battery, and adverse-acoustic recall unproven
+
+- **Description**: Milestone 9B.5's D5 spike (`spikes/android-wakeword/`)
+  real-device-proved the NDK/CMake + TensorFlow Lite Micro architecture
+  builds, loads the model, runs inference, and detects the real wake word
+  on the S20 FE — but every test ran with the screen kept awake via
+  Developer Options "Stay awake" while charging, deliberately avoiding
+  actual screen-lock/Doze conditions. The spike has no foreground service
+  or wake lock (unlike the production `PresenceService`); an earlier,
+  shorter attempt at the same false-positive test lost its in-memory
+  counters the moment Android recreated the backgrounded activity,
+  confirming real device evidence that this spike does not currently
+  survive ordinary backgrounding. Recall was also only measured from one
+  speaker at close range in two room conditions (8/10 non-quiet, 10/10
+  quiet) — not against distance, multiple speakers, or genuine background
+  noise/conversation. No multi-hour battery-drain figures exist for
+  continuous native inference at ~100Hz on this device.
+- **Severity**: High for any future production wake-word milestone
+  (always-listening is the entire point, so Doze/background survival is
+  not optional) — Low for the current state, since no production
+  integration exists yet and the spike remains disposable.
+- **Owner**: Unowned — no module currently addresses this;
+  `spikes/android-wakeword/` is disposable, not a production dependency.
+- **Origin milestone**: Milestone 9B.5 (D5 spike, real-device evidence)
+- **Risk**: Any future production wake-word milestone that assumes the
+  D5 spike's quiet-room/plugged-in results generalize to real always-on
+  background operation would be building on REQUIRES-EXPERIMENT-classified
+  ground, not FACT — the same category of assumption M9B.0 already found
+  and fixed once for `PresenceService` (Samsung Default battery
+  optimization silently killing backgrounded work).
+- **Recommended milestone**: Any future production wake-word milestone
+  must resolve this first, reusing the `PresenceService`
+  foreground-service/wake-lock pattern rather than assuming the bare
+  spike's behavior carries over.
+- **Status**: Open, explicitly disclosed (`SESSION.md` Milestone 9B.5)
+
 ---
 
 ## Summary
@@ -473,7 +512,7 @@ not urgently), **Low** (cosmetic or very low probability of mattering).
 | ID | Title | Category | Severity |
 |---|---|---|---|
 | TD-001 | `push_subscriptions` ownership | Architecture | Medium |
-| TD-002 | VoiceSession multi-client lease | Architecture | High (conditional) |
+| TD-002 | VoiceSession multi-client lease | Architecture | Resolved (M9B.4) |
 | TD-003 | Transport Reachability | Architecture | High (conditional) |
 | TD-004 | Background push reliability | Operational | High (conditional) |
 | TD-005 | Notification routing ownership | Architecture | Low |
@@ -493,6 +532,7 @@ not urgently), **Low** (cosmetic or very low probability of mattering).
 | TD-019 | Unbounded table growth | Operational | Medium |
 | TD-020 | Hardcoded paid-model allowlist | Operational | Low |
 | TD-021 | Android companion retries forever on cert mismatch | Implementation | **Closed (M9B.2)** |
+| TD-022 | Wake-word background/Doze survival, battery, adverse-acoustic recall unproven | Architecture | High (conditional) |
 
 No duplicate entries exist between this register and `SESSION.md`'s own
 "Known Bugs, Limitations, and Technical Debt" section — this register is

@@ -8,6 +8,7 @@ import com.jarvis.companion.core.SecureConfigStore
 import com.jarvis.companion.pairing.PairingClient
 import com.jarvis.companion.pairing.PairingRepository
 import com.jarvis.companion.telemetry.TelemetryRecorder
+import com.jarvis.companion.voice.VoiceSessionRepository
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 
@@ -35,6 +36,14 @@ class JarvisCompanionApp : Application() {
     lateinit var attentionRepository: AttentionRepository
         private set
 
+    // Milestone 9B.4: the one client-side mirror of the current voice
+    // session, fed by CompanionWebSocketClient's voice_session_* frame
+    // parsing, same sharing rationale as attentionRepository above — this
+    // is what makes rotation/process-recreation survival possible for
+    // VoiceActivity without it doing anything special itself.
+    lateinit var voiceSessionRepository: VoiceSessionRepository
+        private set
+
     // App-wide, in-memory only (not persisted — this is live status, not
     // config). PresenceService is the sole writer; ConnectionStatusActivity
     // and any other observer only read it. Deliberately not a bound-service
@@ -55,6 +64,7 @@ class JarvisCompanionApp : Application() {
         pairingClient = PairingClient()
         telemetry = TelemetryRecorder(this)
         attentionRepository = AttentionRepository()
+        voiceSessionRepository = VoiceSessionRepository()
         telemetry.record(TelemetryRecorder.APP_CREATED, "deviceId=${deviceIdentity.get()}")
     }
 }

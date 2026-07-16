@@ -106,5 +106,11 @@
             android:layout_height="wrap_content"
             android:text="@string/open_diagnostics_button" />
 
+        <Button
+            android:id="@+id/openVoiceButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/open_voice_button" />
+
     </LinearLayout>
 </ScrollView>

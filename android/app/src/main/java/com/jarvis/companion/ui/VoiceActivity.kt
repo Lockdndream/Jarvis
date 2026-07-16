@@ -1,0 +1,285 @@
+package com.jarvis.companion.ui
+
+import android.os.Bundle
+import android.view.View
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AppCompatActivity
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
+import com.jarvis.companion.JarvisCompanionApp
+import com.jarvis.companion.audio.AudioFocusManager
+import com.jarvis.companion.core.ConnectionState
+import com.jarvis.companion.databinding.ActivityVoiceBinding
+import com.jarvis.companion.service.PresenceService
+import com.jarvis.companion.settings.PermissionsHelper
+import com.jarvis.companion.voice.AudioFocusOwner
+import com.jarvis.companion.voice.PlaybackManager
+import com.jarvis.companion.voice.SpeechInputController
+import com.jarvis.companion.voice.VoiceSession
+import com.jarvis.companion.voice.VoiceSessionState
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.launch
+
+/**
+ * Maps the server's internal [VoiceSessionState] strings to the five
+ * user-facing labels the UI needs to display. The server has more granular
+ * internal states than the UI shows — transient intermediary states
+ * (opening, processing, deferred, closing) are all mapped to "waiting"
+ * because from the user's perspective the system is working and they
+ * should wait.
+ *
+ * null (no active session) maps to "finished".
+ */
+fun voiceSessionStateToUserFacingLabel(serverState: String?): String = when (serverState) {
+    null -> "finished"
+    VoiceSessionState.LISTENING -> "listening"
+    VoiceSessionState.SPEAKING -> "speaking"
+    VoiceSessionState.WAITING -> "waiting"
+    VoiceSessionState.CLOSED -> "finished"
+    VoiceSessionState.FAILED -> "error"
+    else -> "waiting"
+}
+
+/**
+ * Production voice screen for Milestone 9B.4. Displays the current
+ * [VoiceSession] status, the latest spoken response, and a mic button.
+ *
+ * Owns its own [AudioFocusManager], [PlaybackManager], and
+ * [SpeechInputController] instances — [PresenceService] is presence/
+ * transport only and must not own audio/UI-adjacent resources.
+ */
+class VoiceActivity : AppCompatActivity() {
+    private lateinit var binding: ActivityVoiceBinding
+    private lateinit var app: JarvisCompanionApp
+    private lateinit var audioFocusManager: AudioFocusManager
+    private lateinit var playbackManager: PlaybackManager
+    private lateinit var speechInputController: SpeechInputController
+
+    private var pendingTranscript: String? = null
+    private var lastSpokenText: String? = null
+    private var lastSpokenSessionId: String? = null
+    private var userFacingError: String? = null
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        app = applicationContext as JarvisCompanionApp
+        binding = ActivityVoiceBinding.inflate(layoutInflater)
+        setContentView(binding.root)
+
+        audioFocusManager = AudioFocusManager(this)
+        audioFocusManager.start()
+
+        playbackManager = PlaybackManager(this, AudioFocusOwnerAdapter(audioFocusManager))
+        playbackManager.init()
+
+        speechInputController = SpeechInputController(this)
+
+        // Same-process-only static exposure for the Diagnostics screen,
+        // mirroring PresenceService.activeClient's doc-commented rationale:
+        // this Activity and Diagnostics always run in the same process, so
+        // a Binder would add indirection without adding safety. Only valid
+        // while this screen is actually alive — Diagnostics must treat
+        // null as "voice screen not open" and render "n/a", not crash.
+        activeAudioFocusManager = audioFocusManager
+        activePlaybackManager = playbackManager
+        activeSpeechInputController = speechInputController
+
+        val attentionRequestId = intent.getStringExtra(EXTRA_ATTENTION_REQUEST_ID)
+        if (attentionRequestId != null && app.voiceSessionRepository.current.value == null) {
+            PresenceService.activeClient?.sendVoiceSessionOpen(
+                conversationId = null,
+                attentionRequestId = attentionRequestId,
+            )
+        }
+
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                combine(
+                    app.voiceSessionRepository.current,
+                    app.voiceSessionRepository.lastResponse,
+                    app.connectionState,
+                ) { session, response, connectionState ->
+                    Triple(session, response, connectionState)
+                }.collect { (session, response, connectionState) ->
+                    val pending = pendingTranscript
+                    if (pending != null && session != null) {
+                        pendingTranscript = null
+                        PresenceService.activeClient?.sendVoiceSessionTranscript(
+                            session.voiceSessionId, pending,
+                        )
+                    }
+                    render(session, response, connectionState)
+                }
+            }
+        }
+
+        binding.micButton.setOnClickListener { onMicTap() }
+
+        binding.closeButton.setOnClickListener { onClose() }
+    }
+
+    override fun onPause() {
+        super.onPause()
+        speechInputController.cancel()
+        playbackManager.cancel()
+    }
+
+    override fun onDestroy() {
+        if (activeAudioFocusManager === audioFocusManager) activeAudioFocusManager = null
+        if (activePlaybackManager === playbackManager) activePlaybackManager = null
+        if (activeSpeechInputController === speechInputController) activeSpeechInputController = null
+        audioFocusManager.stop()
+        playbackManager.shutdown()
+        super.onDestroy()
+    }
+
+    private val recordAudioPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            if (granted) startListening() else showError("Microphone permission is required to talk to Jarvis")
+        }
+
+    private fun onMicTap() {
+        if (!PermissionsHelper.hasRecordAudioPermission(this)) {
+            recordAudioPermissionLauncher.launch(android.Manifest.permission.RECORD_AUDIO)
+            return
+        }
+        startListening()
+    }
+
+    private fun startListening() {
+        userFacingError = null
+        speechInputController.startListening(
+            onResult = { transcript ->
+                val session = app.voiceSessionRepository.current.value
+                if (session != null) {
+                    PresenceService.activeClient?.sendVoiceSessionTranscript(
+                        session.voiceSessionId, transcript,
+                    )
+                } else {
+                    val attentionRequestId = intent.getStringExtra(EXTRA_ATTENTION_REQUEST_ID)
+                    pendingTranscript = transcript
+                    PresenceService.activeClient?.sendVoiceSessionOpen(
+                        conversationId = null,
+                        attentionRequestId = attentionRequestId,
+                    )
+                }
+            },
+            onError = { message -> showError(message) },
+        )
+    }
+
+    /** render() otherwise only runs from the session/response/connection
+     * StateFlow combine() below — an error from SpeechInputController
+     * doesn't touch any of those, so without this explicit call the error
+     * would silently never reach the screen. */
+    private fun showError(message: String) {
+        userFacingError = message
+        render(
+            app.voiceSessionRepository.current.value,
+            app.voiceSessionRepository.lastResponse.value,
+            app.connectionState.value,
+        )
+    }
+
+    private fun onClose() {
+        val session = app.voiceSessionRepository.current.value
+        if (session != null) {
+            PresenceService.activeClient?.sendVoiceSessionClose(session.voiceSessionId)
+        }
+        playbackManager.cancel()
+        pendingTranscript = null
+        finish()
+    }
+
+    private fun render(
+        session: VoiceSession?,
+        response: String?,
+        connectionState: ConnectionState,
+    ) {
+        binding.connectionStateText.text = when (connectionState) {
+            ConnectionState.CONNECTED -> "Connected"
+            ConnectionState.CONNECTING -> "Connecting\u2026"
+            ConnectionState.RECONNECTING -> "Reconnecting\u2026"
+            ConnectionState.DISCONNECTED -> "Not connected"
+            ConnectionState.FAILED_PERMANENT -> "Connection failed"
+        }
+
+        if (userFacingError != null) {
+            binding.statusText.text = "error"
+            binding.responseText.text = userFacingError
+            binding.responseText.visibility = View.VISIBLE
+            return
+        }
+
+        binding.statusText.text = voiceSessionStateToUserFacingLabel(session?.state)
+
+        // The server never actually reports voice_session_state="speaking"
+        // (app/voice_session_manager.py's real transition path only ever
+        // sets listening/deferred) — speaking is a purely client-driven
+        // fact, exactly like the PWA's own speakForVoiceSession(), which
+        // speaks any new response text regardless of server-reported state.
+        val sessionId = session?.voiceSessionId
+        if (sessionId != null && sessionId != lastSpokenSessionId) {
+            lastSpokenSessionId = sessionId
+            lastSpokenText = null
+            val greeting = session.greeting
+            if (greeting != null) {
+                lastSpokenText = greeting
+                playbackManager.speak(greeting)
+            }
+        }
+        if (response != null && response != lastSpokenText) {
+            lastSpokenText = response
+            playbackManager.speak(response)
+        }
+
+        // The turn response takes priority once one exists; before that, a
+        // bound session's greeting is the only text the user has been
+        // given yet, so show it rather than nothing.
+        val displayText = response ?: session?.greeting
+        if (displayText != null) {
+            binding.responseText.text = displayText
+            binding.responseText.visibility = View.VISIBLE
+        } else {
+            binding.responseText.visibility = View.GONE
+        }
+    }
+
+    companion object {
+        const val EXTRA_ATTENTION_REQUEST_ID = "com.jarvis.companion.EXTRA_VOICE_ATTENTION_REQUEST_ID"
+
+        // In-process only (this app has no other process), read access for
+        // the Diagnostics screen — same rationale as
+        // PresenceService.activeClient. Null whenever this screen isn't
+        // currently alive; Diagnostics must render "n/a" in that case, not
+        // crash or assume the voice feature is broken.
+        @Volatile
+        var activeAudioFocusManager: AudioFocusManager? = null
+            private set
+
+        @Volatile
+        var activePlaybackManager: PlaybackManager? = null
+            private set
+
+        @Volatile
+        var activeSpeechInputController: SpeechInputController? = null
+            private set
+    }
+}
+
+/**
+ * Bridges [AudioFocusManager] (whose [AudioFocusManager.abandonFocus]
+ * returns [Unit]) to [AudioFocusOwner] (whose [AudioFocusOwner.abandonFocus]
+ * returns [Boolean]). The real method has no failure mode to report, so
+ * this adapter always returns true.
+ */
+private class AudioFocusOwnerAdapter(
+    private val audioFocusManager: AudioFocusManager,
+) : AudioFocusOwner {
+    override fun requestFocus(): Boolean = audioFocusManager.requestFocus()
+    override fun abandonFocus(): Boolean {
+        audioFocusManager.abandonFocus()
+        return true
+    }
+}

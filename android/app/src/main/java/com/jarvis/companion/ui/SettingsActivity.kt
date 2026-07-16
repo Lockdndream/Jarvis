@@ -58,6 +58,9 @@ class SettingsActivity : AppCompatActivity() {
         binding.openConnectionStatusButton.setOnClickListener {
             startActivity(Intent(this, ConnectionStatusActivity::class.java))
         }
+        binding.openVoiceButton.setOnClickListener {
+            startActivity(Intent(this, VoiceActivity::class.java))
+        }
         binding.openDiagnosticsButton.setOnClickListener {
             startActivity(Intent(this, DiagnosticsActivity::class.java))
         }

@@ -9,7 +9,7 @@ package com.jarvis.companion.core
  * flips its constant, it does not add new wire-protocol fields.
  */
 data class DeviceCapabilities(
-    val voice: Boolean = false,
+    val voice: Boolean = true,
     val wakeword: Boolean = false,
     val widget: Boolean = false,
     val notifications: Boolean = true,

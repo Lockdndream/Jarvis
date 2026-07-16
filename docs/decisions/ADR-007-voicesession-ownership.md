@@ -2,8 +2,10 @@
 
 ## Status
 
-Accepted (single-client model proven; multi-client ownership guard
-designed but not yet implemented — see Tradeoffs)
+Accepted. The multi-client ownership guard (Tradeoffs, below) was
+implemented in Milestone 9B.4 (ADR-016) — see that ADR for the
+implementation; this ADR's own text is left as originally written for
+historical accuracy (the guard's design predates its implementation).
 
 ## Date
 
