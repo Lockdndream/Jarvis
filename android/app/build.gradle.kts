@@ -6,6 +6,12 @@ plugins {
 android {
     namespace = "com.jarvis.companion"
     compileSdk = 34
+    // Milestone 9B.6, Task 6: first native code in this module (a
+    // minimal JNI infrastructure proof — see wakeword/WakeWordNativeSelfTest.kt
+    // and src/main/cpp/). Same NDK version as the disposable
+    // spikes/android-wakeword/ spike, which already real-device-proved
+    // the toolchain works on this target device.
+    ndkVersion = "28.2.13676358"
 
     defaultConfig {
         applicationId = "com.jarvis.companion"
@@ -16,6 +22,24 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "0.1.0"
+
+        // Real device (S20 FE, Snapdragon 865) is arm64-v8a only.
+        ndk {
+            abiFilters += "arm64-v8a"
+        }
+
+        externalNativeBuild {
+            cmake {
+                cppFlags += ""
+            }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
     }
 
     buildTypes {
