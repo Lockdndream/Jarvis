@@ -11,6 +11,17 @@ import java.nio.ByteBuffer
 private const val TAG = "MicroWakeWord"
 
 /**
+ * Milestone 9B.7: small abstraction over [MicroWakeWord] so callers (e.g.
+ * [WakeWordManager]) can be unit-tested with a fake — real inference
+ * requires the native library and cannot run in a JVM unit test. Zero
+ * behavior change to [MicroWakeWord] itself, no native/JNI changes.
+ */
+interface WakeWordEngine : Closeable {
+    fun processAudio(samples: ShortArray): Boolean
+    fun reset()
+}
+
+/**
  * Wake word detector combining audio feature extraction, TFLite Micro inference,
  * and sliding window detection — all in a single C++ engine.
  *
@@ -25,7 +36,7 @@ class MicroWakeWord(
     featureStepSizeMs: Int,
     probabilityCutoff: Float,
     slidingWindowSize: Int,
-) : Closeable {
+) : WakeWordEngine {
 
     private var nativeHandle: Long = 0
 
@@ -49,12 +60,12 @@ class MicroWakeWord(
      * @param samples 16-bit PCM mono audio samples at 16 kHz
      * @return true if wake word was detected in this or recent frames
      */
-    fun processAudio(samples: ShortArray): Boolean {
+    override fun processAudio(samples: ShortArray): Boolean {
         check(nativeHandle != 0L) { "MicroWakeWord has been closed" }
         return nativeProcessAudio(nativeHandle, samples)
     }
 
-    fun reset() {
+    override fun reset() {
         check(nativeHandle != 0L) { "MicroWakeWord has been closed" }
         nativeReset(nativeHandle)
         Log.d(TAG, "MicroWakeWord reset")
