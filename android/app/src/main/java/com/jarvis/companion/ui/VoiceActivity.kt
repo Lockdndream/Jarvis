@@ -117,6 +117,16 @@ class VoiceActivity : AppCompatActivity() {
         binding.micButton.setOnClickListener { onMicTap() }
 
         binding.closeButton.setOnClickListener { onClose() }
+
+        // ADR-017 Section C: a wake-word-initiated launch means the user
+        // just spoke a trigger phrase — start listening immediately rather
+        // than waiting for a mic tap. savedInstanceState == null (not just
+        // the intent extra) guards this so a configuration-change
+        // recreation of this same Activity/Intent doesn't re-trigger a
+        // second startListening() call over an already-listening session.
+        if (savedInstanceState == null && intent.getBooleanExtra(EXTRA_LAUNCHED_BY_WAKEWORD, false)) {
+            onMicTap()
+        }
     }
 
     override fun onPause() {
@@ -248,6 +258,15 @@ class VoiceActivity : AppCompatActivity() {
 
     companion object {
         const val EXTRA_ATTENTION_REQUEST_ID = "com.jarvis.companion.EXTRA_VOICE_ATTENTION_REQUEST_ID"
+
+        // Milestone 9B.9 (ADR-017 Section C): set by PresenceService's
+        // confirmation-gated handoff when it launches this Activity after
+        // a wake-word detection's VoiceSession open was confirmed by the
+        // server — the VoiceSession already exists by the time this
+        // Activity is created (see PresenceService.handleWakeWordDetection),
+        // so unlike EXTRA_ATTENTION_REQUEST_ID this extra never triggers a
+        // sendVoiceSessionOpen() call here; it only triggers auto-listening.
+        const val EXTRA_LAUNCHED_BY_WAKEWORD = "com.jarvis.companion.EXTRA_VOICE_LAUNCHED_BY_WAKEWORD"
 
         // In-process only (this app has no other process), read access for
         // the Diagnostics screen — same rationale as

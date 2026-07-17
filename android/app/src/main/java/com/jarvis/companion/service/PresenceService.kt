@@ -16,6 +16,10 @@ import com.jarvis.companion.network.CompanionWebSocketClient
 import com.jarvis.companion.network.DeviceStatusSnapshot
 import com.jarvis.companion.settings.PermissionsHelper
 import com.jarvis.companion.telemetry.TelemetryRecorder
+import com.jarvis.companion.ui.VoiceActivity
+import com.jarvis.companion.voice.VoiceSessionOpenOutcome
+import com.jarvis.companion.voice.matchesRequestId
+import com.jarvis.companion.wakeword.WakeWordDetection
 import com.jarvis.companion.wakeword.WakeWordManager
 import com.jarvis.companion.widget.AttentionWidgetProvider
 import java.util.UUID
@@ -25,7 +29,9 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * Foreground service owning this app's one WebSocket connection to the
@@ -57,6 +63,19 @@ class PresenceService : Service() {
     // invalid double-start), stopped once in onDestroy(). Never
     // recreated implicitly.
     private lateinit var wakeWordManager: WakeWordManager
+
+    // Milestone 9B.9 (ADR-017 Section C): client_request_ids that
+    // handleWakeWordDetection() already gave up waiting on (its confirm
+    // timeout elapsed, so it already called wakeWordManager.
+    // resumeAfterVoiceSession()) but whose voice_session_opened reply
+    // might still arrive late over a slow/degraded connection. Only ever
+    // read/written from serviceScope (Dispatchers.Main, single-threaded)
+    // — both collectors that touch it below run confined to it, so a
+    // plain MutableSet needs no separate synchronization. Entries for
+    // replies that never arrive at all are never removed; unbounded in
+    // theory, but each abandoned handoff only adds one UUID string and
+    // these are rare failure/timeout events, not a practical leak.
+    private val abandonedWakeWordRequestIds = mutableSetOf<String>()
 
     private lateinit var connectivityManager: ConnectivityManager
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
@@ -155,13 +174,85 @@ class PresenceService : Service() {
                 }
         }
 
-        // Milestone 9B.8 explicitly defers acting on a detection (opening
-        // a VoiceSession, launching VoiceActivity) to a later milestone —
-        // this only makes detections observable/counted, per that scope
-        // boundary.
+        // Milestone 9B.9 (ADR-017 Section C): the confirmation-gated
+        // handoff. WakeWordManager has already self-transitioned to
+        // PAUSED_VOICE_SESSION synchronously before this event fires (see
+        // WakeWordManager.onAudioChunk()) — every exit path below must
+        // therefore either lead to a real VoiceSession (whose open the
+        // existing `current` collector above will pauseForVoiceSession()
+        // into, a no-op from PAUSED_VOICE_SESSION) or explicitly call
+        // resumeAfterVoiceSession() itself, or WakeWordManager is stuck
+        // paused forever with nothing left to un-pause it.
         serviceScope.launch {
             wakeWordManager.onDetected.collect { detection ->
                 telemetry.record(TelemetryRecorder.WAKEWORD_DETECTED, "detectionId=${detection.detectionId}")
+                handleWakeWordDetection(detection)
+            }
+        }
+
+        // Milestone 9B.9: catches a voice_session_opened reply that
+        // arrives *after* handleWakeWordDetection() already gave up
+        // waiting on it (its confirm timeout elapsed, which already called
+        // resumeAfterVoiceSession()). Without this, the late reply still
+        // flips VoiceSessionRepository.current to non-null, and the
+        // `current` collector above re-pauses WakeWordManager for a
+        // session no VoiceActivity was ever launched to close — leaving
+        // WakeWordManager paused until the server's own idle-session
+        // timeout eventually closes it (a real, independent-review-found
+        // race; ADR-017 Section C). Closing the orphaned session here
+        // immediately turns that potential minutes-long wake-word outage
+        // into a sub-second one.
+        serviceScope.launch {
+            app.voiceSessionRepository.openOutcomes.collect { outcome ->
+                if (outcome is VoiceSessionOpenOutcome.Opened && abandonedWakeWordRequestIds.remove(outcome.clientRequestId)) {
+                    telemetry.record(
+                        TelemetryRecorder.WAKEWORD_HANDOFF_FAILED,
+                        "detectionId=${outcome.clientRequestId} reason=late_reply_closed voiceSessionId=${outcome.session.voiceSessionId}",
+                    )
+                    activeClient?.sendVoiceSessionClose(outcome.session.voiceSessionId)
+                }
+            }
+        }
+    }
+
+    private suspend fun handleWakeWordDetection(detection: WakeWordDetection) {
+        val requestId = detection.detectionId.toString()
+        val sent = activeClient?.sendVoiceSessionOpen(
+            conversationId = null,
+            attentionRequestId = null,
+            clientRequestId = requestId,
+        ) ?: false
+
+        if (!sent) {
+            telemetry.record(TelemetryRecorder.WAKEWORD_HANDOFF_FAILED, "detectionId=$requestId reason=not_connected")
+            wakeWordManager.resumeAfterVoiceSession()
+            return
+        }
+
+        val outcome = withTimeoutOrNull(WAKEWORD_OPEN_CONFIRM_TIMEOUT_MS) {
+            app.voiceSessionRepository.openOutcomes.first { it.matchesRequestId(requestId) }
+        }
+
+        when (outcome) {
+            is VoiceSessionOpenOutcome.Opened -> {
+                telemetry.record(
+                    TelemetryRecorder.WAKEWORD_HANDOFF_LAUNCHED,
+                    "detectionId=$requestId voiceSessionId=${outcome.session.voiceSessionId}",
+                )
+                val intent = Intent(applicationContext, VoiceActivity::class.java).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    putExtra(VoiceActivity.EXTRA_LAUNCHED_BY_WAKEWORD, true)
+                }
+                applicationContext.startActivity(intent)
+            }
+            is VoiceSessionOpenOutcome.Failed -> {
+                telemetry.record(TelemetryRecorder.WAKEWORD_HANDOFF_FAILED, "detectionId=$requestId reason=${outcome.error}")
+                wakeWordManager.resumeAfterVoiceSession()
+            }
+            null -> {
+                telemetry.record(TelemetryRecorder.WAKEWORD_HANDOFF_FAILED, "detectionId=$requestId reason=timeout")
+                abandonedWakeWordRequestIds.add(requestId)
+                wakeWordManager.resumeAfterVoiceSession()
             }
         }
     }
@@ -275,5 +366,14 @@ class PresenceService : Service() {
         @Volatile
         var serviceCreatedAtMs: Long? = null
             private set
+
+        // Milestone 9B.9 (ADR-017 Section C): how long to wait for the
+        // server's voice_session_opened/voice_session_error reply to a
+        // wake-word-initiated voice_session_open before giving up and
+        // resuming wake-word listening. Generous relative to typical
+        // round-trip latency (sub-second on a healthy LAN connection) —
+        // this only guards against a hung/dropped connection, not normal
+        // response time.
+        private const val WAKEWORD_OPEN_CONFIRM_TIMEOUT_MS = 5000L
     }
 }

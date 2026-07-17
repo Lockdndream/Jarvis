@@ -127,5 +127,9 @@ class TelemetryRecorder(context: Context) {
         const val WAKEWORD_PAUSED_FOR_VOICE_SESSION = "WAKEWORD_PAUSED_FOR_VOICE_SESSION"
         const val WAKEWORD_RESUMED_AFTER_VOICE_SESSION = "WAKEWORD_RESUMED_AFTER_VOICE_SESSION"
         const val WAKEWORD_DETECTED = "WAKEWORD_DETECTED"
+        // Milestone 9B.9 (ADR-017 Section C): confirmation-gated handoff
+        // from a wake-word detection to a launched VoiceActivity.
+        const val WAKEWORD_HANDOFF_LAUNCHED = "WAKEWORD_HANDOFF_LAUNCHED"
+        const val WAKEWORD_HANDOFF_FAILED = "WAKEWORD_HANDOFF_FAILED"
     }
 }
