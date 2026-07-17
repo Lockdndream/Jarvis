@@ -16,12 +16,15 @@ import com.jarvis.companion.network.CompanionWebSocketClient
 import com.jarvis.companion.network.DeviceStatusSnapshot
 import com.jarvis.companion.settings.PermissionsHelper
 import com.jarvis.companion.telemetry.TelemetryRecorder
+import com.jarvis.companion.wakeword.WakeWordManager
 import com.jarvis.companion.widget.AttentionWidgetProvider
+import java.util.UUID
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 
 /**
@@ -44,6 +47,16 @@ class PresenceService : Service() {
     private lateinit var notifications: PresenceNotifications
     private var connectionClient: CompanionWebSocketClient? = null
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+
+    // Milestone 9B.8 (ADR-017): PresenceService is the single owner of
+    // exactly one WakeWordManager instance for this service's entire
+    // create-to-destroy lifetime — created once in onCreate(), started
+    // in onStartCommand() (idempotent: WakeWordManager.start() itself
+    // no-ops if already running, so a redelivered/duplicate
+    // onStartCommand call can never produce a second instance or an
+    // invalid double-start), stopped once in onDestroy(). Never
+    // recreated implicitly.
+    private lateinit var wakeWordManager: WakeWordManager
 
     private lateinit var connectivityManager: ConnectivityManager
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
@@ -95,6 +108,62 @@ class PresenceService : Service() {
             combine(app.attentionRepository.outstanding, app.connectionState) { _, _ -> Unit }
                 .collect { AttentionWidgetProvider.requestUpdate(applicationContext) }
         }
+
+        // Milestone 9B.8: created once per service lifetime. Identifies
+        // *this* instance for field debugging of unexpected recreation —
+        // if a future bug report shows two different session IDs without
+        // an intervening SERVICE_DESTROYED, that's a real recreation, not
+        // an assumption.
+        wakeWordSessionId = UUID.randomUUID().toString()
+        wakeWordManager = WakeWordManager(applicationContext, app.wakeWordConfigRepository)
+        activeWakeWordManager = wakeWordManager
+        telemetry.record(TelemetryRecorder.WAKEWORD_MANAGER_CREATED, "sessionId=$wakeWordSessionId")
+
+        // Pause for the entire lifetime of any active VoiceSession
+        // (listening/processing/speaking) — opened by this device or any
+        // other client (the PWA, a future ESP companion) — never just
+        // "while speaking": WakeWordManager needs no reference to
+        // PlaybackManager/AudioFocusManager to get this right, matching
+        // ADR-017 Section B/C exactly. Resume automatically once no
+        // VoiceSession is active. WakeWordManager.pauseForVoiceSession()/
+        // resumeAfterVoiceSession() are themselves idempotent no-ops from
+        // an already-correct state (verified in WakeWordManagerTest), so
+        // repeated or rapid session churn here can never desync the state
+        // machine — each call is independently safe regardless of how
+        // many times it fires or how close together.
+        //
+        // distinctUntilChanged on active/inactive (not on the raw
+        // VoiceSession, which is a data class whose `state` field changes
+        // on every turn-progress update within the SAME session —
+        // listening/processing/listening again) — without this, one
+        // conversation turn would fire pauseForVoiceSession() repeatedly
+        // and spam WAKEWORD_PAUSED_FOR_VOICE_SESSION telemetry, defeating
+        // this task's own field-debugging goal for these diagnostics.
+        // Found and fixed after independent review flagged it as real,
+        // not hypothetical.
+        serviceScope.launch {
+            app.voiceSessionRepository.current
+                .distinctUntilChanged { old, new -> (old != null) == (new != null) }
+                .collect { session ->
+                    if (session != null) {
+                        wakeWordManager.pauseForVoiceSession()
+                        telemetry.record(TelemetryRecorder.WAKEWORD_PAUSED_FOR_VOICE_SESSION, "voiceSessionId=${session.voiceSessionId}")
+                    } else {
+                        wakeWordManager.resumeAfterVoiceSession()
+                        telemetry.record(TelemetryRecorder.WAKEWORD_RESUMED_AFTER_VOICE_SESSION)
+                    }
+                }
+        }
+
+        // Milestone 9B.8 explicitly defers acting on a detection (opening
+        // a VoiceSession, launching VoiceActivity) to a later milestone —
+        // this only makes detections observable/counted, per that scope
+        // boundary.
+        serviceScope.launch {
+            wakeWordManager.onDetected.collect { detection ->
+                telemetry.record(TelemetryRecorder.WAKEWORD_DETECTED, "detectionId=${detection.detectionId}")
+            }
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -136,6 +205,13 @@ class PresenceService : Service() {
             client.start(pairingConfig)
         }
 
+        // Idempotent: WakeWordManager.start() itself no-ops if not
+        // STOPPED (e.g. a redelivered onStartCommand while already
+        // LISTENING) or if disabled in config — safe to call
+        // unconditionally on every onStartCommand.
+        wakeWordManager.start()
+        telemetry.record(TelemetryRecorder.WAKEWORD_STARTED, "state=${wakeWordManager.state.value}")
+
         return START_STICKY
     }
 
@@ -144,6 +220,10 @@ class PresenceService : Service() {
         connectionClient?.stop()
         connectionClient = null
         activeClient = null
+        wakeWordManager.stop()
+        telemetry.record(TelemetryRecorder.WAKEWORD_STOPPED, "sessionId=$wakeWordSessionId")
+        activeWakeWordManager = null
+        wakeWordSessionId = null
         serviceCreatedAtMs = null
         app.updateConnectionState(ConnectionState.DISCONNECTED)
         try {
@@ -177,6 +257,19 @@ class PresenceService : Service() {
         // live connection-client state for its snapshot.
         @Volatile
         var activeClient: CompanionWebSocketClient? = null
+            private set
+
+        // Milestone 9B.8: same in-process-only rationale as activeClient
+        // above — read access for a future Diagnostics screen without a
+        // Binder. wakeWordSessionId identifies *this* WakeWordManager
+        // instance's lifetime (see onCreate()'s doc comment); it and
+        // activeWakeWordManager are set together and cleared together.
+        @Volatile
+        var activeWakeWordManager: WakeWordManager? = null
+            private set
+
+        @Volatile
+        var wakeWordSessionId: String? = null
             private set
 
         @Volatile

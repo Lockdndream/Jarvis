@@ -9,6 +9,7 @@ import com.jarvis.companion.pairing.PairingClient
 import com.jarvis.companion.pairing.PairingRepository
 import com.jarvis.companion.telemetry.TelemetryRecorder
 import com.jarvis.companion.voice.VoiceSessionRepository
+import com.jarvis.companion.wakeword.WakeWordConfigRepository
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 
@@ -44,6 +45,14 @@ class JarvisCompanionApp : Application() {
     lateinit var voiceSessionRepository: VoiceSessionRepository
         private set
 
+    // Milestone 9B.7: wake-word settings (opt-in enabled flag, confidence
+    // threshold, diagnostic mode), same SecureConfigStore-backed pattern
+    // as pairingRepository. Shared here so PresenceService (constructs
+    // WakeWordManager from it) and a future Settings toggle read/write
+    // the same instance.
+    lateinit var wakeWordConfigRepository: WakeWordConfigRepository
+        private set
+
     // App-wide, in-memory only (not persisted — this is live status, not
     // config). PresenceService is the sole writer; ConnectionStatusActivity
     // and any other observer only read it. Deliberately not a bound-service
@@ -65,6 +74,7 @@ class JarvisCompanionApp : Application() {
         telemetry = TelemetryRecorder(this)
         attentionRepository = AttentionRepository()
         voiceSessionRepository = VoiceSessionRepository()
+        wakeWordConfigRepository = WakeWordConfigRepository(secureConfigStore)
         telemetry.record(TelemetryRecorder.APP_CREATED, "deviceId=${deviceIdentity.get()}")
     }
 }
