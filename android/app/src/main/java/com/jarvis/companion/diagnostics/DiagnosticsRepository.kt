@@ -79,3 +79,32 @@ fun buildVoiceDiagnostics(
         lastVoiceEventAgoMs = lastVoiceEventAgoMs,
     )
 }
+
+/**
+ * Milestone 9B.9 (ADR-017 Section C, Item 6): reads
+ * [PresenceService.activeWakeWordManager]'s live StateFlows plus the
+ * handoff-outcome fields PresenceService tracks on itself, same
+ * in-process-only rationale as [DiagnosticsRepository.snapshot]. Returns
+ * an all-null [WakeWordDiagnostics] when no manager is active (service
+ * not running) rather than crashing.
+ */
+fun buildWakeWordDiagnostics(): WakeWordDiagnostics {
+    val manager = PresenceService.activeWakeWordManager
+    return WakeWordDiagnostics(
+        wakeWordSessionId = PresenceService.wakeWordSessionId,
+        managerState = manager?.state?.value?.name,
+        engineLoaded = manager?.engineLoaded?.value,
+        audioRecordState = manager?.audioRecordState?.value?.name,
+        detectionCount = manager?.detectionCount?.value,
+        lastDetectionAtMs = manager?.lastDetectionAtMs?.value?.let { System.currentTimeMillis() - it },
+        framesProcessed = manager?.framesProcessed?.value,
+        avgLatencyMs = manager?.avgLatencyMs?.value,
+        maxLatencyMs = manager?.maxLatencyMs?.value,
+        inferenceErrorCount = manager?.inferenceErrorCount?.value,
+        lastDetectionId = PresenceService.lastDetectionId,
+        lastClientRequestId = PresenceService.lastClientRequestId,
+        lastVoiceSessionId = PresenceService.lastVoiceSessionId,
+        lastHandoffOutcome = PresenceService.lastHandoffOutcome,
+        lastHandoffAtMs = PresenceService.lastHandoffAtMs?.let { System.currentTimeMillis() - it },
+    )
+}

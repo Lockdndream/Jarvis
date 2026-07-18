@@ -9,6 +9,7 @@ import com.jarvis.companion.R
 import com.jarvis.companion.databinding.ActivityDiagnosticsBinding
 import com.jarvis.companion.diagnostics.DiagnosticsRepository
 import com.jarvis.companion.diagnostics.buildVoiceDiagnostics
+import com.jarvis.companion.diagnostics.buildWakeWordDiagnostics
 
 private const val REFRESH_INTERVAL_MS = 2_000L
 private const val TAIL_LINE_COUNT = 200
@@ -63,6 +64,7 @@ class DiagnosticsActivity : AppCompatActivity() {
             lastVoiceEventAtMs = null,
         )
         binding.voiceText.text = voice.formatted()
+        binding.wakeWordText.text = buildWakeWordDiagnostics().formatted()
         val lines = diagnostics.tail(TAIL_LINE_COUNT)
         binding.telemetryText.text = if (lines.isEmpty()) {
             getString(R.string.diagnostics_no_telemetry_yet)

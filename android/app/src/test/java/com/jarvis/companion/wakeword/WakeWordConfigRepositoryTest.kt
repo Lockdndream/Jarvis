@@ -92,4 +92,31 @@ class WakeWordConfigRepositoryTest {
     fun `setConfidenceThreshold rejects infinity`() {
         repository.setConfidenceThreshold(Float.POSITIVE_INFINITY)
     }
+
+    @Test
+    fun `handoffConfirmTimeoutMs defaults to 5000`() {
+        assertEquals(5000L, repository.handoffConfirmTimeoutMs())
+    }
+
+    @Test
+    fun `setHandoffConfirmTimeoutMs persists and reads back`() {
+        repository.setHandoffConfirmTimeoutMs(8000L)
+        assertEquals(8000L, repository.handoffConfirmTimeoutMs())
+    }
+
+    @Test
+    fun `handoffConfirmTimeoutMs falls back to default on malformed stored value`() {
+        backing["wakeword_handoff_confirm_timeout_ms"] = "not-a-long"
+        assertEquals(5000L, repository.handoffConfirmTimeoutMs())
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun `setHandoffConfirmTimeoutMs rejects zero`() {
+        repository.setHandoffConfirmTimeoutMs(0L)
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun `setHandoffConfirmTimeoutMs rejects negative`() {
+        repository.setHandoffConfirmTimeoutMs(-1L)
+    }
 }

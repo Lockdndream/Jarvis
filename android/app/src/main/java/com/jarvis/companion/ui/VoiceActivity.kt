@@ -61,6 +61,19 @@ class VoiceActivity : AppCompatActivity() {
     private var lastSpokenSessionId: String? = null
     private var userFacingError: String? = null
 
+    // Milestone 9B.9: true once this screen has observed a real, opened
+    // VoiceSession at least once. Distinguishes "the session I was
+    // watching just closed" (finish — nothing left for this screen to do)
+    // from "no session has opened yet" (the pre-mic-tap / awaiting-open
+    // state every screen starts in, where session is also null but must
+    // NOT trigger finish()).
+    private var hadSession = false
+
+    // Milestone 9B.9: read once in onCreate (intent extras don't change
+    // across this Activity's lifetime — onNewIntent isn't overridden), so
+    // onStop() doesn't need to re-parse the intent on every call.
+    private var launchedByWakeWord = false
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         app = applicationContext as JarvisCompanionApp
@@ -102,6 +115,20 @@ class VoiceActivity : AppCompatActivity() {
                 ) { session, response, connectionState ->
                     Triple(session, response, connectionState)
                 }.collect { (session, response, connectionState) ->
+                    if (session != null) hadSession = true
+                    // Milestone 9B.9 (ADR-017 Section C, Item 5): a
+                    // wake-word-launched screen that never auto-closes
+                    // after its session ends leaves an orphaned instance
+                    // on the back stack — the next detection launches a
+                    // second one on top instead of reusing this one. Same
+                    // immediate-cutoff semantics as onClose()'s existing
+                    // manual close (no grace period for in-flight TTS),
+                    // just triggered by the session ending server-side
+                    // instead of a button tap.
+                    if (session == null && hadSession) {
+                        finish()
+                        return@collect
+                    }
                     val pending = pendingTranscript
                     if (pending != null && session != null) {
                         pendingTranscript = null
@@ -124,7 +151,8 @@ class VoiceActivity : AppCompatActivity() {
         // the intent extra) guards this so a configuration-change
         // recreation of this same Activity/Intent doesn't re-trigger a
         // second startListening() call over an already-listening session.
-        if (savedInstanceState == null && intent.getBooleanExtra(EXTRA_LAUNCHED_BY_WAKEWORD, false)) {
+        launchedByWakeWord = intent.getBooleanExtra(EXTRA_LAUNCHED_BY_WAKEWORD, false)
+        if (savedInstanceState == null && launchedByWakeWord) {
             onMicTap()
         }
     }
@@ -133,6 +161,31 @@ class VoiceActivity : AppCompatActivity() {
         super.onPause()
         speechInputController.cancel()
         playbackManager.cancel()
+    }
+
+    override fun onStop() {
+        super.onStop()
+        // Milestone 9B.9 (Item 5): a wake-word-launched conversation is a
+        // one-shot interaction — if the user leaves this screen (Home, app
+        // switch) without tapping Close, nothing else will ever close the
+        // session, permanently blocking wake-word detection (a real,
+        // 49-minute-long orphaned session found during real-device
+        // validation — WakeWordManager stays PAUSED_VOICE_SESSION with no
+        // VoiceActivity left to close it or ever call
+        // resumeAfterVoiceSession()). isChangingConfigurations() excludes
+        // rotation — the recreated instance must not have its session
+        // pulled out from under it. !isFinishing excludes the case where
+        // this onStop() is just the teardown from onClose() already
+        // having called finish() — without it, a manual Close tap would
+        // send a second, redundant voice_session_close as this screen
+        // tears down. Manually-opened ("Talk to Jarvis") sessions are
+        // deliberately excluded — backgrounding them still preserves the
+        // conversation to return to, matching existing behavior exactly.
+        if (!isFinishing && !isChangingConfigurations() && launchedByWakeWord &&
+            app.voiceSessionRepository.current.value != null
+        ) {
+            onClose()
+        }
     }
 
     override fun onDestroy() {

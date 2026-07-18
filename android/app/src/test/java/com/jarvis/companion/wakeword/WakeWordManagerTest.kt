@@ -13,14 +13,17 @@ import org.junit.Test
 import org.mockito.Mockito.mock
 import org.mockito.Mockito.`when`
 
-private class FakeWakeWordEngine(private val detectOnCall: Int? = null) : WakeWordEngine {
+private class FakeWakeWordEngine(
+    private val detectOnCall: Int? = null,
+    private val alwaysDetect: Boolean = false,
+) : WakeWordEngine {
     var callCount = 0
     var closed = false
     var throwOnProcessAudio = false
     override fun processAudio(samples: ShortArray): Boolean {
         callCount++
         if (throwOnProcessAudio) throw RuntimeException("simulated native failure")
-        return detectOnCall == callCount
+        return alwaysDetect || detectOnCall == callCount
     }
     override fun reset() {}
     override fun close() { closed = true }
@@ -271,6 +274,32 @@ class WakeWordManagerTest {
         advanceUntilIdle()
 
         assertEquals(0, m.detectionCount.value)
+    }
+
+    @Test
+    fun `rapid repeated wake words only register the first detection`() = runTest {
+        // Milestone 9B.9 Item 2: an engine that reports "detected" on
+        // every single chunk simulates the user repeating the wake word
+        // (or a sustained match) faster than any handoff could complete.
+        // onAudioChunk() self-transitions to PAUSED_VOICE_SESSION on the
+        // very first detection and early-returns for any state other than
+        // LISTENING -- so every later chunk in the same burst must be
+        // suppressed structurally, not by engine behavior.
+        val engine = FakeWakeWordEngine(alwaysDetect = true)
+        val m = manager(engine = { engine })
+        val detections = mutableListOf<WakeWordDetection>()
+        val job = launch { m.onDetected.collect { detections.add(it) } }
+        advanceUntilIdle()
+
+        m.start()
+        advanceUntilIdle()
+        repeat(5) { m.feedAudioForTest(ShortArray(160)) }
+        advanceUntilIdle()
+
+        assertEquals(1, detections.size)
+        assertEquals(1, m.detectionCount.value)
+        assertEquals(WakeWordManager.State.PAUSED_VOICE_SESSION, m.state.value)
+        job.cancel()
     }
 
     @Test

@@ -209,6 +209,8 @@ class PresenceService : Service() {
                         TelemetryRecorder.WAKEWORD_HANDOFF_FAILED,
                         "detectionId=${outcome.clientRequestId} reason=late_reply_closed voiceSessionId=${outcome.session.voiceSessionId}",
                     )
+                    lastHandoffOutcome = "failed:late_reply_closed"
+                    lastHandoffAtMs = System.currentTimeMillis()
                     activeClient?.sendVoiceSessionClose(outcome.session.voiceSessionId)
                 }
             }
@@ -217,6 +219,9 @@ class PresenceService : Service() {
 
     private suspend fun handleWakeWordDetection(detection: WakeWordDetection) {
         val requestId = detection.detectionId.toString()
+        lastDetectionId = requestId
+        lastClientRequestId = requestId
+        lastVoiceSessionId = null
         val sent = activeClient?.sendVoiceSessionOpen(
             conversationId = null,
             attentionRequestId = null,
@@ -225,11 +230,13 @@ class PresenceService : Service() {
 
         if (!sent) {
             telemetry.record(TelemetryRecorder.WAKEWORD_HANDOFF_FAILED, "detectionId=$requestId reason=not_connected")
+            lastHandoffOutcome = "failed:not_connected"
+            lastHandoffAtMs = System.currentTimeMillis()
             wakeWordManager.resumeAfterVoiceSession()
             return
         }
 
-        val outcome = withTimeoutOrNull(WAKEWORD_OPEN_CONFIRM_TIMEOUT_MS) {
+        val outcome = withTimeoutOrNull(app.wakeWordConfigRepository.handoffConfirmTimeoutMs()) {
             app.voiceSessionRepository.openOutcomes.first { it.matchesRequestId(requestId) }
         }
 
@@ -239,6 +246,9 @@ class PresenceService : Service() {
                     TelemetryRecorder.WAKEWORD_HANDOFF_LAUNCHED,
                     "detectionId=$requestId voiceSessionId=${outcome.session.voiceSessionId}",
                 )
+                lastVoiceSessionId = outcome.session.voiceSessionId
+                lastHandoffOutcome = "launched"
+                lastHandoffAtMs = System.currentTimeMillis()
                 val intent = Intent(applicationContext, VoiceActivity::class.java).apply {
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                     putExtra(VoiceActivity.EXTRA_LAUNCHED_BY_WAKEWORD, true)
@@ -247,11 +257,15 @@ class PresenceService : Service() {
             }
             is VoiceSessionOpenOutcome.Failed -> {
                 telemetry.record(TelemetryRecorder.WAKEWORD_HANDOFF_FAILED, "detectionId=$requestId reason=${outcome.error}")
+                lastHandoffOutcome = "failed:${outcome.error}"
+                lastHandoffAtMs = System.currentTimeMillis()
                 wakeWordManager.resumeAfterVoiceSession()
             }
             null -> {
                 telemetry.record(TelemetryRecorder.WAKEWORD_HANDOFF_FAILED, "detectionId=$requestId reason=timeout")
                 abandonedWakeWordRequestIds.add(requestId)
+                lastHandoffOutcome = "failed:timeout"
+                lastHandoffAtMs = System.currentTimeMillis()
                 wakeWordManager.resumeAfterVoiceSession()
             }
         }
@@ -367,13 +381,31 @@ class PresenceService : Service() {
         var serviceCreatedAtMs: Long? = null
             private set
 
-        // Milestone 9B.9 (ADR-017 Section C): how long to wait for the
-        // server's voice_session_opened/voice_session_error reply to a
-        // wake-word-initiated voice_session_open before giving up and
-        // resuming wake-word listening. Generous relative to typical
-        // round-trip latency (sub-second on a healthy LAN connection) —
-        // this only guards against a hung/dropped connection, not normal
-        // response time.
-        private const val WAKEWORD_OPEN_CONFIRM_TIMEOUT_MS = 5000L
+        // Milestone 9B.9 (ADR-017 Section C, Item 6): observable outcome
+        // of the most recent wake-word detection handoff, same
+        // in-process-only read rationale as activeClient above. Read by
+        // DiagnosticsRepository; written only from handleWakeWordDetection()
+        // and the late-reply cleanup collector, both confined to
+        // serviceScope (Dispatchers.Main) — @Volatile only for the cross-
+        // thread read from Diagnostics, not for write-side synchronization.
+        @Volatile
+        var lastDetectionId: String? = null
+            private set
+
+        @Volatile
+        var lastClientRequestId: String? = null
+            private set
+
+        @Volatile
+        var lastVoiceSessionId: String? = null
+            private set
+
+        @Volatile
+        var lastHandoffOutcome: String? = null
+            private set
+
+        @Volatile
+        var lastHandoffAtMs: Long? = null
+            private set
     }
 }

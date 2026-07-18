@@ -72,3 +72,52 @@ data class VoiceDiagnostics(
         }
     }
 }
+
+/**
+ * Wake-word subsystem diagnostics (Milestone 9B.9, ADR-017 Section C,
+ * Item 6). Every failure/timeout/recovery path in
+ * PresenceService.handleWakeWordDetection() must be observable here, not
+ * just in the scrolling telemetry tail — [lastHandoffOutcome] is the
+ * single field that answers "what happened to the last detection"
+ * without requiring a log search. All fields nullable/absent-safe, same
+ * rationale as [VoiceDiagnostics] — wake word may be disabled or never
+ * yet started.
+ */
+data class WakeWordDiagnostics(
+    val wakeWordSessionId: String?,
+    val managerState: String?,
+    val engineLoaded: Boolean?,
+    val audioRecordState: String?,
+    val detectionCount: Int?,
+    val lastDetectionAtMs: Long?,
+    val framesProcessed: Long?,
+    val avgLatencyMs: Double?,
+    val maxLatencyMs: Double?,
+    val inferenceErrorCount: Int?,
+    val lastDetectionId: String?,
+    val lastClientRequestId: String?,
+    val lastVoiceSessionId: String?,
+    val lastHandoffOutcome: String?,
+    val lastHandoffAtMs: Long?,
+) {
+    fun formatted(): String {
+        fun ms(value: Long?): String = if (value == null) "n/a" else "${value / 1000}s"
+        return buildString {
+            appendLine("wakeword_session_id=${wakeWordSessionId ?: "n/a"}")
+            appendLine("manager_state=${managerState ?: "n/a"}")
+            appendLine("engine_loaded=${engineLoaded ?: "n/a"}")
+            appendLine("audio_record_state=${audioRecordState ?: "n/a"}")
+            appendLine("detection_count=${detectionCount ?: "n/a"}")
+            appendLine("last_detection_ago=${ms(lastDetectionAtMs)}")
+            appendLine("frames_processed=${framesProcessed ?: "n/a"}")
+            appendLine("avg_latency_ms=${avgLatencyMs ?: "n/a"}")
+            appendLine("max_latency_ms=${maxLatencyMs ?: "n/a"}")
+            appendLine("inference_error_count=${inferenceErrorCount ?: "n/a"}")
+            appendLine("last_detection_id=${lastDetectionId ?: "n/a"}")
+            appendLine("last_client_request_id=${lastClientRequestId ?: "n/a"}")
+            appendLine("last_voice_session_id=${lastVoiceSessionId ?: "n/a"}")
+            appendLine("last_handoff_outcome=${lastHandoffOutcome ?: "n/a"}")
+            append("last_handoff_ago=${ms(lastHandoffAtMs)}")
+        }
+    }
+}

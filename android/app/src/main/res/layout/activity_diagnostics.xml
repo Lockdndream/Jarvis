@@ -27,6 +27,15 @@
             android:padding="16dp" />
 
         <TextView
+            android:id="@+id/wakeWordText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:fontFamily="monospace"
+            android:textSize="12sp"
+            android:background="#1E293B"
+            android:padding="16dp" />
+
+        <TextView
             android:id="@+id/telemetryText"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
