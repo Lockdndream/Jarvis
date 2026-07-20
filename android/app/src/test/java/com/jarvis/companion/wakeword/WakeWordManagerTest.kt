@@ -32,11 +32,17 @@ private class FakeWakeWordEngine(
 private class FakeWakeWordAudioFocus : WakeWordAudioFocus {
     var requested = false
     var abandoned = false
+    var requestCount = 0
+    // Milestone 9B.10: lets a test simulate a re-request finding focus
+    // still contested by another app (false) vs. already free (true,
+    // the default) -- see resumeAfterVoiceSession()'s re-request fix.
+    var grantOnRequest = true
     private var callback: ((Boolean) -> Unit)? = null
     override fun request(onFocusChange: (Boolean) -> Unit): Boolean {
         requested = true
+        requestCount++
         callback = onFocusChange
-        return true
+        return grantOnRequest
     }
     override fun abandon() { abandoned = true }
     fun simulateFocusLost() { callback?.invoke(false) }
@@ -44,12 +50,15 @@ private class FakeWakeWordAudioFocus : WakeWordAudioFocus {
 }
 
 /** Never produces data on its own -- tests drive detection exclusively via
- * feedAudioForTest(). Blocks in read() until stop() is called, simulating
- * "waiting for audio" without racing the test's own assertions the way the
- * real AudioRecord-backed source would (whose APIs return meaningless
- * stubbed defaults in a JVM unit test). */
+ * feedAudioForTest(). read() returns "no data yet" (0) every ~10ms rather
+ * than blocking indefinitely, matching a real AudioRecord.read() for a
+ * 10ms chunk (bounded by how fast the hardware actually produces that
+ * much audio) -- this is what lets runCaptureLoop's own top-of-loop pause
+ * check run promptly without needing to be unblocked from another thread
+ * (Milestone 9B.10 mic-release fix). Returning 0 never triggers
+ * onAudioChunk, so this still can't race the test's own feedAudioForTest
+ * assertions. */
 private class FakeAudioCaptureSource : AudioCaptureSource {
-    @Volatile private var stopped = false
     var startCalled = false
     var released = false
     override fun start(): Boolean {
@@ -57,13 +66,25 @@ private class FakeAudioCaptureSource : AudioCaptureSource {
         return true
     }
     override fun read(buffer: ShortArray): Int {
-        while (!stopped) {
-            Thread.sleep(20)
-        }
-        return -1
+        Thread.sleep(10)
+        return 0
     }
-    override fun stop() { stopped = true }
+    override fun stop() {}
     override fun release() { released = true }
+}
+
+/** Polls a real wall-clock condition, for asserting on WakeWordManager's
+ * capture loop -- it runs on Dispatchers.Default (real threads, real
+ * time), so runTest's virtual-time advanceUntilIdle() does not control or
+ * observe it. */
+private fun waitUntil(timeoutMs: Long = 2000, intervalMs: Long = 20, condition: () -> Boolean) {
+    val deadline = System.currentTimeMillis() + timeoutMs
+    while (!condition()) {
+        if (System.currentTimeMillis() > deadline) {
+            throw AssertionError("condition not met within ${timeoutMs}ms")
+        }
+        Thread.sleep(intervalMs)
+    }
 }
 
 @OptIn(ExperimentalCoroutinesApi::class)
@@ -83,12 +104,12 @@ class WakeWordManagerTest {
 
     @After
     fun tearDown() {
-        // FakeAudioCaptureSource.read() blocks a real Dispatchers.Default
-        // thread until stop() unblocks it -- without this, a test that
-        // starts a manager and never explicitly stops it leaks that thread
-        // into every subsequent test (Dispatchers.Default is a small fixed
-        // pool), a real flake source found and fixed during independent
-        // review, not merely theoretical.
+        // A manager's capture loop runs on a real Dispatchers.Default
+        // thread until its captureJob is cancelled -- without this, a
+        // test that starts a manager and never explicitly stops it leaks
+        // a live polling loop into every subsequent test (Dispatchers.Default
+        // is a small fixed pool), a real flake source found and fixed
+        // during independent review, not merely theoretical.
         createdManagers.forEach { it.stop() }
         createdManagers.clear()
     }
@@ -96,11 +117,12 @@ class WakeWordManagerTest {
     private fun manager(
         engine: () -> WakeWordEngine = { FakeWakeWordEngine() },
         audioFocus: WakeWordAudioFocus = NoOpWakeWordAudioFocus,
+        audioSources: MutableList<FakeAudioCaptureSource>? = null,
     ) = WakeWordManager(
         config = config,
         engineFactory = engine,
         audioFocus = audioFocus,
-        audioSourceFactory = { FakeAudioCaptureSource() },
+        audioSourceFactory = { FakeAudioCaptureSource().also { audioSources?.add(it) } },
     ).also { createdManagers.add(it) }
 
     @Test
@@ -203,9 +225,10 @@ class WakeWordManagerTest {
 
     @Test
     fun `voice session pause while audio focus already lost resumes into PAUSED_AUDIO_FOCUS`() = runTest {
-        // The composite case: focus lost first, then a VoiceSession opens
-        // and closes entirely while focus is still gone. Resuming must NOT
-        // land in LISTENING -- that would mean capturing without focus.
+        // The composite case: focus lost first (still contested by another
+        // app), then a VoiceSession opens and closes entirely while the
+        // interruption is still active. Resuming must NOT land in
+        // LISTENING -- that would mean capturing without focus.
         val audioFocus = FakeWakeWordAudioFocus()
         val m = manager(audioFocus = audioFocus)
         m.start()
@@ -219,12 +242,45 @@ class WakeWordManagerTest {
         advanceUntilIdle()
         assertEquals(WakeWordManager.State.PAUSED_VOICE_SESSION, m.state.value)
 
+        // Milestone 9B.10: resumeAfterVoiceSession() now re-requests focus
+        // rather than trusting a possibly-stale flag -- deny the
+        // re-request to simulate the interruption still being active when
+        // the session closes.
+        audioFocus.grantOnRequest = false
         m.resumeAfterVoiceSession()
         advanceUntilIdle()
-        // Focus was never regained -- must resume into PAUSED_AUDIO_FOCUS, not LISTENING.
+        // Focus is still contested -- must resume into PAUSED_AUDIO_FOCUS, not LISTENING.
         assertEquals(WakeWordManager.State.PAUSED_AUDIO_FOCUS, m.state.value)
 
         audioFocus.simulateFocusRegained()
+        advanceUntilIdle()
+        assertEquals(WakeWordManager.State.LISTENING, m.state.value)
+    }
+
+    @Test
+    fun `resumeAfterVoiceSession re-requests focus and recovers from a permanent loss that never sent a regain callback`() = runTest {
+        // Milestone 9B.10 real-device finding: a *permanent* AUDIOFOCUS_LOSS
+        // (e.g. VoiceActivity's own TTS playback requesting exclusive
+        // focus) is never followed by an automatic regain callback from
+        // Android -- simulateFocusLost() here with no matching
+        // simulateFocusRegained() models exactly that. Before this fix,
+        // audioFocusLost stayed stuck true forever and every subsequent
+        // resumeAfterVoiceSession() call routed to PAUSED_AUDIO_FOCUS,
+        // permanently disabling wake-word detection until the app was
+        // killed and restarted -- reproduced on a real device (mic never
+        // recorded again across 20+ minutes and several "Hey Jarvis"
+        // attempts after the first conversation completed).
+        val audioFocus = FakeWakeWordAudioFocus()
+        val m = manager(audioFocus = audioFocus)
+        m.start()
+        advanceUntilIdle()
+
+        m.pauseForVoiceSession()
+        advanceUntilIdle()
+        audioFocus.simulateFocusLost() // permanent loss; no regain callback will ever follow
+        advanceUntilIdle()
+
+        m.resumeAfterVoiceSession()
         advanceUntilIdle()
         assertEquals(WakeWordManager.State.LISTENING, m.state.value)
     }
@@ -369,6 +425,29 @@ class WakeWordManagerTest {
         m.stop()
         advanceUntilIdle()
         assertEquals(true, audioFocus.abandoned)
+    }
+
+    @Test
+    fun `pausing for a voice session releases the microphone and resuming reacquires it`() {
+        // Milestone 9B.10 real-device finding: WakeWordManager's own
+        // AudioRecord never released the microphone hardware while
+        // paused, starving a concurrent SpeechRecognizer of real audio.
+        // Not wrapped in runTest -- the capture loop runs on real
+        // Dispatchers.Default threads, so this asserts against real
+        // wall-clock state via waitUntil(), not virtual time.
+        val sources = mutableListOf<FakeAudioCaptureSource>()
+        val m = manager(audioSources = sources)
+        m.start()
+        waitUntil { sources.isNotEmpty() && sources[0].startCalled }
+
+        m.pauseForVoiceSession()
+        waitUntil { sources[0].released }
+        assertEquals(WakeWordManager.State.PAUSED_VOICE_SESSION, m.state.value)
+        assertEquals(WakeWordManager.AudioRecordState.NONE, m.audioRecordState.value)
+
+        m.resumeAfterVoiceSession()
+        waitUntil { sources.size >= 2 && sources[1].startCalled }
+        assertEquals(WakeWordManager.State.LISTENING, m.state.value)
     }
 
     @Test

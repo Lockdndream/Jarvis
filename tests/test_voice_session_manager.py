@@ -276,6 +276,118 @@ def test_close_unknown_session_returns_false():
     assert not vsm.close_session("vs_does_not_exist")
 
 
+# ── termination_reason / idle reaper (Milestone 9B.10) ──────────────────
+
+def _backdate(voice_session_id: str, column: str, value: str) -> None:
+    """Test-only direct write — open_session()/handle_transcript() always
+    stamp "now", so backdating updated_at/created_at to simulate an idle
+    or long-running session requires going around VoiceSessionManager."""
+    conn = db.get_conn()
+    conn.execute(f"UPDATE voice_sessions SET {column}=? WHERE voice_session_id=?", (value, voice_session_id))
+    conn.commit()
+    conn.close()
+
+
+def test_close_session_default_reason_is_client_requested():
+    vsm = VoiceSessionManager(FakeSupervisor())
+    session = vsm.open_session("c1")
+    vsm.close_session(session["voice_session_id"])
+    assert db.get_voice_session(session["voice_session_id"])["termination_reason"] == "client_requested"
+
+
+def test_close_session_records_the_given_reason():
+    vsm = VoiceSessionManager(FakeSupervisor())
+    session = vsm.open_session("c1")
+    vsm.close_session(session["voice_session_id"], reason="disconnect")
+    assert db.get_voice_session(session["voice_session_id"])["termination_reason"] == "disconnect"
+
+
+def test_close_session_twice_keeps_the_first_recorded_reason():
+    """A duplicate close (e.g. a stray client retry) must not overwrite
+    the true original cause with a different one."""
+    vsm = VoiceSessionManager(FakeSupervisor())
+    session = vsm.open_session("c1")
+    vsm.close_session(session["voice_session_id"], reason="client_requested")
+    vsm.close_session(session["voice_session_id"], reason="disconnect")  # no-op, already closed
+    assert db.get_voice_session(session["voice_session_id"])["termination_reason"] == "client_requested"
+
+
+def test_reap_idle_sessions_closes_only_sessions_past_the_idle_threshold():
+    vsm = VoiceSessionManager(FakeSupervisor())
+    stale = vsm.open_session("c1")
+    fresh = vsm.open_session("c2")
+    _backdate(stale["voice_session_id"], "updated_at", "2020-01-01T00:00:00Z")
+
+    reaped = vsm.reap_idle_sessions(max_idle_seconds=900, now="2020-01-01T00:20:00Z")
+
+    assert [s["voice_session_id"] for s in reaped] == [stale["voice_session_id"]]
+    assert db.get_voice_session(stale["voice_session_id"])["state"] == "closed"
+    assert db.get_voice_session(stale["voice_session_id"])["termination_reason"] == "idle_timeout"
+    assert db.get_voice_session(fresh["voice_session_id"])["state"] == "listening"
+
+
+@pytest.mark.asyncio
+async def test_an_active_conversation_never_accrues_idle_time_regardless_of_total_duration():
+    """The core correctness requirement: a session that keeps having real
+    turns must never be reaped, no matter how long it's been open overall
+    — only genuine silence (no transition of any kind) counts as idle."""
+    sv = FakeSupervisor()
+    vsm = VoiceSessionManager(sv)
+    session = vsm.open_session("c1")
+    vsid = session["voice_session_id"]
+
+    # Backdate created_at (but NOT updated_at) far in the past, simulating
+    # a session that's been open a long time but is still actively used.
+    _backdate(vsid, "created_at", "2020-01-01T00:00:00Z")
+    await vsm.handle_transcript(vsid, "still here")  # refreshes updated_at to "now"
+
+    reaped = vsm.reap_idle_sessions(max_idle_seconds=900)
+    assert reaped == []
+    assert db.get_voice_session(vsid)["state"] == "listening"
+
+
+@pytest.mark.asyncio
+async def test_reap_idle_sessions_releases_the_lease_of_a_bound_session():
+    vsm = VoiceSessionManager(FakeSupervisor())
+
+    row = await _attention_row()
+    aid = row["attention_request_id"]
+    session = vsm.open_session("c1", aid)
+    _backdate(session["voice_session_id"], "updated_at", "2020-01-01T00:00:00Z")
+
+    vsm.reap_idle_sessions(max_idle_seconds=900, now="2020-01-01T00:20:00Z")
+
+    assert db.get_attention_request(aid)["active_voice_session_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_handle_transcript_raises_if_session_closed_concurrently_during_process_message():
+    """Milestone 9B.10 (independent review finding): process_message()
+    awaits, and something else (the idle-timeout reaper, another device's
+    explicit close, the LLM's own close_voice_session tool) could close
+    this exact session while the turn is in flight. Without the fix,
+    handle_transcript() would return voice_session_state: "listening" for
+    a session that is actually closed — reproduced here deterministically
+    with a fake supervisor that closes the session mid-call, standing in
+    for the real race's timing."""
+    vsm = VoiceSessionManager(FakeSupervisor())
+    session = vsm.open_session("c1")
+    voice_session_id = session["voice_session_id"]
+
+    class ClosingSupervisor:
+        async def process_message(self, user_message, conversation_id=None, bound_attention_request_id=None):
+            vsm.close_session(voice_session_id, reason="idle_timeout")
+            return {"response": "too late", "conversation_id": conversation_id}
+
+    vsm._supervisor = ClosingSupervisor()
+
+    with pytest.raises(VoiceSessionError):
+        await vsm.handle_transcript(session["voice_session_id"], "hello")
+
+    assert db.get_voice_session(session["voice_session_id"])["state"] == "closed"
+    assert db.get_voice_session(session["voice_session_id"])["termination_reason"] == "idle_timeout"
+
+
 @pytest.mark.asyncio
 async def test_handle_transcript_after_close_raises():
     sv = FakeSupervisor()

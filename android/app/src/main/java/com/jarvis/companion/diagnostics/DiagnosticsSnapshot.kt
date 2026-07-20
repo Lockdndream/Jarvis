@@ -56,6 +56,12 @@ data class VoiceDiagnostics(
     val playbackQueueDepth: Int?,
     val speechInputState: String?,
     val lastVoiceEventAgoMs: Long?,
+    // Milestone 9B.10: why the most recently closed session ended —
+    // "client_requested", "idle_timeout", or absent (either no session
+    // has ever closed yet, or it ended via "disconnect", a reason the
+    // client structurally can never observe itself — see
+    // VoiceSessionRepository.applyClosed()'s doc comment).
+    val lastTerminationReason: String?,
 ) {
     fun formatted(): String {
         fun ms(value: Long?): String = if (value == null) "n/a" else "${value / 1000}s"
@@ -68,6 +74,7 @@ data class VoiceDiagnostics(
             appendLine("voice_session_id=${voiceSessionId ?: "n/a"}")
             appendLine("playback_queue_depth=${playbackQueueDepth ?: "n/a"}")
             appendLine("speech_input_state=${speechInputState ?: "n/a"}")
+            appendLine("last_termination_reason=${lastTerminationReason ?: "n/a"}")
             append("last_voice_event_ago=${ms(lastVoiceEventAgoMs)}")
         }
     }

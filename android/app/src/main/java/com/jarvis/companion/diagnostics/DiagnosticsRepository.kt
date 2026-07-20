@@ -65,6 +65,7 @@ fun buildVoiceDiagnostics(
     playbackQueueDepth: Int?,
     speechInputState: String?,
     lastVoiceEventAtMs: Long?,
+    lastTerminationReason: String? = null,
 ): VoiceDiagnostics {
     val lastVoiceEventAgoMs = lastVoiceEventAtMs?.let { System.currentTimeMillis() - it }
     return VoiceDiagnostics(
@@ -77,6 +78,7 @@ fun buildVoiceDiagnostics(
         playbackQueueDepth = playbackQueueDepth,
         speechInputState = speechInputState,
         lastVoiceEventAgoMs = lastVoiceEventAgoMs,
+        lastTerminationReason = lastTerminationReason,
     )
 }
 

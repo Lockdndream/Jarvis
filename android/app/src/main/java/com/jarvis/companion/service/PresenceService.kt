@@ -1,5 +1,6 @@
 package com.jarvis.companion.service
 
+import android.app.NotificationManager
 import android.app.Service
 import android.content.BroadcastReceiver
 import android.content.Context
@@ -16,7 +17,6 @@ import com.jarvis.companion.network.CompanionWebSocketClient
 import com.jarvis.companion.network.DeviceStatusSnapshot
 import com.jarvis.companion.settings.PermissionsHelper
 import com.jarvis.companion.telemetry.TelemetryRecorder
-import com.jarvis.companion.ui.VoiceActivity
 import com.jarvis.companion.voice.VoiceSessionOpenOutcome
 import com.jarvis.companion.voice.matchesRequestId
 import com.jarvis.companion.wakeword.WakeWordDetection
@@ -249,11 +249,14 @@ class PresenceService : Service() {
                 lastVoiceSessionId = outcome.session.voiceSessionId
                 lastHandoffOutcome = "launched"
                 lastHandoffAtMs = System.currentTimeMillis()
-                val intent = Intent(applicationContext, VoiceActivity::class.java).apply {
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    putExtra(VoiceActivity.EXTRA_LAUNCHED_BY_WAKEWORD, true)
-                }
-                applicationContext.startActivity(intent)
+                // Milestone 9B.10 real-device finding: a direct
+                // applicationContext.startActivity() call from here (a
+                // background Service context) can have its window created
+                // without ever being granted focus by Android's
+                // background-activity-start restrictions -- see
+                // PresenceNotifications.HANDOFF_CHANNEL_ID's doc comment.
+                val nm = getSystemService(NotificationManager::class.java)
+                nm.notify(WAKEWORD_HANDOFF_NOTIFICATION_ID, notifications.buildWakeWordHandoff())
             }
             is VoiceSessionOpenOutcome.Failed -> {
                 telemetry.record(TelemetryRecorder.WAKEWORD_HANDOFF_FAILED, "detectionId=$requestId reason=${outcome.error}")

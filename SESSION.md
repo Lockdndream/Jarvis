@@ -2120,7 +2120,20 @@ Used for browser smoke testing of Milestone 3. May later be useful for Jarvis br
 
 ## Current Milestone
 
-**Milestones 6 through 9B.4 complete and closed. Milestone 9B.5 (Wake-Word Feasibility, D5 spike) real-device-validated and its feasibility gate closed 2026-07-16 — see the Milestone 9B.5 entry below for the full narrative. The spike remains disposable (`spikes/android-wakeword/`), not production code; production wake-word integration remains a separate, not-yet-approved milestone.**
+**Milestones 6 through 9B.5 complete and closed; production wake-word
+integration (ADR-017, Milestones 9B.6–9B.9) has since been built and is
+live in `android/app/src/main/java/com/jarvis/companion/wakeword/` —
+this summary paragraph predates that work and is otherwise stale; see the
+9B.10 entry below (and TD-015, itself about this exact kind of staleness)
+rather than treating the wake-word-not-yet-approved framing above as
+current. Milestone 9B.10 (VoiceSession Lifecycle Verification & Server
+Hardening) is checkpointed as of 2026-07-20, not closed: Phases 1–3
+(architecture audit, failure analysis, hardening) and a four-bug
+mid-milestone detour are done and real-device-validated; Phase 4's
+remaining scenarios (server restart with an active session, mid-
+conversation disconnect, process kill, abandoned-client reaping) are
+explicitly deferred to a dedicated future real-device session — see the
+9B.10 entry and TD-023.**
 
 Milestone 9B.0 closed with: architecture frozen and documented across `ARCHITECTURE.md`, 10 ADRs (`docs/decisions/`), and this file; `docs/TECHNICAL_DEBT.md` (20 items) and `docs/RELEASE_CHECKPOINT_M9B0.md` established; `README.md` rewritten to match. See the Milestone 9B.0 section below for the full narrative (cost-boundary fix, D0–D4, Phase 1–3 investigation, Transport Reachability).
 
@@ -2183,6 +2196,7 @@ Not part of this milestone, investigated as a side issue and left unresolved at 
 15. ~~Real-device install/validation of the M9B.1 production companion~~ — **DONE 2026-07-13**: 15/15 acceptance items PASS on the real S20 FE. See `android/docs/device-acceptance-checklist.md`.
 16. **Resolve the PWA/companion `JARVIS_API_TOKEN` asymmetry** (see TD-018's Milestone 9B.1 update) before enabling the token in any deployment using both the browser PWA and the Android companion — browsers cannot set a custom `Authorization` header on a WebSocket handshake, so enabling the token today protects the companion but breaks the PWA.
 17. **Implement the VoiceSession ownership guard** (Known Limitation #46, TD-002) before the Android companion gains voice capability — still the standing precondition; M9B.2 added no voice/business logic either.
+18. **Complete Milestone 9B.10 Phase 4 in a dedicated real-device session** (TD-023): server restart with a genuinely active VoiceSession, mid-conversation disconnect, process kill + `PresenceService` `START_STICKY` recovery, and abandoned-client reaping — each needs a real conversation actually in flight, not just a launched screen, and was deliberately not rushed to close out 9B.10. See the 9B.10 entry below for exactly what is and isn't validated so far.
 
 ### Milestone 9B.4 — Android Voice Infrastructure (closed 2026-07-14)
 
@@ -2437,6 +2451,200 @@ were touched this milestone. `.jarvis_opencode_owner.json` (a stale
 ownership marker for a since-dead delegated OpenCode process from the
 interrupted prior session) was left in place as a harmless, disclosed
 leftover — not a live process, confirmed via `netstat`/`tasklist`.
+
+### Milestone 9B.10 — VoiceSession Lifecycle Verification & Server Hardening (2026-07-18/20, in progress — checkpointed, not closed)
+
+Explicitly scoped to verifying and hardening the existing client/server
+VoiceSession contract — not new features. Phase 1 (architecture audit)
+produced a Verified/Partially-verified/Untested/Missing classification of
+the full lifecycle; Phase 2 (failure analysis) found the disconnect-cleanup
+path already existed but no idle-timeout path did, plus a third,
+previously-unguarded orphan path via the LLM's own
+`open_voice_session`/`close_voice_session` Supervisor tools. Phase 3
+hardening, built to close exactly those gaps and no more:
+`app/database.py` gained a `termination_reason` column
+(`update_voice_session_state()` uses `COALESCE(?, termination_reason)` so
+the *first* recorded reason always wins) and `get_idle_voice_sessions()`;
+`app/voice_session_manager.py` gained `close_session(reason=...)` and
+`reap_idle_sessions()`; a new `app/voice_session_reaper.py`
+(`VoiceSessionReaper`, mirroring `AttentionScheduler`'s
+start/stop/lifespan-integrated background-loop pattern) ticks every 60s
+and closes sessions idle past a 15-minute threshold, broadcasting
+`voice_session_closed` with `reason: "idle_timeout"`. A real, independent-
+review-found concurrency bug was fixed in the same pass:
+`handle_transcript()` didn't re-check the session's state after its
+`await process_message()` call, so a session closed by another task
+*during* that await (the new reaper, another device, or the LLM's own
+`close_voice_session` tool) would still return a misleading
+`voice_session_state: "listening"` — fixed with a re-read-and-raise guard,
+regression-tested with a `ClosingSupervisor` fake that deterministically
+reproduces the race without needing real concurrent timing. Client-side:
+`VoiceSessionClosed`/`VoiceSessionRepository` gained a `reason` field
+surfaced through Diagnostics (`last_termination_reason=...`).
+
+**A severe, unrelated-to-VoiceSession-lifecycle bug was found live during
+this milestone's real-device validation, with the user's explicit
+authorization to pause Phase 4 and fix it first** (this milestone's own
+scope stayed VoiceSession-lifecycle-only afterward — the detour is
+reported separately here because it blocked validating this milestone at
+all): saying "Hey Jarvis" and then speaking a real command produced no
+response, and the *previous* milestone's own real-device validation had
+silently accepted an identical symptom as benign background noise without
+checking system-level logs — a rigor gap disclosed to the user directly.
+Reading the full untagged `logcat` (not just the app's own tag) surfaced
+Android's system-level `SodaSpeechRecognizer`/`RecognitionServiceImpl`
+logs, which is what actually broke each finding open below. Four real,
+independently-confirmed bugs, each fixed and re-validated on the real S20
+FE before moving to the next:
+
+1. **`WakeWordManager` never released the microphone while paused**
+   (`WakeWordManager.kt`). The wake-word engine's own `AudioRecord` kept
+   running continuously regardless of pause state (only
+   `onAudioChunk()`'s *processing* was gated on state, not the underlying
+   capture), so a concurrently-opened `VoiceActivity`/`SpeechRecognizer`
+   never got real microphone hardware access — confirmed via system logs
+   showing `NO_SPEECH_DETECTED` with `Final recognition ... Size: 0`, i.e.
+   genuine silence, not a transcription-quality problem. Fixed by
+   rewriting `runCaptureLoop()` to actually stop/release the
+   `AudioCaptureSource` whenever not `LISTENING` and lazily reacquire it
+   on resume, relying on a real `AudioRecord.read()`'s own ~10ms-bounded
+   return (not a cross-thread `stop()` call, which was tried, found
+   unnecessary for both the wake-word and manual-open flows, and
+   reverted) to notice the state change promptly. One `WakeWordManagerTest`
+   regression test added, using a `FakeAudioCaptureSource` changed from
+   blocking indefinitely until `stop()` to a bounded ~10ms poll (matching
+   real hardware) so the test can observe the release/reacquire cycle
+   without deadlocking. **Disclosed, not closed**: the *manual* "Talk to
+   Jarvis" flow's `pauseForVoiceSession()` still can't help its own first
+   recognition attempt — it only fires after `SpeechRecognizer` already
+   completed that attempt, since a manually-opened session isn't sent
+   until a transcript exists. Only the wake-word flow (which self-pauses
+   synchronously on detection, before any handoff) is fixed by this
+   change.
+2. **`VoiceActivity` launched from a background service could be created
+   but never shown** (`PresenceService.kt`/`PresenceNotifications.kt`).
+   A plain `applicationContext.startActivity()` from `PresenceService`'s
+   background context can have Android allocate the task/window (a splash
+   screen was even drawn) while never granting it focus — confirmed via
+   `ActivityTaskManager`'s own "Background activity start" warning and,
+   conclusively, the complete absence of any "Focus entered window" log
+   for `VoiceActivity` in a real trace, unlike a later app launch that
+   clearly got one. Fixed with the standard Android pattern for exactly
+   this case (the same one alarm/call apps use): a high-importance
+   notification channel's `setFullScreenIntent()`
+   (`WAKEWORD_HANDOFF_NOTIFICATION_ID`, `USE_FULL_SCREEN_INTENT` added to
+   the manifest), plus `android:showWhenLocked`/`android:turnScreenOn` on
+   `VoiceActivity` for the locked-screen case. **Real, disclosed platform
+   limit, not a bug**: a full-screen intent only auto-launches full-screen
+   when the device is locked/screen-off; Android deliberately downgrades
+   it to a tap-to-open heads-up notification when already unlocked, as an
+   anti-abuse restriction applying to every third-party app, confirmed by
+   `dumpsys notification` showing the posted notification and by directly
+   observing `onHeadsUpPinnedModeChanged`/`mHeadsUpShowing: false -> true`
+   in the system log at the moment of an unlocked-screen detection.
+3. **Wake-word detection died permanently after the first conversation
+   that played a TTS response** (`WakeWordManager.kt`) — the most severe
+   of the four, since it means the feature works exactly once per app
+   launch. Root cause, precisely confirmed via `dumpsys audio`'s
+   recording log (`AudioRecord` for `com.jarvis.companion` stopped after
+   the first detection and never restarted across 20+ minutes and several
+   subsequent "Hey Jarvis" attempts) and a targeted diagnostic log line:
+   `VoiceActivity`'s own TTS playback (`audio.AudioFocusManager`) requests
+   *permanent* `AUDIOFOCUS_GAIN`, which evicts `WakeWordManager`'s
+   `AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK` holder with a *permanent*
+   `AUDIOFOCUS_LOSS` — and Android, by design, never sends an automatic
+   regain notification after a permanent loss (only after a transient
+   one). `audioFocusLost` therefore stayed stuck `true` forever, and
+   every `resumeAfterVoiceSession()` call routed to `PAUSED_AUDIO_FOCUS`
+   instead of `LISTENING` with nothing left to ever un-pause it. Fixed by
+   having `resumeAfterVoiceSession()` re-request focus (abandon + fresh
+   `request()`, using the actual grant result) rather than trust the
+   stale flag — by the time a VoiceSession closes, whatever caused the
+   loss has normally already abandoned its own focus. Confirmed on-device
+   with a clean before/after: before the fix, a second "Hey Jarvis" after
+   a completed conversation produced zero `WAKEWORD_DETECTED` events;
+   after, `WAKEWORD_DETECTED` fired correctly on the very next attempt.
+   Two regression tests added (a denied-re-request case using an enhanced
+   `FakeWakeWordAudioFocus.grantOnRequest`, and the exact permanent-loss-
+   with-no-regain-callback repro).
+4. **Every conversation this milestone transcribed to the literal word
+   "now", regardless of what was actually asked** — traced, not
+   rationalized away as ordinary far-field clipping (an earlier framing
+   that turned out wrong on closer evidence). The system log
+   (`RecognitionServiceImpl`) showed `onStartOfSpeech` to `onEndOfSpeech`
+   was only ~1.14 seconds on every attempt — far too short for any of the
+   sentences actually asked — because `AndroidSpeechRecognizerEngine`
+   (`SpeechInputController.kt`) set only `EXTRA_LANGUAGE_MODEL`, leaving
+   this device's on-device recognizer at its own aggressive default
+   silence/endpoint timeout. Fixed by adding
+   `EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS` (3000ms),
+   `EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS` (1500ms),
+   and `EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS` (3000ms) — these are
+   documented as advisory hints the platform recognizer may still cap or
+   ignore, not a hard guarantee. Real-device confirmation, full
+   transcript: `"now what time is it in India"` (the leading "now" turned
+   out to be the user's own genuine speech habit, not a decoding
+   artifact), correctly answered: *"The current time is 10:11 UTC. India
+   is UTC+5:30, so it's 15:41 (3:41 PM IST) in India."* — the first
+   correct end-to-end transcript-and-answer this milestone. n=1 against
+   ground truth (the `conversations` table) with no residual unexplained
+   symptom, not five repeated re-confirmations of the same result.
+   **Disclosed, not chased further**: two consecutive close-range "Hey
+   Jarvis" attempts went undetected earlier in this same session despite
+   the engine measurably healthy (`manager_state=LISTENING`,
+   `frames_processed` climbing, `inference_error_count=0`) — a separate,
+   ordinary detection-recall data point, not something this fix touched.
+
+**What is and is not validated, stated precisely because several
+over-broad "validated" claims were walked back over the course of this
+milestone before landing here**: all four bugs above have real code fixes
+plus real-device evidence and are genuinely fixed. Separately, a failure-
+injection test killed and restarted the live backend
+(`uvicorn app.main:app`) while `VoiceActivity` was open — the client
+correctly classified the disconnect as `NETWORK`, posted a "Reconnecting…"
+notification, retried with backoff, and fully reconnected
+(`WS_RECONNECTED reconnectCount=1`) the moment the server came back. **This
+validates WebSocket transport reconnect only.** The activity had been
+opened via manual "Talk to Jarvis" without ever speaking, so no
+VoiceSession was open server-side at the moment the server was killed —
+the actual 9B.10 question (does an *active* VoiceSession reach a
+deterministic end-state on both sides when the server dies and comes back
+with its in-memory state gone?) was not exercised and remains open.
+
+**Explicitly pending, deliberately not rushed to close out this
+milestone** — each needs the real device with an actual conversation in
+flight, not just a launched screen, and per explicit user instruction
+these are left for a dedicated real-device session rather than rushed:
+1. Server restart during a genuinely active VoiceSession (open a session,
+   confirm `listening`/`processing` state server-side, kill the server,
+   confirm the deterministic end-state on both sides).
+2. Client disconnect mid-conversation (not at idle).
+3. Process kill of the companion app and `PresenceService`'s
+   `START_STICKY` recovery.
+4. An abandoned client (session opened, then walked away from with no
+   close) actually being reaped on the real device, not just in
+   `test_voice_session_reaper.py`.
+
+Already covered without needing the device (cite these directly in any
+future continuation rather than re-running them): duplicate `close_session`
+idempotency (`test_close_session_twice_keeps_the_first_recorded_reason`),
+the close-during-`process_message` concurrency race
+(`test_handle_transcript_raises_if_session_closed_concurrently_during_process_message`),
+and idle-session reaping
+(`test_reap_idle_sessions_closes_only_sessions_past_the_idle_threshold`,
+`test_an_active_conversation_never_accrues_idle_time_regardless_of_total_duration`).
+
+Regression at this checkpoint: 223/223 Android unit tests pass (up from
+the pre-milestone baseline; new tests cover the mic-release,
+audio-focus-recovery, and reaper/termination-reason logic above),
+`./gradlew assembleDebug` clean. Full `pytest tests/` re-run at this checkpoint despite the changes since
+Phase 3 being Android-only (no server files touched by any of the four
+detour fixes): **455/455 passing**, unchanged from the Phase 3 baseline —
+confirms the detour genuinely left the server side untouched. A `TEMP`
+wake-word-force-enabled hook added to
+`JarvisCompanionApp.kt` for real-device validation convenience during this
+milestone was reverted before this checkpoint's commit, per the standing
+`revert before commit` marker left on it.
 
 ### Milestone 9B.3 — Android Widget & Attention Surface (closed 2026-07-14)
 

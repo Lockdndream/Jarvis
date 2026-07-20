@@ -14,6 +14,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -28,6 +29,16 @@ private const val SAMPLE_RATE = 16000
 private const val FEATURE_STEP_SIZE_MS = 10
 private const val SLIDING_WINDOW_SIZE = 5
 private const val CHUNK_SAMPLES = SAMPLE_RATE / 1000 * FEATURE_STEP_SIZE_MS
+// Milestone 9B.10 (real-device finding): how often the capture loop
+// rechecks whether LISTENING has resumed while paused. The microphone
+// hardware is fully released during any pause (see runCaptureLoop) so a
+// concurrent SpeechRecognizer (e.g. VoiceActivity's mic button) can
+// actually receive real audio instead of silence — a real, reproduced
+// bug where WakeWordManager's own AudioRecord never let go of the mic,
+// so every post-wake-word spoken command was recognized as
+// NO_SPEECH_DETECTED regardless of what the user said. 200ms adds
+// negligible latency to reacquiring the mic after a VoiceSession closes.
+private const val PAUSE_POLL_INTERVAL_MS = 200L
 
 /**
  * Milestone 9B.7: abstraction over [AudioRecord] lifecycle so
@@ -320,18 +331,59 @@ class WakeWordManager(
                 Log.d(TAG, "pauseForVoiceSession() ignored: no-op from ${_state.value}")
             }
         }
+        // Milestone 9B.10: no direct audioSource.stop() here -- a real
+        // AudioRecord.read() for a 10ms chunk returns within ~10ms on its
+        // own (it's bounded by how fast the hardware actually produces
+        // that much audio), so runCaptureLoop's own top-of-loop state
+        // check already releases the mic promptly without needing to be
+        // unblocked from another thread. This call fires only once a
+        // VoiceSession has actually opened, which for the wake-word flow
+        // is already after onAudioChunk()'s own detection handling
+        // self-transitioned to PAUSED_VOICE_SESSION synchronously on the
+        // capture thread itself; for a manually-opened session ("Talk to
+        // Jarvis") it fires only after SpeechRecognizer already completed
+        // its first recognition attempt, so it cannot help that attempt
+        // either way -- see ADR-016/9B.10 report for the manual-flow gap
+        // this does not close.
     }
 
     fun resumeAfterVoiceSession() {
+        var needsFocusRecheck = false
         synchronized(stateLock) {
             if (_state.value == State.PAUSED_VOICE_SESSION) {
                 // If audio focus was lost while paused for the voice session,
                 // resuming must land in PAUSED_AUDIO_FOCUS, not LISTENING —
                 // otherwise capture would resume without focus.
-                _state.value = if (audioFocusLost) State.PAUSED_AUDIO_FOCUS else State.LISTENING
+                if (audioFocusLost) {
+                    _state.value = State.PAUSED_AUDIO_FOCUS
+                    needsFocusRecheck = true
+                } else {
+                    _state.value = State.LISTENING
+                }
             } else {
                 Log.d(TAG, "resumeAfterVoiceSession() ignored: no-op from ${_state.value}")
             }
+        }
+        // Milestone 9B.10 real-device finding: audioFocusLost goes stale
+        // and never clears on its own here. Android only auto-delivers a
+        // regain callback after a *transient* loss; a conversation's own
+        // TTS playback (com.jarvis.companion.audio.AudioFocusManager)
+        // requests permanent AUDIOFOCUS_GAIN, which evicts this class's
+        // AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK holder with a *permanent*
+        // AUDIOFOCUS_LOSS -- by design, Android never follows a permanent
+        // loss with an automatic GAIN notification, so nothing was ever
+        // going to call resumeFromAudioFocusLoss() again. Confirmed via
+        // real-device repro: audioFocusLost stayed true across 20+ minutes
+        // and multiple wake-word attempts until the app was killed and
+        // restarted -- a real, reproduced, session-fatal bug, not a
+        // theoretical one. Re-requesting here (rather than trusting the
+        // stale flag) queries the current ground truth: by the time a
+        // VoiceSession actually closes, whatever caused the loss has
+        // normally already abandoned its own focus.
+        if (needsFocusRecheck) {
+            audioFocus.abandon()
+            val regained = audioFocus.request { gained -> if (gained) resumeFromAudioFocusLoss() else pauseForAudioFocusLoss() }
+            if (regained) resumeFromAudioFocusLoss()
         }
     }
 
@@ -396,22 +448,43 @@ class WakeWordManager(
         }
     }
 
-    private fun runCaptureLoop(activeScope: CoroutineScope) {
-        val source = audioSourceFactory()
-        audioSource = source
-
-        if (!source.start()) {
-            _audioRecordState.value = AudioRecordState.FAILED
-            _state.value = State.ERROR
-            source.release()
-            audioSource = null
-            return
-        }
-        _audioRecordState.value = AudioRecordState.INITIALIZED
-
+    private suspend fun runCaptureLoop(activeScope: CoroutineScope) {
         val buf = ShortArray(CHUNK_SAMPLES)
         while (activeScope.isActive) {
-            val read = source.read(buf)
+            if (_state.value != State.LISTENING) {
+                // Milestone 9B.10: release the microphone hardware itself
+                // while paused (PAUSED_VOICE_SESSION or
+                // PAUSED_AUDIO_FOCUS), not just stop acting on it — a
+                // held-but-idle AudioRecord still occupies the mic on many
+                // devices, starving a concurrent SpeechRecognizer of real
+                // audio. stop()/release()/nulling audioSource only ever
+                // happens here, on this coroutine — a real AudioRecord's
+                // read() for a 10ms chunk returns within ~10ms on its own,
+                // so this top-of-loop check runs promptly after a pause
+                // without needing to be unblocked from another thread.
+                audioSource?.let {
+                    it.stop()
+                    it.release()
+                }
+                audioSource = null
+                _audioRecordState.value = AudioRecordState.NONE
+                delay(PAUSE_POLL_INTERVAL_MS)
+                continue
+            }
+
+            if (audioSource == null) {
+                val source = audioSourceFactory()
+                if (!source.start()) {
+                    _audioRecordState.value = AudioRecordState.FAILED
+                    _state.value = State.ERROR
+                    source.release()
+                    return
+                }
+                audioSource = source
+                _audioRecordState.value = AudioRecordState.INITIALIZED
+            }
+
+            val read = audioSource?.read(buf) ?: -1
             if (read <= 0) {
                 if (!activeScope.isActive) break
                 continue

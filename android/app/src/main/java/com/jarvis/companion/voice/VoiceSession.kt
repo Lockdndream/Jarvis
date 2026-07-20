@@ -25,6 +25,7 @@ data class VoiceSessionError(
 
 data class VoiceSessionClosed(
     val voiceSessionId: String?,
+    val reason: String? = null,
 )
 
 data class VoiceSessionInvitation(

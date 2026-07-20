@@ -470,7 +470,8 @@ def init_db():
             state TEXT NOT NULL DEFAULT 'idle',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
-            closed_at TEXT
+            closed_at TEXT,
+            termination_reason TEXT
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_events_id ON events(id)")
@@ -494,6 +495,12 @@ def init_db():
     # each independently open a VoiceSession bound to the same
     # AttentionRequest with no coordination between them.
     _ensure_column(conn, "attention_requests", "active_voice_session_id", "TEXT")
+    # Milestone 9B.10: distinguishes why a VoiceSession closed (explicit
+    # client request, WebSocket disconnect, or the idle-timeout reaper) —
+    # only ever set on the transition into 'closed', never overwritten
+    # afterward. Existing rows from before this column existed simply read
+    # NULL, which formats as "n/a" everywhere this is displayed.
+    _ensure_column(conn, "voice_sessions", "termination_reason", "TEXT")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_contact_attempts_attention_id ON contact_attempts(attention_request_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_voice_sessions_conversation_id ON voice_sessions(conversation_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_voice_sessions_attention_id ON voice_sessions(attention_request_id)")
@@ -988,17 +995,43 @@ def get_voice_session(voice_session_id: str) -> dict | None:
     return dict(row) if row else None
 
 
-def update_voice_session_state(voice_session_id: str, state: str) -> None:
+def update_voice_session_state(voice_session_id: str, state: str, termination_reason: str | None = None) -> None:
     conn = get_conn()
     now = utcnow()
     closed_at = now if state == "closed" else None
     conn.execute(
-        "UPDATE voice_sessions SET state=?, updated_at=?, closed_at=COALESCE(?, closed_at) "
+        "UPDATE voice_sessions SET state=?, updated_at=?, closed_at=COALESCE(?, closed_at), "
+        "termination_reason=COALESCE(?, termination_reason) "
         "WHERE voice_session_id=?",
-        (state, now, closed_at, voice_session_id),
+        (state, now, closed_at, termination_reason, voice_session_id),
     )
     conn.commit()
     conn.close()
+
+
+def get_idle_voice_sessions(max_idle_seconds: int, now: str | None = None) -> list[dict]:
+    """Milestone 9B.10: sessions that never reached a terminal state and
+    whose updated_at hasn't moved in over max_idle_seconds — every legal
+    transition (including each conversational turn in handle_transcript())
+    refreshes updated_at, so an active back-and-forth conversation never
+    appears here regardless of total session age; only genuine silence
+    does. now is injectable for deterministic tests (Milestone 9B.10,
+    matching attention_scheduler.py's clock-injection pattern). Plain
+    ISO-8601 UTC string comparison, same style as
+    get_due_attention_requests() — these timestamps are always UTC and
+    zero-padded, so lexicographic order matches chronological order
+    without needing SQL date arithmetic."""
+    from datetime import timedelta
+
+    now_dt = datetime.fromisoformat((now or utcnow()).replace("Z", "+00:00"))
+    cutoff = (now_dt - timedelta(seconds=max_idle_seconds)).isoformat().replace("+00:00", "Z")
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM voice_sessions WHERE state NOT IN ('closed', 'failed') AND updated_at <= ?",
+        (cutoff,),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 
 def try_claim_voice_session_lease(attention_request_id: str, voice_session_id: str) -> bool:

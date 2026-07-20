@@ -186,6 +186,33 @@ class VoiceSessionRepositoryTest {
         assertNull(repository.current.value)
     }
 
+    // ── termination reason (Milestone 9B.10) ────────────────────────────
+
+    @Test
+    fun `applyClosed records the given termination reason`() {
+        repository.applyOpened(VoiceSession("vs_1", "listening", "conv_1", null, null))
+        repository.applyClosed("vs_1", "idle_timeout")
+        assertEquals("idle_timeout", repository.lastTerminationReason.value)
+    }
+
+    @Test
+    fun `applyClosed with a stale session id never overwrites the reason for the current session`() {
+        repository.applyOpened(VoiceSession("vs_1", "listening", "conv_1", null, null))
+        repository.applyOpened(VoiceSession("vs_2", "listening", "conv_2", null, null))
+
+        repository.applyClosed("vs_1", "idle_timeout")
+
+        assertNull(repository.lastTerminationReason.value)
+        assertEquals("vs_2", repository.current.value?.voiceSessionId)
+    }
+
+    @Test
+    fun `applyClosed with no reason leaves lastTerminationReason null`() {
+        repository.applyOpened(VoiceSession("vs_1", "listening", "conv_1", null, null))
+        repository.applyClosed("vs_1")
+        assertNull(repository.lastTerminationReason.value)
+    }
+
     @Test
     fun `applyOpened with clientRequestId emits Opened outcome`() = runTest {
         val session = VoiceSession("vs_1", "listening", "conv_1", null, null, clientRequestId = "req-1")

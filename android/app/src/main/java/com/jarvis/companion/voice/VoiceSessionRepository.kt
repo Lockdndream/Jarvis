@@ -15,6 +15,16 @@ class VoiceSessionRepository {
     private val _lastResponse = MutableStateFlow<String?>(null)
     val lastResponse: StateFlow<String?> = _lastResponse.asStateFlow()
 
+    // Milestone 9B.10: why the most recently closed session ended
+    // ("client_requested", "disconnect", or "idle_timeout" — the server's
+    // three VoiceSessionManager.close_session() call sites). Diagnostics
+    // only, never read for control flow. Persists across the session
+    // itself going null (unlike lastResponse's own clearing rules) so
+    // Diagnostics can still show "why did the last session end" after
+    // current has already gone back to null.
+    private val _lastTerminationReason = MutableStateFlow<String?>(null)
+    val lastTerminationReason: StateFlow<String?> = _lastTerminationReason.asStateFlow()
+
     // extraBufferCapacity so a slow/late collector (e.g. PresenceService
     // mid-timeout-wait, ADR-017) doesn't cause emit() to suspend or drop
     // under normal single-digit concurrent-open scenarios.
@@ -54,7 +64,7 @@ class VoiceSessionRepository {
         }
     }
 
-    fun applyClosed(voiceSessionId: String?) {
+    fun applyClosed(voiceSessionId: String?, reason: String? = null) {
         // Same stale-session-id discipline as applyResponse(): a closed
         // frame for a session that has already been superseded by a newer
         // one (e.g. a delayed close round-trip arriving after a fresh open)
@@ -63,6 +73,7 @@ class VoiceSessionRepository {
         // to correlate to in the first place (see VoiceSessionParser).
         if (voiceSessionId == null || voiceSessionId == _current.value?.voiceSessionId) {
             _current.value = null
+            _lastTerminationReason.value = reason
         }
     }
 

@@ -392,7 +392,7 @@ class CompanionWebSocketClient(
                 voiceSessionRepository.applyError(it.voiceSessionId)
                 voiceSessionRepository.applyOpenError(it)
             }
-            "voice_session_closed" -> VoiceSessionParser.parseClosed(text)?.let { voiceSessionRepository.applyClosed(it.voiceSessionId) }
+            "voice_session_closed" -> VoiceSessionParser.parseClosed(text)?.let { voiceSessionRepository.applyClosed(it.voiceSessionId, it.reason) }
             "voice_session_invitation" -> voiceSessionRepository.applyInvitation()
         }
     }

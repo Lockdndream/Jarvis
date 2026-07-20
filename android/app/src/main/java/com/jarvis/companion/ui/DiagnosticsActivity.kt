@@ -62,6 +62,7 @@ class DiagnosticsActivity : AppCompatActivity() {
             playbackQueueDepth = VoiceActivity.activePlaybackManager?.queueDepth,
             speechInputState = VoiceActivity.activeSpeechInputController?.state?.value?.name,
             lastVoiceEventAtMs = null,
+            lastTerminationReason = app.voiceSessionRepository.lastTerminationReason.value,
         )
         binding.voiceText.text = voice.formatted()
         binding.wakeWordText.text = buildWakeWordDiagnostics().formatted()

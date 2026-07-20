@@ -120,6 +120,20 @@ internal class AndroidSpeechRecognizerEngine(
 
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            // Milestone 9B.10 real-device finding: with no silence-length
+            // extras set, this device's on-device recognizer (SODA) ends
+            // the utterance ~1.1s after onStartOfSpeech -- confirmed via
+            // system log (onStartOfSpeech to onEndOfSpeech was 1.14s),
+            // regardless of whether the user spoke immediately or waited
+            // for the "listening" earcon first. That's shorter than any
+            // normal spoken sentence, so every recognition attempt this
+            // session was truncated to a near-silent fragment and decoded
+            // as a low-confidence "now". These extras are hints, not a
+            // hard guarantee (the platform recognizer may still ignore or
+            // cap them), but they're the documented lever for this.
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 3000L)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1500L)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 3000L)
         }
 
         sr.setRecognitionListener(object : RecognitionListener {

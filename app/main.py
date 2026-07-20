@@ -43,6 +43,7 @@ from . import push as push_module
 from .attention_scheduler import AttentionScheduler
 from . import attention_manager
 from .voice_session_manager import VoiceSessionManager, VoiceSessionError
+from .voice_session_reaper import VoiceSessionReaper
 from .integrations.ws_tokens import issue_ws_token, verify_ws_token
 
 logging.basicConfig(
@@ -62,6 +63,7 @@ executor = Executor(task_manager, opencode_supervisor)
 supervisor = Supervisor(task_manager, opencode_supervisor)
 attention_scheduler = AttentionScheduler(conn_manager)
 voice_session_manager = VoiceSessionManager(supervisor)
+voice_session_reaper = VoiceSessionReaper(voice_session_manager, conn_manager)
 attention_manager.set_broadcast_hook(conn_manager)
 
 
@@ -80,8 +82,10 @@ async def lifespan(app: FastAPI):
         await attention_manager.cancel_for_task(task_id)
     await opencode_supervisor.start()
     await attention_scheduler.start()
+    await voice_session_reaper.start()
     logger.info("Jarvis server started")
     yield
+    await voice_session_reaper.stop()
     await attention_scheduler.stop()
     await opencode_supervisor.stop()
     await task_manager.shutdown()
@@ -505,10 +509,13 @@ async def websocket_endpoint(ws: WebSocket):
             if data.get("type") == "voice_session_close":
                 vsid = data.get("voice_session_id")
                 if vsid:
-                    voice_session_manager.close_session(vsid)
+                    voice_session_manager.close_session(vsid, reason="client_requested")
                     if vsid == open_voice_session_id:
                         open_voice_session_id = None
-                await ws.send_text(json.dumps({"type": "voice_session_closed", "voice_session_id": vsid}))
+                await ws.send_text(json.dumps({
+                    "type": "voice_session_closed", "voice_session_id": vsid,
+                    "reason": "client_requested",
+                }))
                 continue
 
             if data.get("type") == "user_message":
@@ -578,7 +585,7 @@ async def websocket_endpoint(ws: WebSocket):
         # that item. close_session() is itself idempotent/guarded (no-op if
         # already closed), so this is safe even if a close already ran.
         if open_voice_session_id:
-            voice_session_manager.close_session(open_voice_session_id)
+            voice_session_manager.close_session(open_voice_session_id, reason="disconnect")
 
 
 def _now() -> str:

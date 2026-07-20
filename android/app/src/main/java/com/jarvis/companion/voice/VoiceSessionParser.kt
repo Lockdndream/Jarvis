@@ -76,6 +76,7 @@ object VoiceSessionParser {
             if (type != "voice_session_closed") return null
             VoiceSessionClosed(
                 voiceSessionId = root.optString("voice_session_id", null)?.ifEmpty { null },
+                reason = root.optString("reason", null)?.ifEmpty { null },
             )
         } catch (_: Exception) {
             null

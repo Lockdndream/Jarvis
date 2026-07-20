@@ -507,6 +507,48 @@ not urgently), **Low** (cosmetic or very low probability of mattering).
 
 ---
 
+### TD-023 — Active VoiceSession recovery under real-device failure injection unproven
+
+- **Description**: Milestone 9B.10 validated WebSocket transport reconnect
+  on a real device (kill the live backend, confirm the client detects,
+  backs off, and reconnects) but that test opened `VoiceActivity` without
+  ever speaking, so no VoiceSession was open server-side at the moment of
+  the kill. The actual question this milestone exists to answer — does an
+  *active* VoiceSession (one with real `listening`/`processing` state on
+  both sides) reach a deterministic end-state on both the client and
+  server when the backend dies mid-conversation and comes back with its
+  in-memory state gone — was not exercised. Three further real-device
+  scenarios are also unproven: a client disconnecting mid-conversation
+  (not at idle); a killed companion process's `PresenceService`
+  `START_STICKY` recovery reconciling correctly with any VoiceSession that
+  was open at kill time; and an abandoned client (opened, then walked
+  away from) actually being reaped by `VoiceSessionReaper` on the real
+  device, as opposed to only in `test_voice_session_reaper.py`.
+- **Severity**: Medium — the server-side state machine and reaper logic
+  are unit-tested and the transport layer is real-device-proven
+  separately, so this is a gap in *combined* real-device evidence, not a
+  known-broken path. Escalates to High if a future milestone builds
+  additional VoiceSession-dependent features assuming this is settled.
+- **Owner**: Unowned — `app/voice_session_manager.py`,
+  `app/voice_session_reaper.py`, `PresenceService.kt` are the modules
+  whose interaction this would exercise.
+- **Origin milestone**: Milestone 9B.10 (real-device finding; deliberately
+  not rushed to close per explicit user instruction — each scenario
+  needs a real device with an actual conversation in flight, not just a
+  launched screen)
+- **Risk**: Any claim that Milestone 9B.10's hardening (idle reaper,
+  `termination_reason`, the close-during-`process_message` fix) is fully
+  proven end-to-end rests on unit tests plus one transport-only device
+  test — REQUIRES-EXPERIMENT-classified for the combined real-device
+  case, not FACT.
+- **Recommended milestone**: Complete Milestone 9B.10's Phase 4 in a
+  dedicated real-device session: open a session, confirm active state on
+  both sides via Diagnostics/DB, then inject each of the four scenarios
+  above and confirm the deterministic end-state for each.
+- **Status**: Open, explicitly disclosed (`SESSION.md` Milestone 9B.10)
+
+---
+
 ## Summary
 
 | ID | Title | Category | Severity |
@@ -533,6 +575,7 @@ not urgently), **Low** (cosmetic or very low probability of mattering).
 | TD-020 | Hardcoded paid-model allowlist | Operational | Low |
 | TD-021 | Android companion retries forever on cert mismatch | Implementation | **Closed (M9B.2)** |
 | TD-022 | Wake-word background/Doze survival, battery, adverse-acoustic recall unproven | Architecture | High (conditional) |
+| TD-023 | Active VoiceSession recovery under real-device failure injection unproven | Testing | Medium |
 
 No duplicate entries exist between this register and `SESSION.md`'s own
 "Known Bugs, Limitations, and Technical Debt" section — this register is

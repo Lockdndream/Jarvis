@@ -85,7 +85,7 @@ class VoiceSessionManager:
     def __init__(self, supervisor):
         self._supervisor = supervisor
 
-    def _transition(self, voice_session_id: str, to_state: str) -> bool:
+    def _transition(self, voice_session_id: str, to_state: str, termination_reason: str | None = None) -> bool:
         session = db.get_voice_session(voice_session_id)
         if not session:
             raise VoiceSessionError(f"Unknown voice session {voice_session_id}")
@@ -96,7 +96,7 @@ class VoiceSessionManager:
                 voice_session_id, session["state"], to_state,
             )
             return False
-        db.update_voice_session_state(voice_session_id, to_state)
+        db.update_voice_session_state(voice_session_id, to_state, termination_reason=termination_reason)
         logger.info("voice session state: id=%s %s -> %s", voice_session_id, session["state"], to_state)
         return True
 
@@ -177,6 +177,22 @@ class VoiceSessionManager:
             transcript, session["conversation_id"], bound_attention_request_id=bound_attention_id,
         )
 
+        # Milestone 9B.10 (independent review finding): process_message()
+        # awaits, and the session could have been closed by something
+        # else while this turn was in flight — the idle-timeout reaper
+        # (VoiceSessionReaper), an explicit close from another device, or
+        # even the LLM's own close_voice_session tool call acting on this
+        # exact session mid-turn. Without this check, the WAITING/
+        # LISTENING transitions below fail silently (return False from
+        # _transition() on a CLOSED session, since CLOSED is never a
+        # legal from-state for either) and this function would return
+        # voice_session_state: "listening" for a session that is actually
+        # closed — a real, misleading response, not just a theoretical
+        # concern.
+        current = db.get_voice_session(voice_session_id)
+        if not current or current["state"] == STATE_CLOSED:
+            raise VoiceSessionError(f"Voice session {voice_session_id} was closed while processing this turn")
+
         # If this turn was a successful defer of the bound AttentionRequest
         # (Phase 18's fast path, resolved inside process_message), the call
         # is over from the user's perspective ("Not now, come back in 15
@@ -217,19 +233,50 @@ class VoiceSessionManager:
     def mark_deferred(self, voice_session_id: str) -> bool:
         return self._transition(voice_session_id, STATE_DEFERRED)
 
-    def close_session(self, voice_session_id: str) -> bool:
+    def close_session(self, voice_session_id: str, reason: str = "client_requested") -> bool:
+        """reason (Milestone 9B.10) is recorded on the terminal transition
+        only — 'client_requested' (explicit voice_session_close),
+        'disconnect' (main.py's finally block on WebSocket teardown), or
+        'idle_timeout' (reap_idle_sessions() below). Never overwrites an
+        already-recorded reason (see db.update_voice_session_state's
+        COALESCE) — close_session() is idempotent and a second call here
+        (e.g. a duplicate close message) must not blame the wrong cause."""
         session = db.get_voice_session(voice_session_id)
         if not session:
             return False
         if session["state"] == STATE_CLOSED:
             return True
         self._transition(voice_session_id, STATE_CLOSING)
-        ok = self._transition(voice_session_id, STATE_CLOSED)
+        ok = self._transition(voice_session_id, STATE_CLOSED, termination_reason=reason)
         if ok and session.get("attention_request_id"):
             # Release the TD-002 lease so a future session (this device or
             # another) can bind to the same AttentionRequest again.
             db.release_voice_session_lease(session["attention_request_id"], voice_session_id)
         return ok
+
+    def reap_idle_sessions(self, max_idle_seconds: int, now: str | None = None) -> list[dict]:
+        """Milestone 9B.10: closes any VoiceSession that never reached a
+        terminal state and has had no activity (no transition of any
+        kind — including each conversational turn) for over
+        max_idle_seconds. Backstops every orphan path that isn't already
+        covered: the OS killing VoiceActivity before its own onStop() can
+        run (ADR-017/9B.9's client-side fix), a Supervisor tool call that
+        opens a session and is never followed by a matching close, and any
+        non-Android client that abandons a session while its connection
+        stays alive (main.py's disconnect-triggered close in the `finally`
+        block only fires when the connection itself actually drops).
+        Returns the list of reaped session rows so the caller can notify
+        any still-connected client that its session was force-closed."""
+        idle = db.get_idle_voice_sessions(max_idle_seconds, now=now)
+        reaped = []
+        for session in idle:
+            if self.close_session(session["voice_session_id"], reason="idle_timeout"):
+                logger.info(
+                    "voice session idle-timeout reap: id=%s state=%s idle_since=%s",
+                    session["voice_session_id"], session["state"], session["updated_at"],
+                )
+                reaped.append(session)
+        return reaped
 
     def fail_session(self, voice_session_id: str) -> bool:
         session = db.get_voice_session(voice_session_id)

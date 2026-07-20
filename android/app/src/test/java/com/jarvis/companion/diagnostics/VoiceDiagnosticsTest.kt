@@ -18,6 +18,7 @@ class VoiceDiagnosticsTest {
             playbackQueueDepth = 3,
             speechInputState = "IDLE",
             lastVoiceEventAgoMs = 5000,
+            lastTerminationReason = "idle_timeout",
         )
         val result = voice.formatted()
         val lines = result.split("\n")
@@ -29,7 +30,8 @@ class VoiceDiagnosticsTest {
         assertEquals("voice_session_id=session-001", lines[5])
         assertEquals("playback_queue_depth=3", lines[6])
         assertEquals("speech_input_state=IDLE", lines[7])
-        assertEquals("last_voice_event_ago=5s", lines[8])
+        assertEquals("last_termination_reason=idle_timeout", lines[8])
+        assertEquals("last_voice_event_ago=5s", lines[9])
     }
 
     @Test
@@ -44,10 +46,11 @@ class VoiceDiagnosticsTest {
             playbackQueueDepth = null,
             speechInputState = null,
             lastVoiceEventAgoMs = null,
+            lastTerminationReason = null,
         )
         val result = voice.formatted()
         val lines = result.split("\n")
-        assertEquals(9, lines.size)
+        assertEquals(10, lines.size)
         lines.forEachIndexed { index, line ->
             val value = line.substringAfter("=")
             assertEquals("line $index should be n/a", "n/a", value)
@@ -105,5 +108,22 @@ class VoiceDiagnosticsTest {
         assertEquals(null, voice.playbackQueueDepth)
         assertEquals(null, voice.speechInputState)
         assertEquals(null, voice.lastVoiceEventAgoMs)
+    }
+
+    @Test
+    fun `buildVoiceDiagnostics passes through the termination reason`() {
+        val voice = buildVoiceDiagnostics(
+            audioFocusState = null,
+            audioRoute = null,
+            ttsReady = null,
+            ttsSpeaking = null,
+            voiceSessionState = null,
+            voiceSessionId = null,
+            playbackQueueDepth = null,
+            speechInputState = null,
+            lastVoiceEventAtMs = null,
+            lastTerminationReason = "client_requested",
+        )
+        assertEquals("client_requested", voice.lastTerminationReason)
     }
 }

@@ -213,6 +213,20 @@ class VoiceSessionParserTest {
     }
 
     @Test
+    fun `parseClosed extracts reason when present`() {
+        val json = """{"type":"voice_session_closed","voice_session_id":"vs_1","reason":"idle_timeout"}"""
+        val result = VoiceSessionParser.parseClosed(json)
+        assertEquals("idle_timeout", result?.reason)
+    }
+
+    @Test
+    fun `parseClosed yields null reason when absent`() {
+        val json = """{"type":"voice_session_closed","voice_session_id":"vs_1"}"""
+        val result = VoiceSessionParser.parseClosed(json)
+        assertNull(result?.reason)
+    }
+
+    @Test
     fun `parseClosed wrong type returns null`() {
         val json = """{"type": "voice_session_error", "voice_session_id": "vs_1"}"""
         assertNull(VoiceSessionParser.parseClosed(json))
