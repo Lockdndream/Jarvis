@@ -10,6 +10,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import app.database as db
+import app.supervisor.supervisor as supervisor_module
 from app.supervisor.supervisor import Supervisor, _fast_path, _format_context
 from app.supervisor.tools import ToolRegistry
 from app.supervisor.context import build_context
@@ -765,3 +766,77 @@ async def test_process_message_survives_llm_failure_mid_loop():
     assert "response" in result
     assert result["response"]  # never empty/None -- always some spoken-friendly text
     assert "conversation_id" in result
+
+
+# ── Control Center hardening: set_broadcast_hook / _broadcast ───────
+#
+# Self-contained: each test explicitly sets and tears down its own hook
+# rather than relying on app.main's module-level import-time wiring, so
+# these never depend on test file import order (see tests/conftest.py's
+# autouse fixture, which also resets this hook to None around every test
+# for the same reason).
+
+class _FakeConnManager:
+    def __init__(self, observers=True):
+        self._observers = observers
+        self.broadcast_calls = []
+
+    def has_observers(self):
+        return self._observers
+
+    async def broadcast_observers(self, data):
+        self.broadcast_calls.append(data)
+
+
+@pytest.mark.asyncio
+async def test_broadcast_is_noop_with_no_hook_registered():
+    supervisor_module._broadcast_hook = None
+    events_before = len(db.get_recent_events(50))
+
+    await supervisor_module._broadcast("supervisor_turn_started", {"x": 1})
+
+    assert len(db.get_recent_events(50)) == events_before
+
+
+@pytest.mark.asyncio
+async def test_broadcast_is_noop_when_hook_set_but_no_observers():
+    """Phase 4 (performance): zero observers connected must mean zero
+    extra db.save_event writes, not just zero broadcast() sends."""
+    fake = _FakeConnManager(observers=False)
+    supervisor_module.set_broadcast_hook(fake)
+    events_before = len(db.get_recent_events(50))
+
+    await supervisor_module._broadcast("supervisor_turn_started", {"x": 1})
+
+    assert len(db.get_recent_events(50)) == events_before
+    assert fake.broadcast_calls == []
+
+
+@pytest.mark.asyncio
+async def test_broadcast_persists_and_forwards_when_observers_present():
+    fake = _FakeConnManager(observers=True)
+    supervisor_module.set_broadcast_hook(fake)
+    events_before = len(db.get_recent_events(50))
+
+    await supervisor_module._broadcast("supervisor_tool_call", {"tool": "list_tasks", "args": {}})
+
+    assert len(db.get_recent_events(50)) == events_before + 1
+    assert len(fake.broadcast_calls) == 1
+    assert fake.broadcast_calls[0]["type"] == "supervisor_tool_call"
+
+
+@pytest.mark.asyncio
+async def test_broadcast_failure_is_swallowed_not_raised():
+    """A dashboard disconnect mid-broadcast must never surface as an
+    exception in the Supervisor's tool-calling loop -- this is
+    observability, not a load-bearing part of answering the user."""
+    class RaisingConnManager:
+        def has_observers(self):
+            return True
+
+        async def broadcast_observers(self, data):
+            raise ConnectionError("dashboard vanished")
+
+    supervisor_module.set_broadcast_hook(RaisingConnManager())
+
+    await supervisor_module._broadcast("supervisor_turn", {"x": 1})  # must not raise

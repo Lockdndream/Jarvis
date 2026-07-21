@@ -1,0 +1,347 @@
+/* Jarvis Control Center — desktop-only operator console.
+   Design language: an instrument panel, not an admin CRUD screen or a log
+   viewer. Dark, high-contrast, monospace-forward for anything that is
+   data (ids, timestamps, counts), a quieter sans for panel titles and
+   prose. The signature element is the Event Timeline: a lit circuit
+   trace across the top that makes a stuck/failed pipeline stage visually
+   unmissable at a glance, which is the one thing a hackathon judge
+   glancing at a laptop screen needs to read in under a second. */
+
+:root {
+  --bg: #080b10;
+  --bg-grid: #0c1017;
+  --panel: #11151d;
+  --panel-2: #151b25;
+  --border: #232b38;
+  --border-soft: #1a2029;
+  --text: #e7edf6;
+  --muted: #7c8aa3;
+  --muted-2: #4d5a6f;
+  --accent: #4c9aff;
+  --accent-dim: #1f3a5c;
+  --green: #34d17c;
+  --green-dim: #12331f;
+  --amber: #f0b429;
+  --amber-dim: #3a2c0b;
+  --red: #f0524a;
+  --red-dim: #3a1414;
+  --mono: ui-monospace, "Cascadia Code", "SF Mono", Consolas, "Roboto Mono", monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html, body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  min-width: 1180px;
+}
+
+body {
+  background-image:
+    radial-gradient(circle at 15% 0%, rgba(76, 154, 255, 0.06), transparent 45%),
+    repeating-linear-gradient(0deg, rgba(255,255,255,0.012) 0px, rgba(255,255,255,0.012) 1px, transparent 1px, transparent 26px);
+}
+
+::selection { background: var(--accent-dim); }
+
+/* ── Header ─────────────────────────────────────────────────────── */
+
+.cc-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 24px;
+  border-bottom: 1px solid var(--border);
+  background: linear-gradient(180deg, #0d1119, #0a0d13);
+}
+
+.cc-brand { display: flex; align-items: center; gap: 10px; }
+
+.cc-brand-mark {
+  width: 10px; height: 10px; border-radius: 50%;
+  background: var(--green);
+  box-shadow: 0 0 0 3px var(--green-dim), 0 0 12px var(--green);
+  animation: cc-breathe 2.4s ease-in-out infinite;
+}
+.cc-brand-mark.down { background: var(--red); box-shadow: 0 0 0 3px var(--red-dim), 0 0 12px var(--red); }
+
+@keyframes cc-breathe { 0%,100% { opacity: 1; } 50% { opacity: .45; } }
+
+.cc-brand h1 {
+  font-family: var(--mono);
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+}
+.cc-brand-sub { color: var(--muted); font-weight: 500; }
+
+.cc-header-stats { display: flex; gap: 28px; }
+.cc-header-stat { display: flex; flex-direction: column; align-items: flex-end; gap: 2px; }
+.cc-header-stat-label {
+  font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted-2);
+}
+.cc-header-stat-value { font-family: var(--mono); font-size: 13px; color: var(--text); }
+
+/* ── Grid ────────────────────────────────────────────────────────── */
+
+.cc-grid {
+  display: grid;
+  grid-template-columns: 1.55fr 1fr;
+  grid-template-areas:
+    "health      health"
+    "timeline    timeline"
+    "feed        conversation"
+    "feed        decisions"
+    "tasks       attention"
+    "connectivity services"
+    "alerts      alerts";
+  gap: 14px;
+  padding: 16px 20px 28px;
+}
+
+.cc-area-health { grid-area: health; }
+.cc-area-timeline { grid-area: timeline; }
+.cc-area-feed { grid-area: feed; }
+.cc-area-conversation { grid-area: conversation; }
+.cc-area-decisions { grid-area: decisions; }
+.cc-area-tasks { grid-area: tasks; }
+.cc-area-attention { grid-area: attention; }
+.cc-area-connectivity { grid-area: connectivity; }
+.cc-area-services { grid-area: services; }
+.cc-area-alerts { grid-area: alerts; }
+
+.cc-panel {
+  background: var(--panel);
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.cc-panel-title {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  margin-bottom: 10px;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+.cc-panel-sub {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--muted-2);
+}
+.cc-badge {
+  font-family: var(--mono);
+  background: var(--accent-dim);
+  color: var(--accent);
+  border-radius: 999px;
+  padding: 1px 8px;
+  font-size: 11px;
+}
+
+.cc-empty { color: var(--muted-2); font-size: 12px; padding: 8px 0; }
+
+/* ── 1. System Health ───────────────────────────────────────────── */
+
+.cc-health-row { display: flex; flex-wrap: wrap; gap: 10px; }
+.cc-health-item {
+  display: flex; align-items: center; gap: 7px;
+  background: var(--panel-2);
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  padding: 6px 12px 6px 8px;
+  font-size: 12px;
+  transition: border-color .2s, background .2s;
+}
+.cc-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+.cc-dot.ok { background: var(--green); box-shadow: 0 0 6px var(--green); }
+.cc-dot.warn { background: var(--amber); box-shadow: 0 0 6px var(--amber); }
+.cc-dot.bad { background: var(--red); box-shadow: 0 0 6px var(--red); animation: cc-blink 1s steps(2) infinite; }
+.cc-dot.unknown { background: var(--muted-2); }
+@keyframes cc-blink { 50% { opacity: 0.25; } }
+.cc-health-item.bad { border-color: rgba(240,82,74,0.4); background: var(--red-dim); }
+.cc-health-item .cc-health-name { font-family: var(--mono); color: var(--text); }
+.cc-health-item .cc-health-detail { color: var(--muted-2); font-size: 10px; }
+
+/* ── 6. Event Timeline (signature) ──────────────────────────────── */
+
+.cc-timeline { display: flex; align-items: flex-start; position: relative; padding: 6px 4px 2px; overflow-x: auto; }
+.cc-tl-node {
+  flex: 1 0 0;
+  display: flex; flex-direction: column; align-items: center;
+  position: relative;
+  min-width: 92px;
+}
+.cc-tl-line {
+  position: absolute; top: 9px; left: -50%; right: 50%;
+  height: 2px; background: var(--border);
+  z-index: 0;
+}
+.cc-tl-node:first-child .cc-tl-line { display: none; }
+.cc-tl-node.lit ~ .cc-tl-node .cc-tl-line { background: var(--border); }
+.cc-tl-node .cc-tl-line.lit { background: var(--accent); }
+.cc-tl-dot {
+  width: 20px; height: 20px; border-radius: 50%;
+  background: var(--panel-2);
+  border: 2px solid var(--border);
+  z-index: 1;
+  display: flex; align-items: center; justify-content: center;
+  transition: background .25s, border-color .25s, box-shadow .25s;
+}
+.cc-tl-node.lit .cc-tl-dot { border-color: var(--accent); background: var(--accent-dim); box-shadow: 0 0 12px rgba(76,154,255,.5); }
+.cc-tl-node.ok .cc-tl-dot { border-color: var(--green); background: var(--green-dim); box-shadow: 0 0 12px rgba(52,209,124,.5); }
+.cc-tl-node.bad .cc-tl-dot { border-color: var(--red); background: var(--red-dim); box-shadow: 0 0 14px rgba(240,82,74,.65); animation: cc-node-alarm 0.9s ease-in-out infinite; }
+.cc-tl-node.dim .cc-tl-dot { opacity: 0.35; }
+@keyframes cc-node-alarm { 0%,100% { box-shadow: 0 0 8px rgba(240,82,74,.4); } 50% { box-shadow: 0 0 20px rgba(240,82,74,.9); } }
+.cc-tl-label { font-size: 10.5px; font-family: var(--mono); color: var(--muted); margin-top: 6px; text-align: center; line-height: 1.3; }
+.cc-tl-node.lit .cc-tl-label, .cc-tl-node.ok .cc-tl-label { color: var(--text); }
+.cc-tl-node.bad .cc-tl-label { color: var(--red); }
+.cc-tl-node.dim .cc-tl-label { color: var(--muted-2); }
+.cc-tl-time { font-size: 9px; color: var(--muted-2); margin-top: 2px; font-family: var(--mono); }
+
+/* ── 2. Live Activity Feed / decision stream / alerts (log-style) ─ */
+
+.cc-feed, .cc-decisions, .cc-alerts {
+  /* Plain column, not column-reverse: a real bug found while verifying
+     live updates end-to-end — column-reverse plus overflow:auto does
+     NOT reliably put scrollTop:0 at the reversed-visual-start in Chrome
+     once content overflows (empirically, scrollTop 0 landed somewhere
+     in the *middle* of the list, not at the newest item). Newest-first
+     is achieved the boring, reliable way instead: prepend new rows at
+     DOM index 0 in normal column flow, so they render at the visual top
+     directly with no scroll-position trickery at all. */
+  overflow-y: auto;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-right: 4px;
+}
+.cc-area-feed .cc-feed { max-height: 560px; }
+.cc-area-decisions .cc-decisions { max-height: 220px; }
+.cc-area-alerts .cc-alerts { max-height: 150px; flex-direction: row; flex-wrap: wrap; overflow-y: hidden; }
+
+.cc-row {
+  display: flex; gap: 8px; align-items: flex-start;
+  font-size: 12px;
+  padding: 5px 8px;
+  border-radius: 6px;
+  animation: cc-fade-in .35s ease-out;
+}
+.cc-row:hover { background: var(--panel-2); }
+.cc-row .t { font-family: var(--mono); color: var(--muted-2); font-size: 10.5px; flex-shrink: 0; padding-top: 1px; }
+.cc-row .icon { flex-shrink: 0; width: 14px; text-align: center; }
+.cc-row .body { color: var(--text); }
+.cc-row .body .k { color: var(--accent); }
+.cc-row.sev-fail { background: var(--red-dim); }
+.cc-row.sev-fail .body { color: #ffb3ae; }
+.cc-row.sev-warn .body { color: var(--amber); }
+@keyframes cc-fade-in { from { opacity: 0; transform: translateY(-3px); } to { opacity: 1; transform: none; } }
+
+/* ── 3. Current Conversation ─────────────────────────────────────── */
+
+.cc-conv-turn { border: 1px solid var(--border-soft); border-radius: 8px; padding: 10px 12px; background: var(--panel-2); }
+.cc-conv-turn + .cc-conv-turn { margin-top: 10px; opacity: 0.55; }
+.cc-conv-field { margin-bottom: 8px; }
+.cc-conv-field:last-child { margin-bottom: 0; }
+.cc-conv-label { font-size: 10px; text-transform: uppercase; letter-spacing: .07em; color: var(--muted-2); font-family: var(--mono); margin-bottom: 2px; }
+.cc-conv-value { font-size: 13px; line-height: 1.4; }
+.cc-conv-value.mono { font-family: var(--mono); font-size: 12px; color: var(--accent); }
+.cc-status-pill { display: inline-block; font-family: var(--mono); font-size: 10px; padding: 2px 8px; border-radius: 999px; text-transform: uppercase; letter-spacing: .05em; }
+.cc-status-pill.running { background: var(--accent-dim); color: var(--accent); }
+.cc-status-pill.completed { background: var(--green-dim); color: var(--green); }
+.cc-status-pill.failed { background: var(--red-dim); color: var(--red); }
+.cc-tool-chip { display: inline-flex; align-items: center; gap: 6px; font-family: var(--mono); font-size: 11px; background: var(--bg-grid); border: 1px solid var(--border-soft); border-radius: 6px; padding: 3px 8px; margin: 2px 4px 0 0; }
+
+/* ── 4. Running Tasks (kanban) ───────────────────────────────────── */
+
+.cc-task-board { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; flex: 1; min-height: 0; }
+.cc-task-col { display: flex; flex-direction: column; min-height: 0; }
+.cc-task-col h3 {
+  font-size: 10px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted);
+  font-family: var(--mono); margin-bottom: 6px; display: flex; justify-content: space-between; align-items: center;
+}
+.cc-count { color: var(--muted-2); }
+.cc-task-list { display: flex; flex-direction: column; gap: 6px; overflow-y: auto; max-height: 320px; }
+.cc-task-card {
+  background: var(--panel-2); border: 1px solid var(--border-soft); border-radius: 7px;
+  padding: 7px 9px; font-size: 11px;
+}
+.cc-task-card .id { font-family: var(--mono); color: var(--muted-2); font-size: 10px; }
+.cc-task-card .name { color: var(--text); margin: 2px 0 4px; line-height: 1.3; }
+.cc-task-card .meta { display: flex; justify-content: space-between; color: var(--muted); font-family: var(--mono); font-size: 10px; }
+.cc-task-card .progress { color: var(--muted-2); font-size: 10px; margin-top: 4px; font-style: italic; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cc-task-col[data-col="running"] .cc-task-card { border-left: 3px solid var(--accent); }
+.cc-task-col[data-col="queued"] .cc-task-card { border-left: 3px solid var(--muted-2); }
+.cc-task-col[data-col="completed"] .cc-task-card { border-left: 3px solid var(--green); }
+.cc-task-col[data-col="failed"] .cc-task-card { border-left: 3px solid var(--red); }
+.cc-task-col[data-col="cancelled"] .cc-task-card { border-left: 3px solid var(--muted); }
+.cc-task-card.stale { opacity: 0.45; }
+.cc-task-card.old { opacity: 0.35; }
+.cc-task-card .stale-flag { color: var(--amber); font-family: var(--mono); font-size: 9px; }
+
+/* ── 5. Attention Center ────────────────────────────────────────── */
+
+.cc-attention-list { display: flex; flex-direction: column; gap: 8px; overflow-y: auto; max-height: 320px; }
+.cc-attn-card {
+  border: 1px solid rgba(240,180,41,0.35); background: var(--amber-dim);
+  border-radius: 7px; padding: 8px 10px; font-size: 12px;
+}
+.cc-attn-card.urgent { border-color: rgba(240,82,74,0.5); background: var(--red-dim); }
+.cc-attn-card .kind { font-family: var(--mono); font-size: 10px; text-transform: uppercase; color: var(--amber); letter-spacing: .05em; }
+.cc-attn-card.urgent .kind { color: var(--red); }
+.cc-attn-card .summary { margin: 3px 0; color: var(--text); }
+.cc-attn-card .meta { color: var(--muted); font-family: var(--mono); font-size: 10px; }
+
+/* ── 8. Connectivity Monitor / kv grid ──────────────────────────── */
+
+.cc-kv-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 16px; }
+.cc-kv { display: flex; flex-direction: column; gap: 2px; }
+.cc-kv-label { font-size: 10px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted-2); font-family: var(--mono); }
+.cc-kv-value { font-family: var(--mono); font-size: 13px; color: var(--text); }
+.cc-kv-value.ok { color: var(--green); }
+.cc-kv-value.bad { color: var(--red); }
+.cc-kv-value.warn { color: var(--amber); }
+
+/* ── 9. Background Services ─────────────────────────────────────── */
+
+.cc-service-list { display: flex; flex-direction: column; gap: 8px; }
+.cc-service-row { display: flex; justify-content: space-between; align-items: center; font-size: 12px; padding: 5px 0; border-bottom: 1px solid var(--border-soft); }
+.cc-service-row:last-child { border-bottom: none; }
+.cc-service-name { font-family: var(--mono); color: var(--text); }
+.cc-service-detail { color: var(--muted-2); font-size: 10.5px; }
+.cc-service-status { display: flex; align-items: center; gap: 6px; font-family: var(--mono); font-size: 10.5px; }
+
+/* ── 10. Recent Alerts (ticker chips) ───────────────────────────── */
+
+.cc-alert-chip {
+  display: flex; align-items: center; gap: 6px;
+  border: 1px solid var(--border-soft); background: var(--panel-2);
+  border-radius: 999px; padding: 5px 12px; font-size: 11.5px;
+  animation: cc-fade-in .35s ease-out;
+}
+.cc-alert-chip.critical { border-color: rgba(240,82,74,0.5); background: var(--red-dim); color: #ffb3ae; }
+.cc-alert-chip.warning { border-color: rgba(240,180,41,0.45); background: var(--amber-dim); color: var(--amber); }
+.cc-alert-chip .t { color: var(--muted-2); font-family: var(--mono); font-size: 10px; }
+
+/* ── scrollbars ──────────────────────────────────────────────────── */
+
+* { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+
+/* ── focus ───────────────────────────────────────────────────────── */
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }

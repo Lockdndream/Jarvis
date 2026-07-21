@@ -122,6 +122,34 @@ not urgently), **Low** (cosmetic or very low probability of mattering).
   over as a named item since Milestone 6.
 - **Status**: Open, long-disclosed, unaddressed
 
+### TD-025 — Control Center's `currentTurn` cannot represent two concurrent turns
+
+- **Description**: `dashboard.js`'s "Current Conversation" panel holds a
+  single global `state.currentTurn` slot. If a second turn begins (e.g.
+  a voice turn and a PWA/text turn both in flight at once) before the
+  first is rendered as complete, `addToolCall`'s synthetic-turn fallback
+  silently discards the previous turn's state rather than representing
+  both. Found during the Control Center's independent architectural
+  review (Milestone 9B.10) and deliberately left unfixed in the same
+  milestone's hardening pass, since resolving it is a data-model change
+  (a turn history/stack, not a single slot), not a bug fix, and was
+  explicitly out of that pass's fix-only scope.
+- **Severity**: Low today — Jarvis is currently a single-user,
+  effectively-single-active-conversation system in practice, so true
+  concurrent turns are rare. Would become more relevant if multi-device
+  simultaneous use (see the Control Center roadmap's Version 2.0 ideas)
+  is ever pursued.
+- **Owner**: `app/static/dashboard/dashboard.js`
+- **Origin milestone**: Milestone 9B.10 (Control Center architectural
+  review)
+- **Risk**: A dashboard viewer could see one turn's data silently
+  replaced by another's mid-observation, with no indication anything
+  was dropped — a correctness gap in what the panel implicitly promises
+  ("this is the current conversation"), not a crash risk.
+- **Recommended milestone**: Only if/when multi-device concurrent use
+  becomes a real product goal; unscheduled otherwise.
+- **Status**: Open, disclosed (`docs/decisions/ADR-018-jarvis-control-center-observability-architecture.md`)
+
 ---
 
 ## Implementation Debt
@@ -192,6 +220,36 @@ not urgently), **Low** (cosmetic or very low probability of mattering).
   unavailable.
 - **Recommended milestone**: Small, low-risk fix; unscheduled.
 - **Status**: Open, disclosed (Known Limitation #43)
+
+### TD-024 — Control Center event-shape handling relies on an unenforced naming convention
+
+- **Description**: `dashboard.js`'s `handleNamedEvent`/`routeWsMessage`
+  unwraps incoming WS frames via `data.content ?? data` — correct today
+  only because no observer event type broadcasting raw top-level fields
+  (e.g. `device_status_update`) also happens to name one of those fields
+  `content`. Nothing enforces this; it is an implicit contract between
+  every future event type's payload shape and this one line of frontend
+  code. Found during the Control Center's independent architectural
+  review (Milestone 9B.10) and deliberately left as-is in the same
+  milestone's hardening pass — fixing it properly means giving every
+  observer event an explicit, self-describing envelope, which is a
+  protocol change belonging with a future protocol revision, not a
+  same-pass bug fix.
+- **Severity**: Low today (zero current event types collide), Medium
+  if a future event type is added carelessly.
+- **Owner**: `app/static/dashboard/dashboard.js`; the actual fix would
+  also touch `docs/protocols/control-center-observer-protocol-v1.md`'s
+  §2 event-type table.
+- **Origin milestone**: Milestone 9B.10 (Control Center architectural
+  review)
+- **Risk**: A future observer event type that reuses the field name
+  `content` for something other than "this is the whole payload" would
+  silently mis-render rather than fail loudly.
+- **Recommended milestone**: Address the next time a new observer event
+  type is added — give every event an explicit envelope
+  (`{"type": ..., "payload": {...}}`) rather than patching around this
+  one collision risk. Unscheduled otherwise.
+- **Status**: Open, disclosed (`docs/decisions/ADR-018-jarvis-control-center-observability-architecture.md`)
 
 ---
 
@@ -576,6 +634,8 @@ not urgently), **Low** (cosmetic or very low probability of mattering).
 | TD-021 | Android companion retries forever on cert mismatch | Implementation | **Closed (M9B.2)** |
 | TD-022 | Wake-word background/Doze survival, battery, adverse-acoustic recall unproven | Architecture | High (conditional) |
 | TD-023 | Active VoiceSession recovery under real-device failure injection unproven | Testing | Medium |
+| TD-024 | Control Center event-shape handling relies on an unenforced naming convention | Implementation | Low |
+| TD-025 | Control Center's `currentTurn` cannot represent two concurrent turns | Architecture | Low |
 
 No duplicate entries exist between this register and `SESSION.md`'s own
 "Known Bugs, Limitations, and Technical Debt" section — this register is

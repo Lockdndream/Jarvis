@@ -22,6 +22,46 @@ MAX_TOOL_CALLS = 5
 def _supervisor_enabled():
     return os.environ.get("JARVIS_SUPERVISOR_ENABLED", "1") == "1"
 
+
+# Control Center dashboard support (additive). Same set-once-at-startup,
+# None-safe hook pattern as app/attention_manager.py's _broadcast_hook and
+# app/voice_session_manager.py's — the supervisor's tool-calling loop
+# previously broadcast nothing at all; a tool call was only visible in the
+# log line right below and in the `conversations` table (see
+# _persist_tool_call), neither of which is a live stream. Both new event
+# types below are observable-execution-only (tool name, arguments, a
+# truncated *result* string) — never the LLM's own reasoning/explanation
+# text, which this codebase never captures in the first place (there is
+# no "reason" field anywhere in this module to broadcast). Uses
+# ConnectionManager.broadcast_observers() — the dashboard-only fan-out —
+# not the general broadcast() every phone/PWA connection also receives:
+# a real regression found and fixed while building this feature, where
+# the general broadcast() interleaved these frames with other
+# connections' own expected request/response frames and broke existing
+# protocol tests that assume strict per-connection frame ordering.
+_broadcast_hook = None
+
+
+def set_broadcast_hook(conn_manager) -> None:
+    global _broadcast_hook
+    _broadcast_hook = conn_manager
+
+
+async def _broadcast(event_type: str, payload: dict) -> None:
+    # Phase 4 (Control Center hardening): checked *before* db.save_event,
+    # not just before the broadcast_observers() call inside it — with no
+    # dashboard open, this whole function (including the sqlite write)
+    # is a real, avoidable per-turn/per-tool-call cost on the phone-
+    # facing hot path for a subsystem nobody is currently watching.
+    if _broadcast_hook is None or not _broadcast_hook.has_observers():
+        return
+    try:
+        content = json.dumps(payload)
+        db.save_event(event_type, content)
+        await _broadcast_hook.broadcast_observers({"type": event_type, "timestamp": db.utcnow(), "content": content})
+    except Exception as e:
+        logger.warning("%s broadcast failed (state unaffected): %s", event_type, e)
+
 SYSTEM_PROMPT = """You are Jarvis, a laptop-resident supervisor agent. You help the user supervise tasks running on their laptop.
 
 You have access to a set of bounded tools. Use them to answer the user's questions and execute their requests.
@@ -94,12 +134,33 @@ class Supervisor:
         if not conversation_id:
             conversation_id = f"conv_{uuid.uuid4().hex[:12]}"
 
+        # Control Center dashboard support (additive): "a turn started" /
+        # "a turn completed" bracket every path through this method
+        # (fast path, deferral, bound command, deterministic command, or
+        # the full LLM tool-calling loop) with exactly the observable
+        # facts already computed at each return point below — never the
+        # LLM's reasoning, which this module doesn't retain anywhere.
+        await _broadcast("supervisor_turn_started", {
+            "conversation_id": conversation_id,
+            "user_message": user_message[:500],
+            "bound_attention_request_id": bound_attention_request_id,
+        })
+
+        async def _emit_turn(response_text: str, tool_call_count: int = 0) -> dict:
+            await _broadcast("supervisor_turn", {
+                "conversation_id": conversation_id,
+                "user_message": user_message[:500],
+                "response": response_text[:1000],
+                "tool_call_count": tool_call_count,
+            })
+            return {"response": response_text, "conversation_id": conversation_id}
+
         # Fast path for deterministic status questions
         fast = _fast_path(user_message)
         if fast:
             _persist_conversation(conversation_id, "user", user_message)
             _persist_conversation(conversation_id, "assistant", fast)
-            return {"response": fast, "conversation_id": conversation_id}
+            return await _emit_turn(fast)
 
         # Milestone 8 Phase 18: deterministic deferral phrases ("Come back
         # in 15 minutes", "remind me tomorrow morning") are checked before
@@ -110,7 +171,7 @@ class Supervisor:
         if deferred:
             _persist_conversation(conversation_id, "user", user_message)
             _persist_conversation(conversation_id, "assistant", deferred)
-            return {"response": deferred, "conversation_id": conversation_id}
+            return await _emit_turn(deferred)
 
         # Milestone 8 Phase 12: when this turn came from a voice session
         # bound to a specific AttentionRequest, resolve answer/approve/
@@ -122,7 +183,7 @@ class Supervisor:
             if bound:
                 _persist_conversation(conversation_id, "user", user_message)
                 _persist_conversation(conversation_id, "assistant", bound)
-                return {"response": bound, "conversation_id": conversation_id}
+                return await _emit_turn(bound)
 
         # Milestone 7 Phase 10: deterministic voice/text command resolution
         # for "Answer B", "Approve it", "Reject it", "Stop it" and close
@@ -133,7 +194,7 @@ class Supervisor:
         if deterministic:
             _persist_conversation(conversation_id, "user", user_message)
             _persist_conversation(conversation_id, "assistant", deterministic)
-            return {"response": deterministic, "conversation_id": conversation_id}
+            return await _emit_turn(deterministic)
 
         # Load conversation history
         history = _load_conversation(conversation_id, max_turns=10)
@@ -178,6 +239,13 @@ class Supervisor:
                         logger.info("Tool call #%d: %s(%s)", tool_call_count, name, func["arguments"][:100])
                         result = await self.tools.call(name, args)
                         _persist_tool_call(conversation_id, name, args, result)
+                        await _broadcast("supervisor_tool_call", {
+                            "conversation_id": conversation_id,
+                            "sequence": tool_call_count,
+                            "tool": name,
+                            "args": args,
+                            "result_summary": result[:300] if isinstance(result, str) else str(result)[:300],
+                        })
 
                         messages.append({
                             "role": "tool",
@@ -203,7 +271,7 @@ class Supervisor:
         _persist_conversation(conversation_id, "user", user_message)
         _persist_conversation(conversation_id, "assistant", final_content)
 
-        return {"response": final_content, "conversation_id": conversation_id}
+        return await _emit_turn(final_content, tool_call_count=tool_call_count)
 
     def _build_tool_definitions(self) -> list[dict]:
         definitions = self.tools.list_definitions()

@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Jarvis Control Center</title>
+<link rel="stylesheet" href="/static/dashboard/dashboard.css">
+</head>
+<body>
+
+<header class="cc-header">
+  <div class="cc-brand">
+    <span class="cc-brand-mark" id="brand-pulse"></span>
+    <h1>JARVIS <span class="cc-brand-sub">CONTROL&nbsp;CENTER</span></h1>
+  </div>
+  <div class="cc-header-stats">
+    <div class="cc-header-stat">
+      <span class="cc-header-stat-label">uptime</span>
+      <span class="cc-header-stat-value" id="stat-uptime">—</span>
+    </div>
+    <div class="cc-header-stat">
+      <span class="cc-header-stat-label">connections</span>
+      <span class="cc-header-stat-value" id="stat-connections">—</span>
+    </div>
+    <div class="cc-header-stat">
+      <span class="cc-header-stat-label">dashboard link</span>
+      <span class="cc-header-stat-value" id="stat-ws-state">connecting…</span>
+    </div>
+    <div class="cc-header-stat">
+      <span class="cc-header-stat-label">clock</span>
+      <span class="cc-header-stat-value" id="stat-clock">—</span>
+    </div>
+  </div>
+</header>
+
+<main class="cc-grid">
+
+  <!-- 1. SYSTEM HEALTH -->
+  <section class="cc-panel cc-area-health" aria-label="System Health">
+    <h2 class="cc-panel-title">System Health</h2>
+    <div class="cc-health-row" id="health-row"><!-- lights injected --></div>
+  </section>
+
+  <!-- 6. EVENT TIMELINE (signature element) -->
+  <section class="cc-panel cc-area-timeline" aria-label="Event Timeline">
+    <h2 class="cc-panel-title">Event Timeline <span class="cc-panel-sub">wake&nbsp;→&nbsp;voice&nbsp;→&nbsp;supervisor&nbsp;→&nbsp;llm&nbsp;→&nbsp;tool&nbsp;→&nbsp;opencode&nbsp;→&nbsp;complete&nbsp;→&nbsp;response&nbsp;→&nbsp;tts</span></h2>
+    <div class="cc-timeline" id="event-timeline"><!-- nodes injected --></div>
+  </section>
+
+  <!-- 2. LIVE ACTIVITY FEED -->
+  <section class="cc-panel cc-area-feed" aria-label="Live Activity Feed">
+    <h2 class="cc-panel-title">Live Activity Feed</h2>
+    <div class="cc-feed" id="activity-feed"></div>
+  </section>
+
+  <!-- 3. CURRENT CONVERSATION -->
+  <section class="cc-panel cc-area-conversation" aria-label="Current Conversation">
+    <h2 class="cc-panel-title">Current Conversation</h2>
+    <div class="cc-conversation" id="current-conversation">
+      <p class="cc-empty">No active turn yet.</p>
+    </div>
+  </section>
+
+  <!-- 7. DECISION STREAM -->
+  <section class="cc-panel cc-area-decisions" aria-label="Decision Stream">
+    <h2 class="cc-panel-title">Decision Stream</h2>
+    <div class="cc-decisions" id="decision-stream">
+      <p class="cc-empty">No decisions yet.</p>
+    </div>
+  </section>
+
+  <!-- 4. RUNNING TASKS -->
+  <section class="cc-panel cc-area-tasks" aria-label="Running Tasks">
+    <h2 class="cc-panel-title">Tasks</h2>
+    <div class="cc-task-board" id="task-board">
+      <div class="cc-task-col" data-col="running"><h3>Running <span class="cc-count" id="count-running">0</span></h3><div class="cc-task-list" id="list-running"></div></div>
+      <div class="cc-task-col" data-col="queued"><h3>Queued <span class="cc-count" id="count-queued">0</span></h3><div class="cc-task-list" id="list-queued"></div></div>
+      <div class="cc-task-col" data-col="completed"><h3>Completed <span class="cc-count" id="count-completed">0</span></h3><div class="cc-task-list" id="list-completed"></div></div>
+      <div class="cc-task-col" data-col="failed"><h3>Failed <span class="cc-count" id="count-failed">0</span></h3><div class="cc-task-list" id="list-failed"></div></div>
+      <div class="cc-task-col" data-col="cancelled"><h3>Cancelled <span class="cc-count" id="count-cancelled">0</span></h3><div class="cc-task-list" id="list-cancelled"></div></div>
+    </div>
+  </section>
+
+  <!-- 5. ATTENTION CENTER -->
+  <section class="cc-panel cc-area-attention" aria-label="Attention Center">
+    <h2 class="cc-panel-title">Attention Center <span class="cc-badge" id="attention-count">0</span></h2>
+    <div class="cc-attention-list" id="attention-list">
+      <p class="cc-empty">Nothing needs attention.</p>
+    </div>
+  </section>
+
+  <!-- 8. CONNECTIVITY MONITOR -->
+  <section class="cc-panel cc-area-connectivity" aria-label="Connectivity Monitor">
+    <h2 class="cc-panel-title">Connectivity Monitor</h2>
+    <div class="cc-kv-grid" id="connectivity-grid"></div>
+  </section>
+
+  <!-- 9. BACKGROUND SERVICES -->
+  <section class="cc-panel cc-area-services" aria-label="Background Services">
+    <h2 class="cc-panel-title">Background Services</h2>
+    <div class="cc-service-list" id="service-list"></div>
+  </section>
+
+  <!-- 10. RECENT ALERTS -->
+  <section class="cc-panel cc-area-alerts" aria-label="Recent Alerts">
+    <h2 class="cc-panel-title">Recent Alerts</h2>
+    <div class="cc-alerts" id="alerts-list">
+      <p class="cc-empty">No alerts yet.</p>
+    </div>
+  </section>
+
+</main>
+
+<script src="/static/dashboard/dashboard.js"></script>
+</body>
+</html>

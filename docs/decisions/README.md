@@ -114,3 +114,6 @@ Every ADR uses the same section structure, in this order:
 | [ADR-013](ADR-013-standing-delegation-workforce-cost-policy.md) | Standing Delegation-Workforce Cost Policy | Accepted |
 | [ADR-014](ADR-014-unified-websocket-authentication.md) | Unified WebSocket Authentication (Short-Lived Signed Tokens) | Accepted |
 | [ADR-015](ADR-015-android-attention-widget.md) | Android Attention Widget | Accepted |
+| [ADR-016](ADR-016-android-voice-infrastructure.md) | Android Voice Infrastructure | Accepted |
+| [ADR-017](ADR-017-production-wakeword-foundation.md) | Production Wake-Word Foundation | Accepted |
+| [ADR-018](ADR-018-jarvis-control-center-observability-architecture.md) | Jarvis Control Center — Observability Architecture | Accepted |

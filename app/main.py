@@ -3,6 +3,7 @@ import logging
 import os
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 
@@ -34,15 +35,18 @@ from .database import (
     set_setting,
     get_unresolved_attention_requests,
     get_attention_request,
+    get_recent_tasks,
 )
 from .executor import Executor
 from .task_manager import TaskManager
 from .integrations.opencode_supervisor import OpenCodeSupervisor
 from .supervisor.supervisor import Supervisor
+from .supervisor import supervisor as supervisor_module
 from . import push as push_module
 from .attention_scheduler import AttentionScheduler
 from . import attention_manager
 from .voice_session_manager import VoiceSessionManager, VoiceSessionError
+from . import voice_session_manager as voice_session_manager_module
 from .voice_session_reaper import VoiceSessionReaper
 from .integrations.ws_tokens import issue_ws_token, verify_ws_token
 
@@ -65,6 +69,17 @@ attention_scheduler = AttentionScheduler(conn_manager)
 voice_session_manager = VoiceSessionManager(supervisor)
 voice_session_reaper = VoiceSessionReaper(voice_session_manager, conn_manager)
 attention_manager.set_broadcast_hook(conn_manager)
+# Control Center dashboard support (additive) — same None-safe
+# set-once-at-startup hook as attention_manager's, just above.
+supervisor_module.set_broadcast_hook(conn_manager)
+voice_session_manager_module.set_broadcast_hook(conn_manager)
+
+# Server process start time, for the dashboard's uptime display
+# (Connectivity Monitor / System Health). Set at import time — the
+# handful of milliseconds before lifespan's startup finishes is not
+# meaningfully different from "server start" for a human glancing at an
+# uptime counter during a demo.
+_SERVER_START_TIME = datetime.now(timezone.utc)
 
 
 @asynccontextmanager
@@ -113,6 +128,15 @@ async def service_worker():
     # Served from the root path (not /static/sw.js) so its default scope is
     # "/" — a service worker's scope is the directory it's served from.
     return FileResponse(os.path.join(STATIC_DIR, "sw.js"), media_type="application/javascript")
+
+
+@app.get("/dashboard")
+async def dashboard():
+    # Jarvis Control Center: a desktop-only operator console, entirely
+    # separate from the phone-facing PWA served at "/". Its JS/CSS live
+    # under /static/dashboard/ (already reachable via the /static mount
+    # above) — this route just serves the page shell.
+    return FileResponse(os.path.join(STATIC_DIR, "dashboard", "index.html"))
 
 
 def _require_api_token(authorization: str | None = Header(default=None)) -> None:
@@ -317,6 +341,71 @@ async def api_get_attention(attention_request_id: str):
     }
 
 
+@app.get("/api/dashboard/snapshot")
+async def dashboard_snapshot(_=Depends(_require_api_token)):
+    """One-shot full-state read for the Jarvis Control Center (deliberately
+    the *only* new REST endpoint this feature adds). It
+    aggregates data every panel needs for its first paint, entirely from
+    functions that already existed for other callers (the same ones /ws
+    already sends piecemeal on connect, plus get_recent_tasks(), which no
+    existing endpoint exposes with all statuses/both task kinds together).
+    Ongoing updates after first paint come from the existing WebSocket
+    broadcast stream (see /ws), not from polling this endpoint — a
+    dashboard client fetches this once, then listens.
+
+    Gated by the same _require_api_token dependency as every other real
+    endpoint in this file (Control Center hardening, Phase 2) — this was
+    previously the one exception, reachable with no auth at all even when
+    JARVIS_API_TOKEN was set.
+
+    The "tasks" field is an explicit allow-list (Phase 3), not a raw
+    get_recent_tasks() passthrough — same shape /api/task/{task_id}
+    already deliberately limits itself to (task_id, name, status,
+    started_at, completed_at), never the raw command/instruction text.
+    dashboard.js's seedTasks() only ever reads exactly these five fields.
+    """
+    oc_status = await opencode_supervisor.get_status()
+    uptime_seconds = int((datetime.now(timezone.utc) - _SERVER_START_TIME).total_seconds())
+    return {
+        "server": {
+            "started_at": _SERVER_START_TIME.isoformat().replace("+00:00", "Z"),
+            "uptime_seconds": uptime_seconds,
+        },
+        "connectivity": conn_manager.get_stats(),
+        "opencode": {
+            "server_alive": oc_status["server_alive"],
+            "server_url": oc_status["server_url"],
+        },
+        "tasks": [
+            {
+                "task_id": t["task_id"],
+                "name": t["name"],
+                "status": t["status"],
+                "started_at": t["started_at"],
+                "completed_at": t["completed_at"],
+            }
+            for t in get_recent_tasks(50)
+        ],
+        "opencode_running_tasks": oc_status["running_tasks"],
+        "pending_questions": task_manager.get_pending_questions_info(),
+        "pending_notifications": get_pending_notifications(),
+        "pending_attention": [
+            {
+                "attention_request_id": a["attention_request_id"],
+                "attention_type": a["attention_type"],
+                "status": a["status"],
+                "summary": a["summary"],
+                "task_id": a["task_id"],
+                "conversation_id": a["conversation_id"],
+                "urgency": a["urgency"],
+                "deferred_until": a["deferred_until"],
+            }
+            for a in get_unresolved_attention_requests()
+        ],
+        "recent_events": get_recent_events(200),
+    }
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     close_code = _resolve_ws_close_code(ws)
@@ -448,6 +537,57 @@ async def websocket_endpoint(ws: WebSocket):
                 # build on, not routing logic itself. No reply is sent
                 # (fire-and-forget, matching the heartbeat frame's shape).
                 conn_manager.set_device_status(ws, data)
+                save_event("device_status_update", json.dumps({
+                    "device_id": data.get("device_id"),
+                    "capabilities": data.get("capabilities"),
+                    "pairing_state": data.get("pairing_state"),
+                }))
+                # Control Center dashboard support (additive): this was
+                # previously stored (above) but never broadcast, so no
+                # observer ever learned a device_status arrived.
+                # broadcast_observers(), never the general broadcast() —
+                # a real regression found and fixed while building this:
+                # fanning a new event type into the general broadcast()
+                # reached every ordinary protocol connection too and
+                # interleaved with their own expected replies, breaking
+                # existing multi-connection tests. Dashboard-only
+                # connections opt in via "register_observer" below;
+                # Android/PWA never send that, so they're never affected.
+                await conn_manager.broadcast_observers({
+                    "type": "device_status_update",
+                    "timestamp": _now(),
+                    "device_id": data.get("device_id"),
+                    "capabilities": data.get("capabilities"),
+                    "pairing_state": data.get("pairing_state"),
+                })
+                continue
+
+            if data.get("type") == "heartbeat":
+                # CompanionWebSocketClient sends {"type":"heartbeat"} every
+                # 30s; previously unhandled here (fell through to no-op).
+                # Recording arrival time is the Connectivity Monitor's
+                # "last heartbeat" signal — no reply is sent, unchanged
+                # behavior for the Android client either way.
+                conn_manager.record_heartbeat(ws)
+                continue
+
+            if data.get("type") == "ping":
+                # Control Center dashboard support only (Android/PWA never
+                # send this): a minimal echo for the dashboard to measure
+                # its own WebSocket round-trip latency honestly, rather
+                # than fabricate a number.
+                await ws.send_text(json.dumps({"type": "pong", "t": data.get("t")}))
+                continue
+
+            if data.get("type") == "register_observer":
+                # Control Center dashboard support only. Opts this
+                # connection into ConnectionManager.broadcast_observers()
+                # — the handful of new dashboard-only event types
+                # (Supervisor tool calls/turns, the voice-session
+                # lifecycle, device_status echoes) that must never reach
+                # an ordinary phone/PWA connection. No reply is sent;
+                # unrecognized by Android/PWA (they never send it).
+                conn_manager.mark_observer(ws)
                 continue
 
             if data.get("type") == "voice_session_open":

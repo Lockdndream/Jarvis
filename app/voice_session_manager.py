@@ -13,6 +13,7 @@ handler) sends it to the browser, which speaks it with the existing M7
 browser TTS. This module never talks to speech APIs directly — those stay
 entirely client-side, unchanged since Milestone 7.
 """
+import asyncio
 import json
 import logging
 import uuid
@@ -81,6 +82,71 @@ class VoiceSessionError(Exception):
     pass
 
 
+# Control Center dashboard support (additive). Same set-once-at-startup,
+# None-safe hook pattern as app/attention_manager.py's _broadcast_hook —
+# VoiceSessionManager previously broadcast nothing at all (every state
+# transition below was visible only in the log and to the single
+# WebSocket connection that happened to be driving it), so there was no
+# existing plumbing to piggyback on for a dashboard-observable voice
+# pipeline. Uses ConnectionManager.broadcast_observers() — the dashboard-
+# only fan-out, never the general broadcast() every protocol connection
+# receives — so an ordinary phone/PWA connection never sees this new
+# "voice_session_lifecycle" event type at all (a real regression found
+# and fixed while building this: the general broadcast() interleaved
+# these frames with other connections' own expected request/response
+# frames, breaking existing multi-connection protocol tests).
+_broadcast_hook = None
+
+
+def set_broadcast_hook(conn_manager) -> None:
+    global _broadcast_hook
+    _broadcast_hook = conn_manager
+
+
+async def _broadcast_lifecycle(phase: str, session: dict, **extra) -> None:
+    # Phase 4 (Control Center hardening): checked before db.save_event,
+    # not just before broadcast_observers() inside it -- with no
+    # dashboard open, this is an avoidable sqlite write on every voice
+    # turn for a subsystem nobody is currently watching.
+    if _broadcast_hook is None or not _broadcast_hook.has_observers():
+        return
+    payload = {
+        "voice_session_id": session.get("voice_session_id"),
+        "conversation_id": session.get("conversation_id"),
+        "attention_request_id": session.get("attention_request_id"),
+        "phase": phase,
+        **extra,
+    }
+    try:
+        content = json.dumps(payload)
+        db.save_event("voice_session_lifecycle", content)
+        await _broadcast_hook.broadcast_observers({
+            "type": "voice_session_lifecycle", "timestamp": db.utcnow(), "content": content,
+        })
+    except Exception as e:
+        logger.warning("voice_session_lifecycle broadcast failed (state unaffected): %s", e)
+
+
+def _schedule_lifecycle(phase: str, session: dict, **extra) -> None:
+    """Fire-and-forget variant for open_session/close_session/fail_session,
+    which are synchronous methods (unchanged signatures — many existing
+    call sites, including plain synchronous unit tests with no running
+    event loop, call them without `await`). Skips entirely when no hook is
+    registered (the common unit-test case). Checks for a running loop
+    *before* constructing the `_broadcast_lifecycle(...)` coroutine object
+    (rather than constructing it and letting asyncio.create_task fail) so
+    a synchronous caller with no loop never leaves an unawaited coroutine
+    behind — that leftover construct-then-fail pattern is exactly what
+    produces Python's "coroutine was never awaited" RuntimeWarning."""
+    if _broadcast_hook is None or not _broadcast_hook.has_observers():
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return  # no running event loop (e.g. a synchronous unit test) — skip
+    loop.create_task(_broadcast_lifecycle(phase, session, **extra))
+
+
 class VoiceSessionManager:
     def __init__(self, supervisor):
         self._supervisor = supervisor
@@ -140,6 +206,7 @@ class VoiceSessionManager:
         )
         session = db.get_voice_session(voice_session_id)
         session["greeting"] = _build_greeting(bound_row) if bound_row else None
+        _schedule_lifecycle("opened", session)
         return session
 
     async def handle_transcript(self, voice_session_id: str, transcript: str) -> dict:
@@ -156,6 +223,8 @@ class VoiceSessionManager:
             # Never process both — the caller should discard this one.
             raise VoiceSessionError(f"Voice session {voice_session_id} is already processing a turn")
 
+        await _broadcast_lifecycle("transcript_received", session, transcript=transcript[:500])
+
         bound_attention_id = session.get("attention_request_id")
         if bound_attention_id:
             row = db.get_attention_request(bound_attention_id)
@@ -166,8 +235,10 @@ class VoiceSessionManager:
                 self._transition(voice_session_id, STATE_WAITING)
                 self._transition(voice_session_id, STATE_LISTENING)
                 status_word = row["status"] if row else "no longer available"
+                response = f"That item is already {status_word} — nothing more to do there."
+                await _broadcast_lifecycle("turn_completed", session, response=response, voice_session_state=STATE_LISTENING)
                 return {
-                    "response": f"That item is already {status_word} — nothing more to do there.",
+                    "response": response,
                     "conversation_id": session["conversation_id"],
                     "attention_request_id": None,
                     "voice_session_state": STATE_LISTENING,
@@ -203,6 +274,10 @@ class VoiceSessionManager:
             post_row = db.get_attention_request(bound_attention_id)
             if post_row and post_row["status"] == "deferred":
                 self._transition(voice_session_id, STATE_DEFERRED)
+                await _broadcast_lifecycle(
+                    "turn_completed", session,
+                    response=result.get("response", "")[:500], voice_session_state=STATE_DEFERRED,
+                )
                 return {
                     "response": result.get("response", ""),
                     "conversation_id": result.get("conversation_id") or session["conversation_id"],
@@ -223,6 +298,10 @@ class VoiceSessionManager:
         # without inventing a new WS message type.
         self._transition(voice_session_id, STATE_WAITING)
         self._transition(voice_session_id, STATE_LISTENING)
+        await _broadcast_lifecycle(
+            "turn_completed", session,
+            response=result.get("response", "")[:500], voice_session_state=STATE_LISTENING,
+        )
         return {
             "response": result.get("response", ""),
             "conversation_id": result.get("conversation_id") or session["conversation_id"],
@@ -252,6 +331,8 @@ class VoiceSessionManager:
             # Release the TD-002 lease so a future session (this device or
             # another) can bind to the same AttentionRequest again.
             db.release_voice_session_lease(session["attention_request_id"], voice_session_id)
+        if ok:
+            _schedule_lifecycle("closed", session, reason=reason)
         return ok
 
     def reap_idle_sessions(self, max_idle_seconds: int, now: str | None = None) -> list[dict]:
@@ -285,4 +366,6 @@ class VoiceSessionManager:
             logger.info("voice session failed: id=%s", voice_session_id)
             if session and session.get("attention_request_id"):
                 db.release_voice_session_lease(session["attention_request_id"], voice_session_id)
+            if session:
+                _schedule_lifecycle("failed", session)
         return ok

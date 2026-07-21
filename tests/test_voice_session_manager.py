@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import app.database as db
 from app import attention_manager as am
+import app.voice_session_manager as voice_session_manager_module
 from app.voice_session_manager import VoiceSessionManager, VoiceSessionError
 
 
@@ -478,3 +479,87 @@ def test_unbound_sessions_never_touch_any_lease():
     b = vsm.open_session("c2")
     assert a["attention_request_id"] is None
     assert b["attention_request_id"] is None  # no lease contention for unbound sessions
+
+
+# ── Control Center hardening: set_broadcast_hook / _broadcast_lifecycle ─
+#
+# Self-contained: each test explicitly sets its own hook rather than
+# relying on app.main's module-level import-time wiring (see
+# tests/conftest.py's autouse fixture, which resets this hook to None
+# around every test for the same reason).
+
+class _FakeObserverConnManager:
+    def __init__(self, observers=True):
+        self._observers = observers
+        self.broadcast_calls = []
+
+    def has_observers(self):
+        return self._observers
+
+    async def broadcast_observers(self, data):
+        self.broadcast_calls.append(data)
+
+
+@pytest.mark.asyncio
+async def test_broadcast_lifecycle_is_noop_with_no_hook():
+    voice_session_manager_module._broadcast_hook = None
+    events_before = len(db.get_recent_events(50))
+
+    await voice_session_manager_module._broadcast_lifecycle("opened", {"voice_session_id": "vs1"})
+
+    assert len(db.get_recent_events(50)) == events_before
+
+
+@pytest.mark.asyncio
+async def test_broadcast_lifecycle_is_noop_when_hook_set_but_no_observers():
+    """Phase 4 (performance): zero observers means zero extra
+    db.save_event writes on the voice-turn hot path, not just zero
+    broadcast() sends."""
+    fake = _FakeObserverConnManager(observers=False)
+    voice_session_manager_module.set_broadcast_hook(fake)
+    events_before = len(db.get_recent_events(50))
+
+    await voice_session_manager_module._broadcast_lifecycle("transcript_received", {"voice_session_id": "vs1"})
+
+    assert len(db.get_recent_events(50)) == events_before
+    assert fake.broadcast_calls == []
+
+
+@pytest.mark.asyncio
+async def test_broadcast_lifecycle_persists_and_forwards_when_observers_present():
+    fake = _FakeObserverConnManager(observers=True)
+    voice_session_manager_module.set_broadcast_hook(fake)
+    events_before = len(db.get_recent_events(50))
+
+    await voice_session_manager_module._broadcast_lifecycle("turn_completed", {"voice_session_id": "vs1"}, response="hi")
+
+    assert len(db.get_recent_events(50)) == events_before + 1
+    assert len(fake.broadcast_calls) == 1
+    assert fake.broadcast_calls[0]["type"] == "voice_session_lifecycle"
+
+
+def test_schedule_lifecycle_skips_when_no_observers_even_with_running_loop():
+    """_schedule_lifecycle is the fire-and-forget variant open_session/
+    close_session call synchronously -- it must not even schedule the
+    task when nobody is observing, not just no-op inside the task."""
+    import asyncio
+
+    fake = _FakeObserverConnManager(observers=False)
+    voice_session_manager_module.set_broadcast_hook(fake)
+
+    async def run():
+        tasks_before = len(asyncio.all_tasks())
+        voice_session_manager_module._schedule_lifecycle("opened", {"voice_session_id": "vs1"})
+        # No task should have been created at all.
+        assert len(asyncio.all_tasks()) == tasks_before
+
+    asyncio.run(run())
+
+
+def test_schedule_lifecycle_is_safe_with_no_running_loop():
+    """Synchronous callers (e.g. a plain unit test with no event loop)
+    must not raise -- this is the existing, unchanged guarantee; confirm
+    it still holds now that has_observers() is checked first."""
+    fake = _FakeObserverConnManager(observers=True)
+    voice_session_manager_module.set_broadcast_hook(fake)
+    voice_session_manager_module._schedule_lifecycle("opened", {"voice_session_id": "vs1"})  # must not raise
