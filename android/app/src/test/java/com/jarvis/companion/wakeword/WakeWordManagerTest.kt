@@ -286,6 +286,27 @@ class WakeWordManagerTest {
     }
 
     @Test
+    fun `wake word self-heals from a permanent audio focus loss with no voice session involved`() {
+        // Milestone 9B.10 release-candidate real-device finding: found
+        // stuck for ~8.6 hours on a real device (manager_state=
+        // PAUSED_AUDIO_FOCUS, audio_record_state=NONE, zero detections)
+        // with no VoiceSession ever having opened or closed --
+        // resumeAfterVoiceSession()'s existing re-request fix never runs
+        // in this case, since nothing ever calls it. Not wrapped in
+        // runTest -- the capture loop's pause-polling retry runs on a
+        // real Dispatchers.Default thread in real time, not virtual time.
+        val audioFocus = FakeWakeWordAudioFocus()
+        val m = manager(audioFocus = audioFocus)
+        m.start()
+        waitUntil { audioFocus.requested }
+
+        audioFocus.simulateFocusLost() // permanent loss; no regain callback will ever follow
+        waitUntil { m.state.value == WakeWordManager.State.PAUSED_AUDIO_FOCUS }
+
+        waitUntil(timeoutMs = 8000) { m.state.value == WakeWordManager.State.LISTENING }
+    }
+
+    @Test
     fun `voice session pause while audio focus is fine resumes into LISTENING`() = runTest {
         val audioFocus = FakeWakeWordAudioFocus()
         val m = manager(audioFocus = audioFocus)

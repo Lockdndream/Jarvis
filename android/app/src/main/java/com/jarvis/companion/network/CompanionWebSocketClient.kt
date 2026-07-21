@@ -484,6 +484,32 @@ class CompanionWebSocketClient(
             val fromHttpStatus = response?.code?.let { DisconnectClassifier.classifyClose(it) }
                 ?.takeIf { it != DisconnectReason.UNKNOWN }
             val classified = fromHttpStatus ?: DisconnectClassifier.classifyFailure(t)
+            // Release-candidate real-device finding: app/main.py's
+            // WS_CLOSE_TOKEN_INVALID/EXPIRED path does ws.accept() then
+            // ws.close(code=...) immediately afterward (ADR-014) -- a
+            // real backend restart (this app's WS-token signing secret
+            // falls back to a fresh random one every process start when
+            // JARVIS_WS_TOKEN_SECRET isn't set) makes every cached token's
+            // *signature* invalid instantly, regardless of its own exp
+            // claim. Reproduced on a real device: that accept-then-close
+            // happens fast enough that OkHttp never delivers it to
+            // onClosed(code, reason) at all -- it surfaces here, in
+            // onFailure, as a bare SocketException, which classifies as
+            // plain NETWORK (needsTokenRefresh=false), so the cached
+            // (permanently invalid) token kept being retried for 10+
+            // cycles until its own unrelated expiry-based safety margin
+            // eventually forced a refresh -- up to the token's full ~15
+            // minute lifetime after any backend restart. connectedSinceMs
+            // is only ever set by onOpen, so null here means this
+            // generation's connection never actually opened before
+            // failing -- a real, already-open session dropping later
+            // would have set it first. Invalidating defensively on that
+            // signal is harmless even when the real cause is a genuine
+            // network outage (getValidToken()'s own REST call simply
+            // fails too, already handled by connect()'s existing
+            // token-fetch-failure path) but closes this real gap when the
+            // cause is a signature mismatch the client can't otherwise see.
+            if (connectedSinceMs == null) tokenClient?.invalidateCache()
             telemetry.record(
                 TelemetryRecorder.WS_DISCONNECTED,
                 "failure=${t.javaClass.simpleName}:${t.message} httpStatus=${response?.code} classified=$classified generation=$generation",

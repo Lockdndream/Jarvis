@@ -37,6 +37,7 @@ You have access to a set of bounded tools. Use them to answer the user's questio
 8. When the user says "Approve it" or "Reject it", use resolve_permission with the appropriate decision.
 9. When the user says "Stop it" and there is exactly one cancellable task, use cancel_task.
 10. When the user provides a follow-up instruction about an active task, use send_opencode_instruction.
+11. Your responses are spoken aloud by text-to-speech, never displayed as formatted text. Never use markdown (no **bold**, no #headings, no bullet lists, no code fences) — plain spoken sentences only.
 
 ## Available Tools
 Use the provided function definitions to interact with Jarvis services.
@@ -158,33 +159,43 @@ class Supervisor:
         tool_call_count = 0
         final_content = None
 
-        while tool_call_count < MAX_TOOL_CALLS:
-            llm_response = await self._llm.chat_completion(messages, tools=tool_defs)
+        try:
+            while tool_call_count < MAX_TOOL_CALLS:
+                llm_response = await self._llm.chat_completion(messages, tools=tool_defs)
 
-            if llm_response.get("tool_calls"):
-                tool_call_count += 1
-                messages.append(llm_response)
+                if llm_response.get("tool_calls"):
+                    tool_call_count += 1
+                    messages.append(llm_response)
 
-                for tc in llm_response["tool_calls"]:
-                    func = tc["function"]
-                    name = func["name"]
-                    try:
-                        args = json.loads(func["arguments"])
-                    except json.JSONDecodeError:
-                        args = {}
+                    for tc in llm_response["tool_calls"]:
+                        func = tc["function"]
+                        name = func["name"]
+                        try:
+                            args = json.loads(func["arguments"])
+                        except json.JSONDecodeError:
+                            args = {}
 
-                    logger.info("Tool call #%d: %s(%s)", tool_call_count, name, func["arguments"][:100])
-                    result = await self.tools.call(name, args)
-                    _persist_tool_call(conversation_id, name, args, result)
+                        logger.info("Tool call #%d: %s(%s)", tool_call_count, name, func["arguments"][:100])
+                        result = await self.tools.call(name, args)
+                        _persist_tool_call(conversation_id, name, args, result)
 
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc["id"],
-                        "content": result,
-                    })
-            else:
-                final_content = llm_response.get("content") or "Done."
-                break
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "content": result,
+                        })
+                else:
+                    final_content = llm_response.get("content") or "Done."
+                    break
+        except Exception:
+            # A network failure calling the LLM here must never propagate
+            # past this point: main.py's websocket loop has no per-message
+            # exception handling, so an uncaught error here tears down the
+            # entire connection (see Milestone 9B.10 RC finding — a real
+            # ConnectTimeout to the LLM API killed the WS mid-tool-call,
+            # even though a tool call already in flight had succeeded).
+            logger.exception("LLM tool-call loop failed for conversation %s", conversation_id)
+            final_content = "I ran into a problem reaching my reasoning engine. If I was already working on something, ask me for its status."
 
         if final_content is None:
             final_content = "I've reached the maximum number of actions I can take in one response. Please let me know what you'd like to do next."

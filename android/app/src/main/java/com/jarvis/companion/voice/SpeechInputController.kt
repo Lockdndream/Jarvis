@@ -108,11 +108,20 @@ internal class AndroidSpeechRecognizerEngine(
 ) : SpeechInputController.SpeechRecognizerEngine {
 
     private var recognizer: SpeechRecognizer? = null
+    private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
 
     override fun isRecognitionAvailable(): Boolean =
         SpeechRecognizer.isRecognitionAvailable(context)
 
     override fun startListening(onResultCallback: (String) -> Unit, onErrorCallback: (String) -> Unit) {
+        attemptListen(onResultCallback, onErrorCallback, hasRetried = false)
+    }
+
+    private fun attemptListen(
+        onResultCallback: (String) -> Unit,
+        onErrorCallback: (String) -> Unit,
+        hasRetried: Boolean,
+    ) {
         destroyExisting()
 
         val sr = SpeechRecognizer.createSpeechRecognizer(context)
@@ -148,6 +157,20 @@ internal class AndroidSpeechRecognizerEngine(
             }
 
             override fun onError(errorCode: Int) {
+                // Milestone 9B.10 RC finding: ERROR_CLIENT observed
+                // specifically launching via the lock-screen full-screen-
+                // intent path, correlated with the screen still turning on
+                // / unlocking when startListening() fires. Android's own
+                // ERROR_CLIENT is documented as often transient. One
+                // retry only -- never loop, so a genuinely broken device
+                // still surfaces the error instead of hanging silently.
+                if (errorCode == SpeechRecognizer.ERROR_CLIENT && !hasRetried) {
+                    destroyExisting()
+                    mainHandler.postDelayed({
+                        attemptListen(onResultCallback, onErrorCallback, hasRetried = true)
+                    }, RETRY_DELAY_MS)
+                    return
+                }
                 onErrorCallback(errorCodeToMessage(errorCode))
                 destroyExisting()
             }
@@ -175,5 +198,9 @@ internal class AndroidSpeechRecognizerEngine(
     private fun destroyExisting() {
         recognizer?.destroy()
         recognizer = null
+    }
+
+    companion object {
+        private const val RETRY_DELAY_MS = 400L
     }
 }

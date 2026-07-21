@@ -11,6 +11,21 @@ object VoiceSessionParser {
 
     fun isVoiceSessionEventType(type: String): Boolean = type in EVENT_TYPES
 
+    // Milestone 9B.10 release-candidate real-device finding:
+    // `optString(key, null)` alone does not protect against an *explicit*
+    // JSON null value (only a missing key) -- org.json's internal
+    // JSONObject.NULL sentinel is a real object, not Kotlin/Java null, so
+    // optString() stringifies it as the literal string "null" instead of
+    // returning the fallback. Reproduced on a real device: the server
+    // always sends an explicit "greeting": null for a wake-word-triggered
+    // VoiceSession (no bound attention row -- see app/main.py's
+    // voice_session_opened response), and the client spoke and displayed
+    // the literal word "null" every single time. isNull() is org.json's
+    // documented, correct way to test for "missing or explicit null"
+    // before ever calling optString().
+    private fun JSONObject.optNullableString(name: String): String? =
+        if (isNull(name)) null else optString(name).ifEmpty { null }
+
     fun parseOpened(json: String): VoiceSession? {
         return try {
             val root = JSONObject(json)
@@ -23,10 +38,10 @@ object VoiceSessionParser {
             VoiceSession(
                 voiceSessionId = id,
                 state = state,
-                conversationId = root.optString("conversation_id", null)?.ifEmpty { null },
-                attentionRequestId = root.optString("attention_request_id", null)?.ifEmpty { null },
-                greeting = root.optString("greeting", null)?.ifEmpty { null },
-                clientRequestId = root.optString("client_request_id", null)?.ifEmpty { null },
+                conversationId = root.optNullableString("conversation_id"),
+                attentionRequestId = root.optNullableString("attention_request_id"),
+                greeting = root.optNullableString("greeting"),
+                clientRequestId = root.optNullableString("client_request_id"),
             )
         } catch (_: Exception) {
             null
@@ -43,9 +58,9 @@ object VoiceSessionParser {
             VoiceSessionResponse(
                 voiceSessionId = id,
                 response = root.optString("response", ""),
-                conversationId = root.optString("conversation_id", null)?.ifEmpty { null },
-                attentionRequestId = root.optString("attention_request_id", null)?.ifEmpty { null },
-                voiceSessionState = root.optString("voice_session_state", null)?.ifEmpty { null },
+                conversationId = root.optNullableString("conversation_id"),
+                attentionRequestId = root.optNullableString("attention_request_id"),
+                voiceSessionState = root.optNullableString("voice_session_state"),
             )
         } catch (_: Exception) {
             null
@@ -60,9 +75,9 @@ object VoiceSessionParser {
             val error = root.optString("error")
             if (error.isEmpty()) return null
             VoiceSessionError(
-                voiceSessionId = root.optString("voice_session_id", null)?.ifEmpty { null },
+                voiceSessionId = root.optNullableString("voice_session_id"),
                 error = error,
-                clientRequestId = root.optString("client_request_id", null)?.ifEmpty { null },
+                clientRequestId = root.optNullableString("client_request_id"),
             )
         } catch (_: Exception) {
             null
@@ -75,8 +90,8 @@ object VoiceSessionParser {
             val type = root.optString("type", "")
             if (type != "voice_session_closed") return null
             VoiceSessionClosed(
-                voiceSessionId = root.optString("voice_session_id", null)?.ifEmpty { null },
-                reason = root.optString("reason", null)?.ifEmpty { null },
+                voiceSessionId = root.optNullableString("voice_session_id"),
+                reason = root.optNullableString("reason"),
             )
         } catch (_: Exception) {
             null
@@ -94,8 +109,8 @@ object VoiceSessionParser {
             if (attType.isEmpty()) return null
             VoiceSessionInvitation(
                 attentionRequestId = attId,
-                summary = root.optString("summary", null)?.ifEmpty { null },
-                taskId = root.optString("task_id", null)?.ifEmpty { null },
+                summary = root.optNullableString("summary"),
+                taskId = root.optNullableString("task_id"),
                 attentionType = attType,
             )
         } catch (_: Exception) {

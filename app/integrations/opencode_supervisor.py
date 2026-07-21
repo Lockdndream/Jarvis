@@ -597,6 +597,14 @@ class OpenCodeSupervisor:
         first_activity = task is not None and db.get_opencode_task(task_id) and not db.get_opencode_task(task_id).get("last_evidence_type")
         if first_activity:
             logger.info("opencode first execution event observed: task_id=%s evidence=%s", task_id, event.get("evidence_type"))
+        else:
+            # Demo visibility (Milestone 9B.10): the first-event log above
+            # was the only console output for an entire task's execution --
+            # every subsequent real activity event updated the DB silently.
+            # This line makes the already-real, already-streaming OpenCode
+            # activity visible continuously instead of one line then a long
+            # silent gap. Purely additive logging -- no control flow change.
+            logger.info("opencode activity: task_id=%s evidence=%s", task_id, event.get("evidence_type"))
         db.update_opencode_task_evidence(task_id, event.get("evidence_type", "activity"))
         if task and task["status"] not in ("waiting_for_user", "completed", "failed", "cancelled"):
             db.update_task_status(task_id, "running")

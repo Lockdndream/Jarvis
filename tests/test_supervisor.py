@@ -740,3 +740,28 @@ def test_fast_path_attention_no_duplicate_entry_for_same_task():
     result = _fast_path("what needs my attention")
 
     assert result.count("Dup Task") == 1
+
+
+# ── Milestone 9B.10 RC finding: LLM call failure mid tool-loop ──────
+#
+# A real device rehearsal hit a genuine defect: an httpx.ConnectTimeout
+# calling the LLM API after a tool call had already succeeded propagated
+# unhandled out of process_message(), which main.py's websocket loop has
+# no per-message exception handling for -- an uncaught exception there
+# tears down the entire client connection, not just that one turn.
+
+class _RaisingLLMProvider:
+    async def chat_completion(self, messages, tools=None, max_tokens=1024, temperature=0.3):
+        raise ConnectionError("simulated LLM API connect timeout")
+
+
+@pytest.mark.asyncio
+async def test_process_message_survives_llm_failure_mid_loop():
+    sv = Supervisor()
+    sv._llm = _RaisingLLMProvider()
+
+    result = await sv.process_message("tell me something only the LLM can answer")
+
+    assert "response" in result
+    assert result["response"]  # never empty/None -- always some spoken-friendly text
+    assert "conversation_id" in result

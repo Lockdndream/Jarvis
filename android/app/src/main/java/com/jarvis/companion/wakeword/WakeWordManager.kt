@@ -40,6 +40,20 @@ private const val CHUNK_SAMPLES = SAMPLE_RATE / 1000 * FEATURE_STEP_SIZE_MS
 // negligible latency to reacquiring the mic after a VoiceSession closes.
 private const val PAUSE_POLL_INTERVAL_MS = 200L
 
+// Milestone 9B.10 (release-candidate real-device finding): how often the
+// capture loop retries audio focus while stuck in PAUSED_AUDIO_FOCUS with
+// no VoiceSession involved at all -- found stuck for ~8.6 hours on a real
+// device (manager_state=PAUSED_AUDIO_FOCUS, audio_record_state=NONE, no
+// detections). Same root cause as resumeAfterVoiceSession()'s fix
+// (Android never auto-delivers a regain callback after a *permanent*
+// AUDIOFOCUS_LOSS), but reachable without ever closing a VoiceSession —
+// e.g. a phone call or another app's permanent-focus request while idly
+// LISTENING. 5s is far slower than the 200ms pause-poll tick specifically
+// so this doesn't hammer AudioManager while genuinely paused for an
+// active interruption (a call in progress, music playing) that hasn't
+// ended yet.
+private const val AUDIO_FOCUS_RETRY_INTERVAL_MS = 5000L
+
 /**
  * Milestone 9B.7: abstraction over [AudioRecord] lifecycle so
  * [WakeWordManager]'s capture loop and state machine can be unit-tested
@@ -235,6 +249,10 @@ class WakeWordManager(
     // composite result any observer needs. Always mutated under [stateLock].
     private var audioFocusLost = false
 
+    // Milestone 9B.10 RC finding: only ever read/written on the capture
+    // coroutine (see runCaptureLoop's pause branch) -- no lock needed.
+    private var lastAudioFocusRetryAtMs = 0L
+
     fun start() {
         if (_state.value != State.STOPPED) {
             Log.w(TAG, "start() ignored: illegal transition from ${_state.value}")
@@ -387,6 +405,25 @@ class WakeWordManager(
         }
     }
 
+    /** Milestone 9B.10 RC finding: called from the capture loop's own
+     * pause-polling branch (never from a timer of its own) whenever
+     * PAUSED_AUDIO_FOCUS has held for at least [AUDIO_FOCUS_RETRY_INTERVAL_MS]
+     * -- covers the case where the pause never involved a VoiceSession at
+     * all (so [resumeAfterVoiceSession]'s re-request never runs) and the
+     * original loss was permanent, meaning Android will never deliver an
+     * automatic regain callback on its own. Same re-request pattern as
+     * [resumeAfterVoiceSession]; duplicated rather than shared since
+     * that method's own logic is already real-device-tested and this is
+     * a minimal, separate fix. */
+    private fun retryAudioFocusIfStuck() {
+        val now = System.currentTimeMillis()
+        if (now - lastAudioFocusRetryAtMs < AUDIO_FOCUS_RETRY_INTERVAL_MS) return
+        lastAudioFocusRetryAtMs = now
+        audioFocus.abandon()
+        val regained = audioFocus.request { gained -> if (gained) resumeFromAudioFocusLoss() else pauseForAudioFocusLoss() }
+        if (regained) resumeFromAudioFocusLoss()
+    }
+
     /** Test-only seam: feeds one chunk directly to [onAudioChunk], bypassing
      * the real capture loop entirely. Production capture calls the exact
      * same function. */
@@ -468,6 +505,7 @@ class WakeWordManager(
                 }
                 audioSource = null
                 _audioRecordState.value = AudioRecordState.NONE
+                if (_state.value == State.PAUSED_AUDIO_FOCUS) retryAudioFocusIfStuck()
                 delay(PAUSE_POLL_INTERVAL_MS)
                 continue
             }

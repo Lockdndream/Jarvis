@@ -61,6 +61,14 @@ class VoiceActivity : AppCompatActivity() {
     private var lastSpokenSessionId: String? = null
     private var userFacingError: String? = null
 
+    // Milestone 9B.10 RC finding: the server sends exactly one
+    // voice_session_response per turn, delivered only after the whole
+    // turn (LLM call, tool calls) already finished server-side -- there
+    // is no intermediate "processing" push, so the client has no signal
+    // at all during the wait. Purely local/client-side; never sent to or
+    // read from the server.
+    private var isAwaitingResponse = false
+
     // Milestone 9B.9: true once this screen has observed a real, opened
     // VoiceSession at least once. Distinguishes "the session I was
     // watching just closed" (finish — nothing left for this screen to do)
@@ -219,6 +227,12 @@ class VoiceActivity : AppCompatActivity() {
                     PresenceService.activeClient?.sendVoiceSessionTranscript(
                         session.voiceSessionId, transcript,
                     )
+                    isAwaitingResponse = true
+                    render(
+                        app.voiceSessionRepository.current.value,
+                        app.voiceSessionRepository.lastResponse.value,
+                        app.connectionState.value,
+                    )
                 } else {
                     val attentionRequestId = intent.getStringExtra(EXTRA_ATTENTION_REQUEST_ID)
                     pendingTranscript = transcript
@@ -269,13 +283,18 @@ class VoiceActivity : AppCompatActivity() {
         }
 
         if (userFacingError != null) {
+            isAwaitingResponse = false
             binding.statusText.text = "error"
             binding.responseText.text = userFacingError
             binding.responseText.visibility = View.VISIBLE
             return
         }
 
-        binding.statusText.text = voiceSessionStateToUserFacingLabel(session?.state)
+        if (response != null && response != lastSpokenText) {
+            isAwaitingResponse = false
+        }
+
+        binding.statusText.text = if (isAwaitingResponse) "thinking…" else voiceSessionStateToUserFacingLabel(session?.state)
 
         // The server never actually reports voice_session_state="speaking"
         // (app/voice_session_manager.py's real transition path only ever
