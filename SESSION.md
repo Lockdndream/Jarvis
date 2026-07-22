@@ -2120,20 +2120,29 @@ Used for browser smoke testing of Milestone 3. May later be useful for Jarvis br
 
 ## Current Milestone
 
-**Milestones 6 through 9B.5 complete and closed; production wake-word
-integration (ADR-017, Milestones 9B.6–9B.9) has since been built and is
-live in `android/app/src/main/java/com/jarvis/companion/wakeword/` —
-this summary paragraph predates that work and is otherwise stale; see the
-9B.10 entry below (and TD-015, itself about this exact kind of staleness)
-rather than treating the wake-word-not-yet-approved framing above as
-current. Milestone 9B.10 (VoiceSession Lifecycle Verification & Server
-Hardening) is checkpointed as of 2026-07-20, not closed: Phases 1–3
-(architecture audit, failure analysis, hardening) and a four-bug
-mid-milestone detour are done and real-device-validated; Phase 4's
-remaining scenarios (server restart with an active session, mid-
-conversation disconnect, process kill, abandoned-client reaping) are
-explicitly deferred to a dedicated future real-device session — see the
-9B.10 entry and TD-023.**
+**Milestones 6 through 9B.9 complete and closed; production wake-word
+integration (ADR-017, Milestones 9B.6–9B.9) is live in
+`android/app/src/main/java/com/jarvis/companion/wakeword/` — this
+summary paragraph predates that work and is otherwise stale; see the
+9B.10 entry below (and TD-015, itself about this exact kind of
+staleness) rather than treating the wake-word-not-yet-approved framing
+above as current. Milestone 9B.10 (VoiceSession Lifecycle Verification
+& Server Hardening, Release-Candidate Validation, and the Jarvis
+Control Center) is **closed as of 2026-07-22**: VoiceSession Phase 4's
+previously-deferred active-session-restart scenario was exercised for
+real (found and fixed 3 real defects, #5–#7); RC/demo rehearsal found
+and fixed 4 more (#8, #10–#12); the OpenAI Build Week hackathon was
+evaluated for eligibility and declined (Jarvis's stack uses neither
+Codex nor GPT-5.6); the project shifted to long-term "Product Mode";
+the Jarvis Control Center (ADR-018) was built in an isolated worktree,
+independently reviewed, hardened, and merged (`ea546b2`); ADR-019
+formalized the Control Center's permanent read-only boundary after the
+first operational-improvements request tested it directly; a scoped
+operational-improvements pass followed (found and fixed a 6th real
+defect, OpenCode liveness always reporting false when externally
+attached), committed at `b477013`. TD-023 (the active-VoiceSession
+scenario) and the demo-readiness question are both resolved; see the
+9B.10 entry below for full detail and evidence.**
 
 Milestone 9B.0 closed with: architecture frozen and documented across `ARCHITECTURE.md`, 10 ADRs (`docs/decisions/`), and this file; `docs/TECHNICAL_DEBT.md` (20 items) and `docs/RELEASE_CHECKPOINT_M9B0.md` established; `README.md` rewritten to match. See the Milestone 9B.0 section below for the full narrative (cost-boundary fix, D0–D4, Phase 1–3 investigation, Transport Reachability).
 
@@ -2452,7 +2461,7 @@ ownership marker for a since-dead delegated OpenCode process from the
 interrupted prior session) was left in place as a harmless, disclosed
 leftover — not a live process, confirmed via `netstat`/`tasklist`.
 
-### Milestone 9B.10 — VoiceSession Lifecycle Verification & Server Hardening (2026-07-18/20, in progress — checkpointed, not closed)
+### Milestone 9B.10 — VoiceSession Lifecycle Verification & Server Hardening, Release-Candidate Validation, and the Jarvis Control Center (2026-07-18/22, closed 2026-07-22)
 
 Explicitly scoped to verifying and hardening the existing client/server
 VoiceSession contract — not new features. Phase 1 (architecture audit)
@@ -2645,6 +2654,144 @@ wake-word-force-enabled hook added to
 `JarvisCompanionApp.kt` for real-device validation convenience during this
 milestone was reverted before this checkpoint's commit, per the standing
 `revert before commit` marker left on it.
+
+**Continuation, 2026-07-21/22 — Release-Candidate rehearsal (item 1 of the
+pending list above, resolved), five more real defects found and fixed,
+the OpenAI Build Week hackathon evaluated and declined, and a pivot to
+long-term "Product Mode."**
+
+Item 1 above (an *active* VoiceSession's fate across a real server
+restart) was finally exercised on the real device: opened a session,
+spoke a real question, killed the backend mid-`listening`/`processing`.
+Found and fixed, in order, stopping to diagnose each fully before
+continuing per the user's explicit RC discipline ("stop, diagnose
+completely, minimum fix, re-run the full scenario"):
+
+- **Defect #5**: `WakeWordManager` found stuck in `PAUSED_AUDIO_FOCUS`
+  for ~8.6 hours with no VoiceSession ever involved — the existing
+  `resumeAfterVoiceSession()` re-request fix only covered the
+  voice-session-close path, not a bare audio-focus loss with nothing to
+  trigger a recovery at all. Fixed: a throttled re-request
+  (`retryAudioFocusIfStuck()`, 5s) from the capture loop's own
+  pause-polling branch.
+- **Defect #6**: the literal word "null" spoken/shown on every wake-word
+  greeting. Root cause: `org.json.JSONObject`'s `NULL` sentinel is a real
+  object, not Kotlin/Java `null` — `optString(key, null)` only guards a
+  *missing* key, not an *explicit* JSON null, which is exactly what
+  `app/main.py` sends for a wake-word-triggered `greeting`. Fixed with an
+  `optNullableString()` helper using `isNull()`, applied to all 9
+  affected call sites in `VoiceSessionParser.kt`. Disclosed finding: the
+  existing unit test for this exact case was already passing before the
+  fix, because the JVM-only `org.json` test double doesn't reproduce
+  Android's real quirk — this class of bug is invisible to this
+  project's unit tests and only catchable on a real device.
+- **Defect #7**: every backend restart invalidates every cached WS
+  token's signature (no `JARVIS_WS_TOKEN_SECRET` set), and the
+  accept-then-close rejection can arrive as a bare `SocketException` in
+  `onFailure` rather than a proper close code — classified as plain
+  `NETWORK`, so the existing `needsTokenRefresh` gate never fired,
+  leaving the client retrying a permanently-dead token for up to its own
+  unrelated expiry window. Fixed: defensively invalidate the cached
+  token in `onFailure` whenever `connectedSinceMs == null` (this
+  generation's connection never opened before failing).
+
+Scenario 1 then passed cleanly, re-verified precisely (server access log
+showed exactly one reconnect attempt post-fix vs. 10+ before).
+
+Demo rehearsal for a planned OpenAI Build Week submission surfaced four
+more real defects: **#8** an uncaught LLM-API exception mid-tool-call
+crashed the entire WebSocket connection, not just the turn (fixed:
+try/except around the tool-calling loop, returns a spoken fallback
+message instead); **#10** the auto-routing `openrouter/free` model
+alias returned raw `<unk>` token garbage on one real request (fixed by
+pinning a specific named model instead — the same lesson OpenCode's own
+model selection had already learned once); **#11** the LLM's markdown
+formatting was being read aloud literally by TTS ("asterisk asterisk")
+— fixed with an explicit system-prompt rule; **#12** no client-side
+signal existed between sending a transcript and receiving a response,
+so the screen looked frozen during real LLM/OpenCode latency — fixed
+with a local `isAwaitingResponse` "thinking…" indicator. A fifth,
+Android-only fix: `SpeechRecognizer.ERROR_CLIENT`, observed specifically
+launching via the lock-screen full-screen-intent path, retried once
+(Android's own documented transient-error class). All five committed at
+`ea9d422`, 456/456 pytest, Android build clean.
+
+Separately, a repeated LLM reasoning failure was investigated and
+**not** fixed: asked "what is the status of the last task" against a
+freshly-cleaned, correctly-ordered task list, the model (tried on both
+a free-tier model and a paid `deepseek/deepseek-v4-flash`) answered
+about the wrong (old, unrelated) task on 2 of 3 attempts despite
+correct data being directly in front of it — a genuine model-capability
+limit, not a code defect, and not reliably fixable by switching models
+or cleaning data. Resolution: dropped the "ask again for status" beat
+from the demo script entirely in favor of a single-turn design ending
+in a real, observable laptop-side artifact.
+
+**Hackathon eligibility checked before investing further demo-prep
+time**: the official OpenAI Build Week rules require a submission "built
+with Codex and GPT 5.6," or for a pre-existing project, "meaningfully
+extended using Codex and/or GPT-5.6." Jarvis's coding-agent integration
+is OpenCode (unrelated to OpenAI's Codex), and its LLM that night had
+been OpenRouter's free pool / DeepSeek — neither is GPT-5.6. **Decision:
+skip the hackathon submission** rather than force-fit an eligibility
+claim or rebuild the OpenCode integration around a different agent
+under a same-day deadline.
+
+**Pivot to "Product Mode"**: no longer optimizing for a competition
+deadline; explicit long-term-architecture framing for everything after
+this point (maintainability, observability, extensibility over shipping
+speed).
+
+**The Jarvis Control Center** (full detail: ADR-018) — built by a
+delegated agent in an isolated git worktree specifically so it could not
+destabilize the RC-validated main tree; independently reviewed by a
+separate agent with no self-interest in the outcome (findings: zero test
+coverage protecting the observer-isolation invariant; an unauthenticated
+endpoint returning raw conversation text and task commands; unconditional
+per-turn database writes with no dashboard connected; `SELECT *`
+schema-coupling); every finding fixed in a dedicated hardening pass and
+independently re-verified (488 tests, a live auth matrix against a real
+server, live proof that zero observers means zero extra writes). Merged
+into `develop` (`ea546b2`) after a genuine pre-merge audit found two real
+conflicts a first-pass "zero overlap" claim had missed (`supervisor.py`'s
+tool-call loop touched by both this milestone's own try/except fix and
+the new broadcast call; `test_supervisor.py`'s insertion point) — both
+resolved by composing, not picking a side, and re-verified (489 passed
+post-merge, Android build unaffected, live isolation/auth/zero-overhead
+checks repeated against the actual merged code).
+
+**ADR-019** was written after the very first requested operational
+improvement (Start/Stop/Restart buttons for Jarvis and OpenCode) tested
+the Control Center's read-only boundary directly — formalizing
+"Control Center observes, a future write-capable Jarvis Operations
+subsystem acts" as a permanent, general rule rather than relying on
+catching each future request case-by-case.
+
+**Operational improvements** (scoped to what fits inside that boundary):
+`open_control_center.bat` rewritten for the real merged deployment (was
+still launching an isolated port-8010 test instance); a Refresh Status
+action that is genuinely live (reuses the existing `pollConnectivity()`,
+no duplicate logic); an Operations panel showing OpenCode/Jarvis
+lifecycle controls as honestly disabled with a dynamic explanation
+rather than faked or silently omitted; new status fields
+(`supervisor_state`, `connectivity.observers_now`,
+`opencode.owned`/`last_health_check_at`). **A sixth real defect found
+and fixed along the way**: `OpenCodeServerManager.is_alive` always
+returned `False` for an *attached* (`owned=False`) server — this
+deployment's actual, permanent real-world state — because the attach
+path never sets the field `is_alive` checks; the dashboard had been
+reporting OpenCode as unhealthy the entire time despite it correctly
+executing real tasks all night. Fixed with a real live `check_health()`
+call, deliberately wired in only at the dashboard endpoint, not into
+`get_status()` (which the phone/PWA's own `/ws` connect handshake also
+calls) — a network round trip that fix doesn't need to impose on the
+primary product's own connect path.
+
+Committed at `b477013`. Final regression at milestone close: **489/489
+pytest passing**, Android build clean (zero Android files touched by
+any Control Center or operational-improvements work), and every new
+behavior confirmed live against the real running server, not merely
+unit-tested in isolation.
 
 ### Milestone 9B.3 — Android Widget & Attention Surface (closed 2026-07-14)
 

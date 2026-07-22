@@ -599,11 +599,29 @@ not urgently), **Low** (cosmetic or very low probability of mattering).
   proven end-to-end rests on unit tests plus one transport-only device
   test — REQUIRES-EXPERIMENT-classified for the combined real-device
   case, not FACT.
-- **Recommended milestone**: Complete Milestone 9B.10's Phase 4 in a
-  dedicated real-device session: open a session, confirm active state on
-  both sides via Diagnostics/DB, then inject each of the four scenarios
-  above and confirm the deterministic end-state for each.
-- **Status**: Open, explicitly disclosed (`SESSION.md` Milestone 9B.10)
+- **Recommended milestone**: Exercise the remaining two scenarios (a
+  mid-conversation client disconnect; a killed companion process's
+  `START_STICKY` recovery reconciling with an open VoiceSession) in a
+  dedicated real-device session.
+- **Status**: **Partially resolved, 2026-07-21/22.** The originally-listed
+  first scenario (an active VoiceSession's deterministic end-state on
+  both sides when the backend dies mid-conversation and comes back with
+  its in-memory state gone) was exercised for real: opened a session,
+  spoke a real question, killed the backend mid-`listening`/`processing`.
+  Found and fixed 3 real defects in the process (#5 WakeWordManager
+  audio-focus stuck, #6 the "null" greeting parsing bug, #7 stale-token
+  fast-fail) — see `SESSION.md` Milestone 9B.10's continuation entry for
+  full detail. The fourth scenario (an abandoned client actually being
+  reaped by `VoiceSessionReaper` on the real device) was also confirmed
+  working end-to-end during the same real-device session
+  (`termination_reason=idle_timeout` observed exactly as designed). The
+  remaining two scenarios (mid-conversation disconnect as an isolated,
+  deliberate test; process-kill/`START_STICKY` recovery) were not
+  specifically exercised — real, unplanned WebSocket disconnects did
+  happen repeatedly during the same session's later demo rehearsal and
+  were all observed to self-heal correctly, but that is incidental
+  evidence, not a controlled test of this scenario, so it is not claimed
+  as resolved here.
 
 ---
 
