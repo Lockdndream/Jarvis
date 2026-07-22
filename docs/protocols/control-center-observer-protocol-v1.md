@@ -166,6 +166,17 @@ specifically returns exactly `{task_id, name, status, started_at,
 completed_at}`, matching `/api/task/{id}`'s own existing convention of
 withholding raw command/instruction text.
 
+Operational-improvements pass (Milestone 9B.10, second sub-milestone)
+added, additively, to the top-level snapshot response: `supervisor_state`
+(`"idle"` or `"processing"` — an in-memory counter around
+`Supervisor.process_message()`, never persisted); `connectivity.observers_now`
+(`ConnectionManager`'s existing `_observers` count, previously computed
+but not exposed); and on the `opencode` object, `owned` (bool) and
+`last_health_check_at` (ISO timestamp, set by the new `check_health()`
+live check — see Contract 9 below). None of these required a new
+endpoint or a new event type; all are additive fields on the one
+existing snapshot response, consistent with this contract.
+
 **Why it matters**: found during hardening that the initial
 implementation forwarded `SELECT * FROM tasks` unfiltered, exposing a
 field the project had already deliberately decided, elsewhere, to keep
@@ -252,6 +263,41 @@ break next.
 
 **Files**: `app/supervisor/supervisor.py`, `app/voice_session_manager.py`,
 `tests/conftest.py`.
+
+### Contract 9 — OpenCode liveness is checked live, correct for both ownership cases, and never on the phone-facing hot path
+
+**Invariant**: `OpenCodeServerManager.is_alive` (a sync property) is
+**not** a reliable "is OpenCode healthy" signal on its own — it only
+reflects `self._proc`, which is set for an *owned* (Jarvis-spawned)
+server but never for an *attached* (`owned=False`) one, the real
+deployment's actual, ordinary state. `check_health()` (async) does a
+real HTTP call to OpenCode's own `/global/health`, correct for both
+ownership cases, and records `last_health_check_at`. It is called
+*only* from `GET /api/dashboard/snapshot` — never from `get_status()`,
+which `/ws`'s connect handshake also calls for the phone/PWA's own
+`opencode_status` push.
+
+**Why it matters**: found and fixed during the operational-improvements
+pass — the dashboard was reporting OpenCode as unhealthy (via the old
+`is_alive`-based value) despite it having executed real tasks correctly
+the entire time. The fix is deliberately scoped to the dashboard only:
+adding a real network round trip (up to a few seconds in the worst
+case) to `get_status()` would add that same latency to every phone/PWA
+reconnect, a cost this contract explicitly refuses to impose on the
+primary product to make one status field in an observability panel
+more accurate.
+
+**What breaks if violated**: reverting to `is_alive` in the snapshot
+endpoint silently reintroduces the original bug (a permanently-wrong
+health indicator for the deployment's normal, real-world state).
+Moving `check_health()` into `get_status()` instead would fix that but
+quietly add real latency to the phone's own connect path — a regression
+in the opposite, more important direction.
+
+**Files**: `app/integrations/opencode_server.py` (`check_health()`,
+`is_alive`), `app/integrations/opencode_supervisor.py` (`get_status()`,
+deliberately unchanged), `app/main.py` (`GET /api/dashboard/snapshot`,
+the only caller of `check_health()`).
 
 ## 4. Authentication
 

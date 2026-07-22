@@ -131,6 +131,7 @@ class ConnectionManager:
         is invented, just exposed."""
         return {
             "connections_now": len(self._connections),
+            "observers_now": len(self._observers),
             "total_connections_since_start": self._next_id - 1,
             "reconnect_count": self._reconnect_count,
             "last_heartbeat_at": self._last_heartbeat_at,

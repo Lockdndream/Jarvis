@@ -30,6 +30,7 @@
       <span class="cc-header-stat-label">clock</span>
       <span class="cc-header-stat-value" id="stat-clock">—</span>
     </div>
+    <button class="cc-refresh-btn" id="btn-refresh-status" type="button">Refresh Status</button>
   </div>
 </header>
 
@@ -99,6 +100,52 @@
   <section class="cc-panel cc-area-services" aria-label="Background Services">
     <h2 class="cc-panel-title">Background Services</h2>
     <div class="cc-service-list" id="service-list"></div>
+  </section>
+
+  <!-- OPERATIONS -->
+  <!-- Milestone 9B.10 (Product Mode): the Control Center is an observability
+       subsystem -- it observes, it does not act. Actual process control
+       (start/stop/restart Jarvis or OpenCode) is write-capable and belongs
+       to the future "Jarvis Operations" subsystem (its own ADR, auth model,
+       audit logging -- not this one). "Refresh Status" is the one control
+       here that is genuinely just observation (re-fetching already-public
+       state), so it's the only one that's a live button; everything else
+       is disabled and says exactly why. -->
+  <section class="cc-panel cc-area-operations" aria-label="Operations">
+    <h2 class="cc-panel-title">Operations</h2>
+    <div class="cc-op-row">
+      <div>
+        <div class="cc-op-label">Refresh Status</div>
+        <div class="cc-op-note">Re-reads current state from the backend. Read-only.</div>
+      </div>
+      <div>
+        <button class="cc-op-btn" id="btn-op-refresh" type="button">Refresh</button>
+        <span class="cc-op-status" id="op-refresh-status"></span>
+      </div>
+    </div>
+    <div class="cc-op-row">
+      <div>
+        <div class="cc-op-label">Start / Stop / Restart OpenCode</div>
+        <div class="cc-op-note" id="op-opencode-note">—</div>
+      </div>
+      <div>
+        <button class="cc-op-btn" disabled>Start</button>
+        <button class="cc-op-btn" disabled>Stop</button>
+        <button class="cc-op-btn" disabled>Restart</button>
+      </div>
+    </div>
+    <div class="cc-op-row">
+      <div>
+        <div class="cc-op-label">Start / Stop / Restart Jarvis</div>
+        <div class="cc-op-note">Not available: no process can safely restart itself without a
+          separate watchdog process, which does not exist yet. Deferred to Jarvis Operations.</div>
+      </div>
+      <div>
+        <button class="cc-op-btn" disabled>Start</button>
+        <button class="cc-op-btn" disabled>Stop</button>
+        <button class="cc-op-btn" disabled>Restart</button>
+      </div>
+    </div>
   </section>
 
   <!-- 10. RECENT ALERTS -->

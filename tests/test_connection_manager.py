@@ -260,6 +260,7 @@ def test_get_stats_shape_and_values():
     stats = cm.get_stats()
     assert stats == {
         "connections_now": 0,
+        "observers_now": 0,
         "total_connections_since_start": 0,
         "reconnect_count": 0,
         "last_heartbeat_at": None,

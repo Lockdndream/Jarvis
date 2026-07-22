@@ -41,6 +41,19 @@ def _supervisor_enabled():
 # protocol tests that assume strict per-connection frame ordering.
 _broadcast_hook = None
 
+# Control Center status display (Milestone 9B.10, additive): a plain
+# in-memory counter, not persisted, not gated by has_observers() -- unlike
+# _broadcast() this costs nothing worth gating (an int increment/decrement
+# already sitting on every code path through process_message()). A count
+# rather than a bool because two turns (e.g. phone + PWA) could genuinely
+# overlap; "processing" means the count is nonzero, not that a specific
+# turn is in flight.
+_active_turns = 0
+
+
+def get_supervisor_state() -> str:
+    return "processing" if _active_turns > 0 else "idle"
+
 
 def set_broadcast_hook(conn_manager) -> None:
     global _broadcast_hook
@@ -107,6 +120,26 @@ class Supervisor:
         return self._llm
 
     async def process_message(
+        self, user_message: str, conversation_id: str | None = None,
+        bound_attention_request_id: str | None = None,
+    ) -> dict:
+        """Public entry point -- see _process_message_inner for the actual
+        logic. This thin wrapper only maintains the Control Center's
+        active-turn counter (Milestone 9B.10, additive): try/finally here,
+        once, is simpler and safer than threading an increment/decrement
+        through every one of _process_message_inner's several early-return
+        branches, and correctly still decrements even if something in
+        there raises past its own exception handling."""
+        global _active_turns
+        _active_turns += 1
+        try:
+            return await self._process_message_inner(
+                user_message, conversation_id, bound_attention_request_id,
+            )
+        finally:
+            _active_turns -= 1
+
+    async def _process_message_inner(
         self, user_message: str, conversation_id: str | None = None,
         bound_attention_request_id: str | None = None,
     ) -> dict:

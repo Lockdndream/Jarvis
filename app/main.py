@@ -366,15 +366,30 @@ async def dashboard_snapshot(_=Depends(_require_api_token)):
     """
     oc_status = await opencode_supervisor.get_status()
     uptime_seconds = int((datetime.now(timezone.utc) - _SERVER_START_TIME).total_seconds())
+    # Control Center status display (Milestone 9B.10): a live, ownership-
+    # correct health check, done only here (not in get_status(), which
+    # /ws's connect handshake also calls -- adding a real network round
+    # trip to that phone-facing path is not this endpoint's call to make).
+    # Found and fixed in the same pass: the old server_alive value below
+    # was is_alive, which is always False for an *attached* (owned=False)
+    # server -- this deployment's actual, real-world state -- because the
+    # attach path in OpenCodeServerManager.start() never sets self._proc,
+    # which is what is_alive checks. check_health() does a real HTTP call
+    # instead and is correct for both ownership cases.
+    oc_server = opencode_supervisor.server
+    oc_alive = await oc_server.check_health()
     return {
         "server": {
             "started_at": _SERVER_START_TIME.isoformat().replace("+00:00", "Z"),
             "uptime_seconds": uptime_seconds,
         },
         "connectivity": conn_manager.get_stats(),
+        "supervisor_state": supervisor_module.get_supervisor_state(),
         "opencode": {
-            "server_alive": oc_status["server_alive"],
+            "server_alive": oc_alive,
             "server_url": oc_status["server_url"],
+            "owned": oc_server.owned,
+            "last_health_check_at": oc_server.last_health_check_at,
         },
         "tasks": [
             {

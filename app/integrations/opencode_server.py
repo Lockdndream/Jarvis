@@ -57,6 +57,7 @@ import asyncio
 import json
 import logging
 import os
+from datetime import datetime, timezone
 
 from app.integrations import process_utils
 
@@ -252,6 +253,9 @@ class OpenCodeServerManager:
         # Resolved lazily in start() so JARVIS_OPENCODE_RUNTIME_DIR can still
         # be set right up until startup (e.g. by tests).
         self.runtime_dir: str | None = None
+        # Control Center observability (Milestone 9B.10) -- last time
+        # check_health() actually ran, regardless of the result.
+        self.last_health_check_at: str | None = None
 
     @property
     def base_url(self) -> str:
@@ -438,6 +442,32 @@ class OpenCodeServerManager:
         if self.owned:
             return self._owned_pid is not None
         return self._proc is not None and self._proc.returncode is None
+
+    async def check_health(self) -> bool:
+        """Live health check, correct for both ownership cases.
+
+        Control Center finding (Milestone 9B.10): `is_alive` alone is not
+        a usable "is OpenCode healthy" signal for an *attached* (owned=False)
+        server, which is the real deployment's actual state — the attach
+        path in start() never sets self._proc, so `is_alive` always
+        returned False for a genuinely healthy, actively-used external
+        server. This does the same real HTTP check start()/_wait_for_healthy()
+        already do, works for both ownership cases, and records when it
+        last ran for observability (Control Center "Last Health Check").
+        """
+        import httpx
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.get(
+                    f"{self.base_url}/global/health",
+                    headers={"Authorization": self.auth_header},
+                    timeout=3,
+                )
+                alive = r.status_code == 200 and bool(r.json().get("healthy"))
+        except Exception:
+            alive = False
+        self.last_health_check_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        return alive
 
     async def _health_loop(self) -> None:
         import httpx

@@ -96,6 +96,7 @@ body {
     "feed        decisions"
     "tasks       attention"
     "connectivity services"
+    "operations  operations"
     "alerts      alerts";
   gap: 14px;
   padding: 16px 20px 28px;
@@ -110,7 +111,44 @@ body {
 .cc-area-attention { grid-area: attention; }
 .cc-area-connectivity { grid-area: connectivity; }
 .cc-area-services { grid-area: services; }
+.cc-area-operations { grid-area: operations; }
 .cc-area-alerts { grid-area: alerts; }
+
+.cc-refresh-btn {
+  font-family: var(--mono);
+  font-size: 12px;
+  background: var(--accent-dim);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 6px 12px;
+  cursor: pointer;
+}
+.cc-refresh-btn:hover { background: var(--accent); }
+.cc-refresh-btn:disabled { opacity: 0.5; cursor: default; }
+
+.cc-op-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border-soft);
+}
+.cc-op-row:last-child { border-bottom: none; }
+.cc-op-label { font-size: 13px; }
+.cc-op-note { font-size: 11px; color: var(--muted); margin-top: 2px; }
+.cc-op-btn {
+  font-family: var(--mono);
+  font-size: 11px;
+  background: var(--accent-dim);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+.cc-op-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.cc-op-status { font-size: 11px; margin-left: 8px; color: var(--muted); }
 
 .cc-panel {
   background: var(--panel);

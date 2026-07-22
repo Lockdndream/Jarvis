@@ -117,3 +117,4 @@ Every ADR uses the same section structure, in this order:
 | [ADR-016](ADR-016-android-voice-infrastructure.md) | Android Voice Infrastructure | Accepted |
 | [ADR-017](ADR-017-production-wakeword-foundation.md) | Production Wake-Word Foundation | Accepted |
 | [ADR-018](ADR-018-jarvis-control-center-observability-architecture.md) | Jarvis Control Center — Observability Architecture | Accepted |
+| [ADR-019](ADR-019-separation-of-observability-and-operations.md) | Separation of Observability and Operations | Accepted |

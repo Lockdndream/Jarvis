@@ -1,8 +1,18 @@
 # Jarvis Control Center — Merge Plan
 
-**Status: not yet executed.** This is a plan, produced ahead of the
-actual merge per explicit instruction not to merge yet. It should be
-followed, and can be revised, but nothing below has been run.
+**Status: executed.** The plan below was followed as written — commit,
+rebase onto the then-current `develop` tip, resolve the two real
+conflicts found (see the pre-merge audit this plan's execution
+produced), verify, fast-forward. Merge commit: `ea546b2`. The document
+is kept as-written (historical record of the actual first merge), not
+rewritten after the fact.
+
+A second, smaller round of work (operational improvements: Task 1/2/5
+of the post-hackathon Product Mode pass) was made directly on `develop`
+rather than through a new isolated worktree, since it was small,
+low-risk, and fully validated in place — see `SESSION.md`/ADR-018 for
+that round's own detail. This document describes only the original
+subsystem's merge, not that follow-up.
 
 ## Precondition — a real divergence, checked directly, not assumed
 

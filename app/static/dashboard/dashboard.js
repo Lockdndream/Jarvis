@@ -590,7 +590,14 @@ function applySnapshotHealthAndConnectivity(snap) {
   setHealth("backend", "ok", fmtElapsed(snap.server.uptime_seconds));
   setHealth("websocket", ws && ws.readyState === WebSocket.OPEN ? "ok" : "bad",
     state.latencyMs != null ? `${state.latencyMs}ms` : "");
-  setHealth("supervisor", "ok");
+  // Milestone 9B.10 (Task 5): this was hardcoded "ok" with no real signal
+  // behind it -- exactly the "fake control" the operational-improvements
+  // pass was told not to introduce. supervisor_state ("idle"/"processing")
+  // is real: an in-memory counter incremented/decremented around every
+  // call to Supervisor.process_message(). Idle and processing are both
+  // healthy, so the health dot stays "ok" either way; the state itself is
+  // the detail text, and also its own row in the connectivity grid below.
+  setHealth("supervisor", "ok", snap.supervisor_state);
   setHealth("llm", "ok");
   const wasAlive = state.opencodeAliveKnown;
   setHealth("opencode", snap.opencode.server_alive ? "ok" : "bad", snap.opencode.server_alive ? "" : "unreachable");
@@ -599,6 +606,18 @@ function applySnapshotHealthAndConnectivity(snap) {
       snap.opencode.server_alive ? "info" : "critical");
   }
   state.opencodeAliveKnown = snap.opencode.server_alive;
+
+  // Task 2 (operational improvements): represent honestly why OpenCode
+  // lifecycle controls are disabled rather than leaving an unexplained
+  // grey button. ownership=false is this deployment's actual, normal
+  // state (it attached to an already-running external server) -- not an
+  // error condition.
+  const ocNote = $("op-opencode-note");
+  if (ocNote) {
+    ocNote.textContent = snap.opencode.owned
+      ? "Jarvis owns this OpenCode process, but lifecycle actions are not yet exposed here -- deferred to Jarvis Operations (see roadmap)."
+      : "Not available: this OpenCode server is externally attached (ownership=false) -- Jarvis is only observing it, not managing its lifecycle. Deferred to Jarvis Operations.";
+  }
   setHealth("database", "ok");
   setHealth("notifications", "ok");
 
@@ -623,9 +642,20 @@ function applySnapshotHealthAndConnectivity(snap) {
     ["Dashboard WS latency", state.latencyMs != null ? `${state.latencyMs} ms` : "—", ""],
     ["Reconnects (all clients)", String(snap.connectivity.reconnect_count), ""],
     ["Active connections", String(snap.connectivity.connections_now), ""],
+    ["Observers (dashboards) connected", String(snap.connectivity.observers_now), ""],
     ["Total connections since start", String(snap.connectivity.total_connections_since_start), ""],
     ["Current device", ds.device_id ? truncate(ds.device_id, 20) : "—", ""],
+    // Connectivity policy (Task 4) is explicitly deferred -- not
+    // implemented, so shown honestly rather than omitted or faked.
+    ["Connectivity policy", "Always Connected (only mode implemented)", ""],
+    ["Supervisor state", snap.supervisor_state, ""],
     ["OpenCode server", snap.opencode.server_alive ? "available" : "unavailable", snap.opencode.server_alive ? "ok" : "bad"],
+    // Task 2 (operational improvements): ownership must be represented
+    // honestly -- an "externally attached" OpenCode process is not one
+    // Jarvis can safely start/stop/restart (see the Operations panel,
+    // which disables those controls for exactly this reason).
+    ["OpenCode ownership", snap.opencode.owned ? "owned by Jarvis" : "externally attached (not owned)", ""],
+    ["OpenCode last health check", fmtAgo(snap.opencode.last_health_check_at), ""],
     ["Server uptime", fmtElapsed(snap.server.uptime_seconds), ""],
   ].map(([label, value, cls]) => `
     <div class="cc-kv"><div class="cc-kv-label">${label}</div><div class="cc-kv-value ${cls}">${esc(value)}</div></div>
@@ -798,20 +828,53 @@ function tickClock() {
 }
 
 async function pollConnectivity() {
+  // Returns true/false so a manual "Refresh Status" click can report
+  // success/failure (Task 2) -- the existing setInterval(pollConnectivity,
+  // 5000) caller below simply never looks at the return value, so this is
+  // additive, not a behavior change for the periodic case.
   try {
     const res = await fetch("/api/dashboard/snapshot", { headers: authHeaders() });
+    if (!res.ok) return false;
     const snap = await res.json();
     applySnapshotHealthAndConnectivity(snap);
-  } catch (e) { /* transient — next poll will retry */ }
+    return true;
+  } catch (e) {
+    return false; // transient — next scheduled poll will retry
+  }
 }
 
 // ── Boot ──────────────────────────────────────────────────────────────
+
+// Task 2 (operational improvements): the one genuinely safe, already-
+// existing action this pass wires up -- re-running the exact same
+// pollConnectivity() the periodic timer already calls (not loadSnapshot(),
+// which would re-run the recent_events backfill and duplicate feed/
+// decision-stream/conversation entries on every click). Reused by both
+// the header button and the Operations panel button so there is exactly
+// one implementation, not two.
+async function refreshStatusNow(statusEl) {
+  const btns = [$("btn-refresh-status"), $("btn-op-refresh")].filter(Boolean);
+  btns.forEach((b) => (b.disabled = true));
+  const ok = await pollConnectivity();
+  if (statusEl) {
+    if (ok) {
+      statusEl.textContent = `refreshed ${new Date().toLocaleTimeString()}`;
+      statusEl.style.color = "var(--green)";
+    } else {
+      statusEl.textContent = "refresh failed";
+      statusEl.style.color = "var(--red)";
+    }
+  }
+  btns.forEach((b) => (b.disabled = false));
+}
 
 (async function boot() {
   buildHealthRow();
   buildTimeline();
   await loadSnapshot();
   connectWs();
+  $("btn-refresh-status")?.addEventListener("click", () => refreshStatusNow($("op-refresh-status")));
+  $("btn-op-refresh")?.addEventListener("click", () => refreshStatusNow($("op-refresh-status")));
   setInterval(tickClock, 1000);
   setInterval(pollConnectivity, 5000);
   tickClock();
