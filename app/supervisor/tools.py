@@ -6,6 +6,7 @@ to existing service layers (TaskManager, OpenCodeSupervisor).
 """
 import json
 import logging
+from typing import Any
 
 import app.database as db
 from app.supervisor.projects import resolve_project, get_projects
@@ -16,13 +17,13 @@ logger = logging.getLogger(__name__)
 class ToolRegistry:
     """Registry of bounded supervisor tools backed by service references."""
 
-    def __init__(self, task_manager=None, opencode_supervisor=None):
+    def __init__(self, task_manager: Any = None, opencode_supervisor: Any = None) -> None:
         self._tm = task_manager
         self._oc = opencode_supervisor
         self._tools: dict[str, dict] = {}
         self._register_all()
 
-    def _register(self, name: str, description: str, parameters: dict, handler):
+    def _register(self, name: str, description: str, parameters: dict, handler: Any) -> None:
         self._tools[name] = {
             "description": description,
             "parameters": parameters,
@@ -140,6 +141,33 @@ class ToolRegistry:
             return f"Instruction sent to task {task_id}"
         except Exception as e:
             return f"Error sending instruction: {e}"
+
+    async def _get_task_result(self, task_id: str) -> str:
+        """Delegated Observation and Reporting milestone: the substantive
+        answer for a completed/failed OpenCode task — what the delegated
+        agent actually found or did, not just its lifecycle status (that's
+        get_task_status). Prefers the result captured at completion time
+        (app/integrations/opencode_supervisor.py's _capture_task_result);
+        falls back to a live fetch from OpenCode's own message history if
+        nothing was persisted (e.g. an older task from before this
+        capture existed, or the capture itself failed) — never re-runs
+        the task to answer a follow-up question about it."""
+        task = db.get_task(task_id)
+        if not task:
+            return f"Task '{task_id}' not found"
+        oc_task = db.get_opencode_task(task_id)
+        if not oc_task:
+            return f"Task '{task_id}' is not an OpenCode task"
+        if oc_task.get("result_summary"):
+            return oc_task["result_summary"]
+        if task["status"] not in ("completed", "failed", "cancelled"):
+            return f"Task '{task_id}' is still {task['status']} — no result yet."
+        if not self._oc:
+            return "Error: OpenCode supervisor not available"
+        text = await self._oc.fetch_task_result_text(task_id)
+        if text:
+            return text
+        return f"Task '{task_id}' finished ({task['status']}) but no result text is available."
 
     async def _answer_question(self, question_id: str, answer: str) -> str:
         q = db.get_question_record(question_id)
@@ -288,7 +316,7 @@ class ToolRegistry:
         if not ok:
             return f"Could not resume '{attention_request_id}'"
         fresh = db.get_attention_request(attention_request_id)
-        await attention_manager.initiate_contact(self._oc.cm, fresh)
+        await attention_manager.initiate_contact(self._oc.cm, fresh)  # type: ignore[arg-type]  # TODO(F1.10): resolved by injecting connection_manager
         return f"Resumed {attention_request_id}"
 
     async def _open_voice_session(self, conversation_id: str, attention_request_id: str | None = None) -> str:
@@ -303,10 +331,11 @@ class ToolRegistry:
             return f"Voice session '{voice_session_id}' not found"
         return f"Voice session {voice_session_id} closed"
 
-    def _register_all(self):
+    def _register_all(self) -> None:
         self._register("get_attention", "Get summary of everything needing user attention", {"type": "object", "properties": {}, "required": []}, self._get_attention)
         self._register("list_tasks", "List all active, waiting, and recent tasks", {"type": "object", "properties": {}, "required": []}, self._list_tasks)
         self._register("get_task_status", "Get detailed status for a specific task", {"type": "object", "properties": {"task_id": {"type": "string", "description": "Task ID to inspect"}}, "required": ["task_id"]}, self._get_task_status)
+        self._register("get_task_result", "Get the substantive result of a completed or failed task -- what the delegated agent actually found or did, not just its status. Use this to answer follow-up questions about finished work instead of starting a new task.", {"type": "object", "properties": {"task_id": {"type": "string", "description": "Task ID to get the result for"}}, "required": ["task_id"]}, self._get_task_result)
         self._register("start_opencode_task", "Start a new OpenCode task in a safe project. NEVER accept or invent filesystem paths — always use the project_alias.", {"type": "object", "properties": {"project_alias": {"type": "string", "description": "Project alias"}, "instruction": {"type": "string", "description": "Instruction for OpenCode"}}, "required": ["project_alias", "instruction"]}, self._start_opencode_task)
         self._register("send_opencode_instruction", "Send a follow-up instruction to an existing OpenCode session", {"type": "object", "properties": {"task_id": {"type": "string", "description": "Task ID"}, "instruction": {"type": "string", "description": "Follow-up instruction"}}, "required": ["task_id", "instruction"]}, self._send_opencode_instruction)
         self._register("answer_question", "Answer a pending question", {"type": "object", "properties": {"question_id": {"type": "string", "description": "Question ID"}, "answer": {"type": "string", "description": "Answer text"}}, "required": ["question_id", "answer"]}, self._answer_question)

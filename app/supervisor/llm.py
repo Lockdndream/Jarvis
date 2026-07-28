@@ -3,12 +3,23 @@
 Supports OpenAI-compatible chat completion APIs with tool calling.
 No SDK dependency — uses httpx directly.
 """
+import asyncio
 import logging
 import os
 
 logger = logging.getLogger(__name__)
 
 _FREE_MODELS_ALLOWED = {"openrouter/free"}
+
+# Interaction Layer v1 (Goal 4): a single unretried call here is what
+# turned one transient network hiccup into the whole voice turn
+# collapsing (real-device finding — a ConnectTimeout to OpenRouter took
+# down the connection with no retry at all). Kept small and short: this
+# is still on the blocking voice-session round trip, so retrying should
+# recover a transient hiccup without materially worsening a real outage
+# the user is already waiting through.
+_MAX_ATTEMPTS = 3
+_RETRY_BACKOFF_SECONDS = 1.0
 
 
 class ModelNotAllowedError(ValueError):
@@ -96,19 +107,46 @@ class LLMProvider:
         url = f"{self._base_url}/chat/completions"
 
         async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.post(url, headers=headers, json=body)
-            if resp.status_code != 200:
-                logger.error("LLM API error %s: %s", resp.status_code, resp.text[:500])
-                return {
-                    "role": "assistant",
-                    "content": f"I encountered an error contacting the language model (HTTP {resp.status_code}). Please check my configuration.",
-                }
+            resp = None
+            for attempt in range(1, _MAX_ATTEMPTS + 1):
+                try:
+                    resp = await client.post(url, headers=headers, json=body)
+                except httpx.HTTPError as exc:
+                    if attempt == _MAX_ATTEMPTS:
+                        raise
+                    logger.warning(
+                        "LLM request failed (attempt %d/%d), retrying: %s",
+                        attempt, _MAX_ATTEMPTS, exc,
+                    )
+                    await asyncio.sleep(_RETRY_BACKOFF_SECONDS)
+                    continue
 
-            data = resp.json()
+                if resp.status_code != 200:
+                    logger.error(
+                        "LLM API error %s (attempt %d/%d): %s",
+                        resp.status_code, attempt, _MAX_ATTEMPTS, resp.text[:500],
+                    )
+                    if attempt == _MAX_ATTEMPTS:
+                        # Milestone 9B.10-era behavior returned a fake-looking
+                        # "assistant" reply here, which the supervisor spoke
+                        # as if it were a real answer and never retried.
+                        # Raising instead routes this through the same
+                        # caught-and-recovered path as a network failure
+                        # (supervisor.py's tool-call loop already handles
+                        # that broadly), so every non-200 outcome now gets
+                        # the same bounded-retry treatment, not just
+                        # transport-level errors.
+                        resp.raise_for_status()
+                    await asyncio.sleep(_RETRY_BACKOFF_SECONDS)
+                    continue
+
+                break
+
+            data = resp.json()  # type: ignore[union-attr]  # TODO(F1.6): LLM call path hardening
             choice = data["choices"][0]
             msg = choice["message"]
 
-            result = {"role": "assistant"}
+            result: dict[str, object] = {"role": "assistant"}
 
             if msg.get("content"):
                 result["content"] = msg["content"]

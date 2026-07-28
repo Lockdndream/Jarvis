@@ -384,7 +384,8 @@ async def scenario_d(page, context):
     else:
         fail("Completion-notification toggle did not change state")
 
-    import urllib.request, json
+    import json
+    import urllib.request
     with urllib.request.urlopen(SERVER_URL + "/api/settings") as resp:
         server_state = json.loads(resp.read())["notify_on_completion"]
     if str(server_state).lower() == flipped:
@@ -485,7 +486,8 @@ async def scenario_e(page, context):
     await page.locator(f'.question-send-btn[data-question-id="{qid}"]').click()
 
     async def resolved():
-        import urllib.request, json
+        import json
+        import urllib.request
         try:
             with urllib.request.urlopen(f"{SERVER_URL}/api/question/{qid}") as resp:
                 return json.loads(resp.read())["status"] != "pending"
@@ -565,7 +567,6 @@ async def scenario_f(page, context):
         fail(f"Spoken text for a question notification fell back to the generic placeholder: {spoken!r}")
 
     notif_count_before = await page.locator(".event-notification").count()
-    tts_before = await page.evaluate("() => window.__ttsCalls.length")
 
     await page.add_init_script(SPEECH_MOCK_INIT_SCRIPT)  # must be added before reload to apply to it
     await page.reload()
@@ -713,7 +714,8 @@ async def scenario_h(context):
     )
 
     async def question_resolved():
-        import urllib.request, json as _json
+        import json as _json
+        import urllib.request
         try:
             with urllib.request.urlopen(f"{SERVER_URL}/api/question/{qid}") as resp:
                 return _json.loads(resp.read())["status"] != "pending"

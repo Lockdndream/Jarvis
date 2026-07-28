@@ -6,6 +6,7 @@ tests use a FakeSupervisor that just records calls and returns a canned
 response, the same pattern tests/test_voice_fast_paths.py uses for
 FakeTools.
 """
+import json
 import os
 import sys
 import tempfile
@@ -45,7 +46,7 @@ class FakeSupervisor:
         self.calls = []
         self.response = response
 
-    async def process_message(self, user_message, conversation_id=None, bound_attention_request_id=None):
+    async def process_message(self, user_message, conversation_id=None, bound_attention_request_id=None, confirm_before_tools=None):
         self.calls.append((user_message, conversation_id, bound_attention_request_id))
         return {"response": self.response, "conversation_id": conversation_id}
 
@@ -73,6 +74,23 @@ def test_open_session_unbound_goes_straight_to_listening():
     assert session["state"] == "listening"
     assert session["attention_request_id"] is None
     assert session["greeting"] is None
+
+
+def test_transition_log_lines_carry_conversation_id(caplog):
+    """M-OX.3 live-validation finding: every voice_session_manager state-
+    transition log line carried conversation_id: null despite it being
+    directly available on the already-fetched `session` row -- with two
+    concurrent sessions, these lines were indistinguishable except by
+    parsing the free-text `id=vs_...` substring."""
+    import logging
+
+    sv = FakeSupervisor()
+    vsm = VoiceSessionManager(sv)
+    with caplog.at_level(logging.INFO, logger="app.voice_session_manager"):
+        vsm.open_session("conv_transition_test")
+    state_records = [r for r in caplog.records if "voice session state:" in r.message]
+    assert len(state_records) >= 1
+    assert all(r.conversation_id == "conv_transition_test" for r in state_records)
 
 
 @pytest.mark.asyncio
@@ -222,7 +240,7 @@ async def test_concurrent_transcripts_on_same_session_barge_in_guard():
     import asyncio
 
     class SlowSupervisor:
-        async def process_message(self, user_message, conversation_id=None, bound_attention_request_id=None):
+        async def process_message(self, user_message, conversation_id=None, bound_attention_request_id=None, confirm_before_tools=None):
             await asyncio.sleep(0.05)
             return {"response": "done", "conversation_id": conversation_id}
 
@@ -249,7 +267,7 @@ async def test_bound_defer_transitions_voice_session_to_deferred_not_waiting():
     aid = row["attention_request_id"]
 
     class DeferringSupervisor:
-        async def process_message(self, user_message, conversation_id=None, bound_attention_request_id=None):
+        async def process_message(self, user_message, conversation_id=None, bound_attention_request_id=None, confirm_before_tools=None):
             await am.defer(bound_attention_request_id, "2026-07-10T10:15:00Z")
             return {"response": "Okay.", "conversation_id": conversation_id}
 
@@ -376,7 +394,7 @@ async def test_handle_transcript_raises_if_session_closed_concurrently_during_pr
     voice_session_id = session["voice_session_id"]
 
     class ClosingSupervisor:
-        async def process_message(self, user_message, conversation_id=None, bound_attention_request_id=None):
+        async def process_message(self, user_message, conversation_id=None, bound_attention_request_id=None, confirm_before_tools=None):
             vsm.close_session(voice_session_id, reason="idle_timeout")
             return {"response": "too late", "conversation_id": conversation_id}
 
@@ -563,3 +581,132 @@ def test_schedule_lifecycle_is_safe_with_no_running_loop():
     fake = _FakeObserverConnManager(observers=True)
     voice_session_manager_module.set_broadcast_hook(fake)
     voice_session_manager_module._schedule_lifecycle("opened", {"voice_session_id": "vs1"})  # must not raise
+
+
+# ── Interaction Layer v1 (Goal 5): technical command confirmation ──────
+
+_PENDING = {"name": "start_opencode_task", "args": {"project_alias": "jarvis-test", "instruction": "create a file"}}
+
+
+class ConfirmingSupervisor:
+    """Stands in for the real Supervisor's Goal 5 behavior: a turn that
+    proposes a confirmation-gated tool returns pending_tool_call instead
+    of executing it; resolve_pending_tool_confirmation resolves the
+    following yes/no reply. VoiceSessionManager never duplicates this
+    reasoning (same Phase 10 constraint as FakeSupervisor above) — it only
+    needs to know that a pending_tool_call arrived and route accordingly."""
+
+    def __init__(self):
+        self.process_message_calls = []
+        self.resolve_calls = []
+
+    async def process_message(self, user_message, conversation_id=None, bound_attention_request_id=None, confirm_before_tools=None):
+        self.process_message_calls.append((user_message, conversation_id, bound_attention_request_id, confirm_before_tools))
+        return {
+            "response": "I heard: create a file — for the jarvis-test project. Should I go ahead?",
+            "conversation_id": conversation_id,
+            "pending_tool_call": dict(_PENDING),
+        }
+
+    async def resolve_pending_tool_confirmation(self, conversation_id, transcript, pending_tool_call):
+        self.resolve_calls.append((conversation_id, transcript, pending_tool_call))
+        decision = transcript.strip().lower()
+        if decision == "yes":
+            return {"response": "Okay, I've started that.", "conversation_id": conversation_id}
+        if decision == "no":
+            return {"response": "Okay, I won't do that. What would you like instead?", "conversation_id": conversation_id}
+        return {
+            "response": "Sorry, was that a yes or a no?",
+            "conversation_id": conversation_id,
+            "pending_tool_call": pending_tool_call,
+        }
+
+
+@pytest.mark.asyncio
+async def test_pending_tool_call_transitions_to_confirming_not_listening():
+    sv = ConfirmingSupervisor()
+    vsm = VoiceSessionManager(sv)
+    session = vsm.open_session("c1")
+    vsid = session["voice_session_id"]
+
+    result = await vsm.handle_transcript(vsid, "start an opencode task to create a file")
+
+    assert result["voice_session_state"] == "confirming"
+    assert "Should I go ahead" in result["response"]
+    row = db.get_voice_session(vsid)
+    assert row["state"] == "confirming"
+    assert json.loads(row["pending_tool_call"]) == _PENDING
+    # process_message() was passed the voice-only confirmation set — this
+    # is what makes Goal 5 voice-specific rather than affecting text/
+    # browser chat, which never sets this.
+    assert sv.process_message_calls[0][3] is not None
+
+
+@pytest.mark.asyncio
+async def test_yes_reply_resolves_confirmation_and_returns_to_listening():
+    sv = ConfirmingSupervisor()
+    vsm = VoiceSessionManager(sv)
+    session = vsm.open_session("c1")
+    vsid = session["voice_session_id"]
+    await vsm.handle_transcript(vsid, "start an opencode task to create a file")
+
+    result = await vsm.handle_transcript(vsid, "yes")
+
+    assert result["voice_session_state"] == "listening"
+    assert result["response"] == "Okay, I've started that."
+    assert sv.resolve_calls == [("c1", "yes", _PENDING)]
+    row = db.get_voice_session(vsid)
+    assert row["state"] == "listening"
+    assert row["pending_tool_call"] is None  # cleared once resolved
+
+
+@pytest.mark.asyncio
+async def test_no_reply_cancels_confirmation_and_returns_to_listening():
+    sv = ConfirmingSupervisor()
+    vsm = VoiceSessionManager(sv)
+    session = vsm.open_session("c1")
+    vsid = session["voice_session_id"]
+    await vsm.handle_transcript(vsid, "start an opencode task to create a file")
+
+    result = await vsm.handle_transcript(vsid, "no")
+
+    assert result["voice_session_state"] == "listening"
+    assert "won't do that" in result["response"]
+    row = db.get_voice_session(vsid)
+    assert row["state"] == "listening"
+    assert row["pending_tool_call"] is None
+
+
+@pytest.mark.asyncio
+async def test_unclear_reply_stays_in_confirming_and_reasks():
+    """No-guessing-under-ambiguity (same philosophy as
+    _resolve_deterministic_command in supervisor.py) — an unrecognized
+    reply must re-ask, never silently execute or silently cancel."""
+    sv = ConfirmingSupervisor()
+    vsm = VoiceSessionManager(sv)
+    session = vsm.open_session("c1")
+    vsid = session["voice_session_id"]
+    await vsm.handle_transcript(vsid, "start an opencode task to create a file")
+
+    result = await vsm.handle_transcript(vsid, "maybe")
+
+    assert result["voice_session_state"] == "confirming"
+    assert "yes or a no" in result["response"]
+    row = db.get_voice_session(vsid)
+    assert row["state"] == "confirming"
+    assert json.loads(row["pending_tool_call"]) == _PENDING  # still pending, not lost
+
+
+@pytest.mark.asyncio
+async def test_second_yes_after_unclear_reply_still_resolves_correctly():
+    sv = ConfirmingSupervisor()
+    vsm = VoiceSessionManager(sv)
+    session = vsm.open_session("c1")
+    vsid = session["voice_session_id"]
+    await vsm.handle_transcript(vsid, "start an opencode task to create a file")
+    await vsm.handle_transcript(vsid, "maybe")
+
+    result = await vsm.handle_transcript(vsid, "yes")
+
+    assert result["voice_session_state"] == "listening"
+    assert result["response"] == "Okay, I've started that."

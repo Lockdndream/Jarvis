@@ -217,7 +217,7 @@ async def test_primary_acceptance_scenario():
     # ── Step 10: fifteen minutes later, the request becomes due ──────
     # DB-driven scheduler with an injected clock — never a browser timer,
     # never a real fifteen-minute sleep in this test (Phase 8).
-    from datetime import datetime, timedelta, timezone
+    from datetime import datetime, timedelta
     due_time = (
         datetime.fromisoformat(deferred_until.replace("Z", "+00:00")) + timedelta(minutes=1)
     ).isoformat().replace("+00:00", "Z")

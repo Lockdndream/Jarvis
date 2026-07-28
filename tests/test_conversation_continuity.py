@@ -135,7 +135,9 @@ def test_second_conversation_is_isolated(client):
         ws_a.send_json({"type": "conversation_init", "conversation_id": None})
         cid_a = ws_a.receive_json()["conversation_id"]
         ws_a.send_json({"type": "user_message", "content": "conversation A secret", "conversation_id": cid_a})
-        ws_a.receive_json(); ws_a.receive_json(); ws_a.receive_json()
+        ws_a.receive_json()
+        ws_a.receive_json()
+        ws_a.receive_json()
 
     with client.websocket_connect("/ws") as ws_b:
         _drain_initial(ws_b)

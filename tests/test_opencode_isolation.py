@@ -10,7 +10,6 @@ not as part of this deterministic suite.
 import json
 import os
 import sys
-import tempfile
 
 import pytest
 

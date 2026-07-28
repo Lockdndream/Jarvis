@@ -5,19 +5,55 @@ import json
 import logging
 import os
 import uuid
+from datetime import datetime, timezone
 
 import app.database as db
 from app import notifications
 from app import attention_policy
 from app import worker_events
 from app import attention_manager
+from app import trace
 from app.integrations.opencode_server import OpenCodeServerManager
 from app.integrations.opencode_adapter import OpenCodeAdapter
 from app.integrations.opencode_events import normalize_question, normalize_permission, process_sse_event
+from app.operational_state import OperationalState
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_PORT = int(os.environ.get("JARVIS_OPENCODE_PORT", "4097"))
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _extract_result_text(messages: list) -> str | None:
+    """Delegated Observation and Reporting milestone: pure extraction from
+    OpenCodeAdapter.get_messages()'s response shape (verified directly
+    against a live completed session — each message has info.role and a
+    parts list; a part's type is "text", "tool", "reasoning", "step-start",
+    or "step-finish"). The delegated agent's own final natural-language
+    answer is the last text part of the last assistant message — that's
+    what a person would actually want read back, not internal reasoning
+    or raw tool output. Falls back to the last tool call's raw output only
+    if the agent never wrote a closing text part (e.g. it stopped right
+    after a tool call) — still substantive, just less readable. Returns
+    None if there's nothing usable; never raises on an unexpected shape."""
+    last_text = None
+    last_tool_output = None
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("info", {}).get("role") != "assistant":
+            continue
+        for part in msg.get("parts", []):
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "text" and part.get("text"):
+                last_text = part["text"]
+            elif part.get("type") == "tool":
+                output = part.get("state", {}).get("output")
+                if output:
+                    last_tool_output = output
+    return last_text or last_tool_output
 
 # Bounded SSE event-id dedup window: OpenCode's SSE reconnect can replay
 # recent events, and a flaky connection may deliver the same event twice.
@@ -46,13 +82,153 @@ class OpenCodeSupervisor:
         self._seen_event_ids: collections.deque = collections.deque(maxlen=_SEEN_EVENT_IDS_MAX)
         self._seen_event_ids_set: set[str] = set()
 
+        # ADR-022 Phase 3/4: explicit lifecycle state, separate from the
+        # server's own is_alive/check_health (which answer "is the process
+        # up" and "is it responding", not "what did the last operation do").
+        self.state: str = OperationalState.STOPPED
+        self.last_operation: str | None = None
+        self.last_operation_result: str | None = None  # "success" | "failure" | None (in progress)
+        self.last_operation_error: str | None = None
+        self.last_updated: str | None = None
+
+    def _claim(self, operation: str, from_states: set, to_state: str) -> bool:
+        """Synchronous, no-await state-transition gate. Because this never
+        awaits, two concurrent callers can never both see the same
+        pre-transition state — whichever coroutine's synchronous code runs
+        first wins the claim, and the loser sees the already-updated state.
+        This is the entire concurrency-safety mechanism for start/stop/
+        restart; the async bodies below assume the claim already happened
+        and never re-check state themselves."""
+        if self.state not in from_states:
+            return False
+        self.state = to_state
+        self.last_operation = operation
+        self.last_operation_result = None
+        self.last_operation_error = None
+        self.last_updated = _now_iso()
+        return True
+
+    def claim_start(self) -> bool:
+        return self._claim("start", {OperationalState.STOPPED, OperationalState.FAILED}, OperationalState.STARTING)
+
+    def claim_stop(self) -> bool:
+        return self._claim("stop", {OperationalState.RUNNING, OperationalState.FAILED}, OperationalState.STOPPING)
+
+    def claim_restart(self) -> bool:
+        return self._claim("restart", {OperationalState.RUNNING, OperationalState.FAILED}, OperationalState.STOPPING)
+
+    async def _do_start(self) -> tuple[bool, str | None]:
+        """Mechanics only -- deliberately does not touch
+        last_operation_result/error. A restart's stop sub-phase completing
+        must never make last_operation_result briefly read "success" for
+        the still-in-progress overall restart (found via live validation:
+        a poll landing between the stop and start phases saw exactly that).
+        Only run_claimed_start()/run_claimed_restart() finalize the
+        user-visible result, once the *whole* requested operation is done.
+
+        Caller must already hold a successful claim_start() (state ==
+        STARTING) before calling this -- this is also the fix for the
+        confirmed defect where start() never reset self._stopped, so
+        background loops recreated after a stop() would see self._stopped
+        already True and exit immediately."""
+        try:
+            self._stopped = False
+            await self.server.start()
+            self._sse_task = asyncio.create_task(self._sse_loop())
+            self._poll_task = asyncio.create_task(self._poll_loop())
+            await self.reconcile_on_startup()
+            self.state = OperationalState.RUNNING
+            logger.info("OpenCode supervisor started")
+            return True, None
+        except Exception as e:
+            self.state = OperationalState.FAILED
+            logger.error("OpenCode supervisor failed to start: %s", e, exc_info=True)
+            return False, str(e)
+
+    async def _do_stop(self) -> tuple[bool, str | None]:
+        """Mechanics only -- see _do_start()'s docstring for why this does
+        not touch last_operation_result/error itself. Caller must already
+        hold a successful claim_stop() (state == STOPPING)."""
+        try:
+            self._stopped = True
+            if self._sse_task:
+                self._sse_task.cancel()
+                try:
+                    await self._sse_task
+                except asyncio.CancelledError:
+                    pass
+                self._sse_task = None
+            if self._poll_task:
+                self._poll_task.cancel()
+                try:
+                    await self._poll_task
+                except asyncio.CancelledError:
+                    pass
+                self._poll_task = None
+            await self.server.stop()
+            self.state = OperationalState.STOPPED
+            logger.info("OpenCode supervisor stopped")
+            return True, None
+        except Exception as e:
+            self.state = OperationalState.FAILED
+            logger.error("OpenCode supervisor failed to stop: %s", e, exc_info=True)
+            return False, str(e)
+
+    def _finalize(self, ok: bool, error: str | None) -> bool:
+        self.last_operation_result = "success" if ok else "failure"
+        self.last_operation_error = error
+        self.last_updated = _now_iso()
+        return ok
+
+    async def run_claimed_start(self) -> bool:
+        ok, error = await self._do_start()
+        return self._finalize(ok, error)
+
+    async def run_claimed_stop(self) -> bool:
+        ok, error = await self._do_stop()
+        return self._finalize(ok, error)
+
+    async def run_claimed_restart(self) -> bool:
+        """Caller must already hold a successful claim_restart() (state ==
+        STOPPING) before calling this. Stop and start are sequenced, not
+        atomic: if stop fails, start is never attempted and the true state
+        (FAILED) is left in place rather than reporting a false restart."""
+        stopped_ok, stop_error = await self._do_stop()
+        if not stopped_ok:
+            return self._finalize(False, stop_error)
+        # _do_stop() already set state to STOPPED; advance straight to
+        # STARTING with no intervening await, so no other caller can
+        # observe or act on the momentary STOPPED state.
+        self.state = OperationalState.STARTING
+        self.last_updated = _now_iso()
+        started_ok, start_error = await self._do_start()
+        return self._finalize(started_ok, start_error)
+
     async def start(self) -> None:
-        """Start the OpenCode server and background supervision loops."""
-        await self.server.start()
-        self._sse_task = asyncio.create_task(self._sse_loop())
-        self._poll_task = asyncio.create_task(self._poll_loop())
-        logger.info("OpenCode supervisor started")
-        await self.reconcile_on_startup()
+        """Idempotent entry point for internal callers (app lifespan). A
+        no-op if already running or starting."""
+        if not self.claim_start():
+            return
+        await self.run_claimed_start()
+
+    async def snapshot_status(self) -> dict:
+        """Live status: state + last-operation bookkeeping (sync fields)
+        plus a real health check (ADR-022 Phase 4) — state and health are
+        deliberately different questions. Health is only meaningful while
+        RUNNING; a server that is STOPPED or mid-transition has no health
+        to report, not "unhealthy"."""
+        if self.state == OperationalState.RUNNING:
+            health = "HEALTHY" if await self.server.check_health() else "UNHEALTHY"
+        else:
+            health = "UNKNOWN"
+        return {
+            "state": self.state,
+            "health": health,
+            "last_operation": self.last_operation,
+            "last_operation_result": self.last_operation_result,
+            "last_operation_error": self.last_operation_error,
+            "last_updated": self.last_updated,
+        }
 
     async def reconcile_on_startup(self) -> None:
         """Attempt to upgrade 'degraded' OpenCode tasks (left ambiguous by a
@@ -88,21 +264,11 @@ class OpenCodeSupervisor:
                     upgraded, len(degraded), len(degraded) - upgraded)
 
     async def stop(self) -> None:
-        self._stopped = True
-        if self._sse_task:
-            self._sse_task.cancel()
-            try:
-                await self._sse_task
-            except asyncio.CancelledError:
-                pass
-        if self._poll_task:
-            self._poll_task.cancel()
-            try:
-                await self._poll_task
-            except asyncio.CancelledError:
-                pass
-        await self.server.stop()
-        logger.info("OpenCode supervisor stopped")
+        """Idempotent entry point for internal callers (app lifespan). A
+        no-op if already stopped or stopping."""
+        if not self.claim_stop():
+            return
+        await self.run_claimed_stop()
 
     async def start_session(
         self, project_dir: str, instruction: str,
@@ -119,10 +285,19 @@ class OpenCodeSupervisor:
         """
         task_id = f"oc_{uuid.uuid4().hex[:12]}"
         session_id = await self.adapter.create_session(project_dir)
-        logger.info("opencode task/session mapping created: task_id=%s session_id=%s", task_id, session_id)
+        logger.info("opencode task/session mapping created: task_id=%s session_id=%s", task_id, session_id, extra={"task_id": task_id, "session_id": session_id})
 
-        db.create_task_record(task_id, f"OpenCode: {instruction[:50]}", instruction)
-        db.create_opencode_task_record(task_id, session_id, project_dir, instruction)
+        # ADR-020: start_session() is reached from Supervisor.process_message()
+        # via ToolRegistry.call() -> _start_opencode_task(), several layers
+        # below the Supervisor -- read the current turn's trace_id from the
+        # ContextVar rather than threading a new parameter through that whole
+        # chain. This is the hard case ADR-020 exists to solve: OpenCode's
+        # own completion arrives asynchronously, potentially long after this
+        # turn has already returned, so trace_id must be persisted on the
+        # row now, at creation, not passed through a live callback later.
+        trace_id = trace.current_trace_id()
+        db.create_task_record(task_id, f"OpenCode: {instruction[:50]}", instruction, trace_id=trace_id)
+        db.create_opencode_task_record(task_id, session_id, project_dir, instruction, trace_id=trace_id)
 
         await self._notify_broadcast({
             "type": "opencode_task_created",
@@ -135,7 +310,7 @@ class OpenCodeSupervisor:
         self._error_since_prompt[task_id] = False
 
         await self.adapter.send_prompt(session_id, project_dir, instruction, provider_id=provider_id, model_id=model_id)
-        logger.info("opencode instruction submitted: task_id=%s session_id=%s", task_id, session_id)
+        logger.info("opencode instruction submitted: task_id=%s session_id=%s", task_id, session_id, extra={"task_id": task_id, "session_id": session_id})
 
         return {"task_id": task_id, "session_id": session_id, "name": f"OpenCode: {instruction[:50]}"}
 
@@ -151,7 +326,7 @@ class OpenCodeSupervisor:
             raise ValueError(f"Task '{task_id}' is not an OpenCode task")
         self._error_since_prompt[task_id] = False
         await self.adapter.send_prompt(oc_task["session_id"], oc_task["project_dir"], instruction)
-        logger.info("opencode instruction submitted: task_id=%s session_id=%s", task_id, oc_task["session_id"])
+        logger.info("opencode instruction submitted: task_id=%s session_id=%s", task_id, oc_task["session_id"], extra={"task_id": task_id, "session_id": oc_task["session_id"]})
 
     async def cancel_session(self, task_id: str) -> str:
         """Cancel an OpenCode session by Jarvis task_id."""
@@ -175,6 +350,39 @@ class OpenCodeSupervisor:
         # about a source that no longer exists.
         await attention_manager.cancel_for_task(task_id)
         return f"OpenCode task {task_id} cancelled"
+
+    async def fetch_task_result_text(self, task_id: str) -> str | None:
+        """Delegated Observation and Reporting milestone: fetches the
+        delegated agent's own final answer for a task, on demand, from
+        OpenCode's own message history — adapter.get_messages() already
+        existed (Milestone 9A) but was never called anywhere; OpenCode
+        retains the real conversation itself, Jarvis only needed to ask
+        for it rather than only watching the SSE activity stream for
+        "something happened" evidence. Returns None (never raises) if the
+        task is unknown, OpenCode is unreachable, or there's no text
+        content to extract — callers decide how to degrade."""
+        oc_task = db.get_opencode_task(task_id)
+        if not oc_task:
+            return None
+        try:
+            messages = await self.adapter.get_messages(oc_task["session_id"], oc_task["project_dir"])
+        except Exception:
+            logger.warning("Failed to fetch OpenCode messages for task_id=%s", task_id, exc_info=True)
+            return None
+        return _extract_result_text(messages)
+
+    async def _capture_task_result(self, task_id: str) -> None:
+        """Best-effort persistence at terminal-state time (see
+        _handle_session_idle/_handle_session_failed) — a capture failure
+        must never affect the terminal state transition that already
+        happened by the time this runs; get_task_result (app/supervisor/
+        tools.py) falls back to a live fetch if nothing was persisted."""
+        try:
+            text = await self.fetch_task_result_text(task_id)
+            if text:
+                db.update_opencode_task_result(task_id, text[:4000])
+        except Exception:
+            logger.warning("Failed to capture result for task_id=%s", task_id, exc_info=True)
 
     def _clear_waiting_state(self, task_id: str) -> None:
         """After a question/permission is resolved, resume the task —
@@ -308,7 +516,6 @@ class OpenCodeSupervisor:
 
     async def _poll_loop(self) -> None:
         """Background task polling for questions/permissions (backup for SSE)."""
-        polled_dirs = set()
         while not self._stopped:
             try:
                 running_tasks = db.get_opencode_running_tasks()
@@ -516,10 +723,31 @@ class OpenCodeSupervisor:
         task = db.get_task(task_id)
         if task and task["status"] in ("completed", "failed", "cancelled"):
             return  # already terminal — ignore late/duplicate error evidence
-        logger.info("opencode task terminal state observed: task_id=%s status=failed evidence=session.error", task_id)
+        oc_task = db.get_opencode_task(task_id)
+        duration = (datetime.now(timezone.utc) - datetime.fromisoformat(oc_task["created_at"].replace("Z", "+00:00"))).total_seconds() if oc_task else 0.0
+        # M-OX.3 live-validation finding: this handler runs on the SSE
+        # loop's own asyncio Task, not the turn's -- trace.current_trace_id()
+        # is always None here. Recover it from the row instead, exactly the
+        # mechanism ADR-020 built start_session()'s persist-at-creation for.
+        terminal_trace_id = oc_task.get("trace_id") if oc_task else None
+        # M-OX.3 live-validation finding (Phase 4, incorrect severity): a
+        # genuine task failure was logged at INFO -- severity-based
+        # filtering/alerting for real errors would silently miss every
+        # OpenCode task failure. This is the one call site in this method
+        # that reports an actual failure; WARNING is correct here even
+        # though the method's other logging (activity, non-terminal
+        # states) legitimately stays at INFO.
+        logger.warning(
+            "opencode task terminal state observed: task_id=%s status=failed evidence=session.error", task_id,
+            extra={"task_id": task_id, "status": "failed", "duration_seconds": duration, "trace_id": terminal_trace_id},
+        )
         db.update_task_status(task_id, "failed", -1)
         db.update_opencode_task_status(task_id, "failed")
         db.update_opencode_task_evidence(task_id, "session.error")
+        # Delegated Observation and Reporting milestone: a failed task can
+        # still have a useful partial result (e.g. the agent's own
+        # explanation of what went wrong) -- same capture path as success.
+        await self._capture_task_result(task_id)
         if task_id in self._completion_events:
             self._completion_events[task_id].set()
         await self._notify_broadcast({
@@ -563,10 +791,24 @@ class OpenCodeSupervisor:
         if pending:
             return  # genuinely waiting on the user, not complete
 
-        logger.info("opencode task terminal state observed: task_id=%s status=completed evidence=session.idle", task_id)
+        oc_task = db.get_opencode_task(task_id)
+        duration = (datetime.now(timezone.utc) - datetime.fromisoformat(oc_task["created_at"].replace("Z", "+00:00"))).total_seconds() if oc_task else 0.0
+        # M-OX.3 live-validation finding: see the matching comment in
+        # _handle_session_failed() -- same asyncio-Task-boundary issue.
+        terminal_trace_id = oc_task.get("trace_id") if oc_task else None
+        logger.info(
+            "opencode task terminal state observed: task_id=%s status=completed evidence=session.idle", task_id,
+            extra={"task_id": task_id, "status": "completed", "duration_seconds": duration, "trace_id": terminal_trace_id},
+        )
         db.update_task_status(task_id, "completed", 0)
         db.update_opencode_task_status(task_id, "completed")
         db.update_opencode_task_evidence(task_id, "session.idle")
+        # Delegated Observation and Reporting milestone: capture the
+        # delegated agent's own final answer *before* announcing
+        # completion, so a follow-up question asked right after "task
+        # completed" already has something to answer from — not a second,
+        # separate round trip the user has to wait through.
+        await self._capture_task_result(task_id)
         if task_id in self._completion_events:
             self._completion_events[task_id].set()
         await self._notify_broadcast({
@@ -594,9 +836,21 @@ class OpenCodeSupervisor:
         if task_id == "unknown":
             return
         task = db.get_task(task_id)
-        first_activity = task is not None and db.get_opencode_task(task_id) and not db.get_opencode_task(task_id).get("last_evidence_type")
+        oc_task_for_log = db.get_opencode_task(task_id)
+        first_activity = task is not None and oc_task_for_log and not oc_task_for_log.get("last_evidence_type")
+        # M-OX.3 live-validation finding: these two lines carried neither
+        # task_id nor trace_id in structured output, unlike their sibling
+        # terminal-state log lines in the same class -- an obviously
+        # incomplete fix if left inconsistent. Same row-recovery mechanism
+        # as _handle_session_failed()/_handle_session_idle() (this handler
+        # also runs on the SSE loop's own asyncio Task, no ambient binding).
+        activity_extra = {
+            "task_id": task_id,
+            "trace_id": oc_task_for_log.get("trace_id") if oc_task_for_log else None,
+            "evidence_type": event.get("evidence_type"),
+        }
         if first_activity:
-            logger.info("opencode first execution event observed: task_id=%s evidence=%s", task_id, event.get("evidence_type"))
+            logger.info("opencode first execution event observed: task_id=%s evidence=%s", task_id, event.get("evidence_type"), extra=activity_extra)
         else:
             # Demo visibility (Milestone 9B.10): the first-event log above
             # was the only console output for an entire task's execution --
@@ -604,7 +858,7 @@ class OpenCodeSupervisor:
             # This line makes the already-real, already-streaming OpenCode
             # activity visible continuously instead of one line then a long
             # silent gap. Purely additive logging -- no control flow change.
-            logger.info("opencode activity: task_id=%s evidence=%s", task_id, event.get("evidence_type"))
+            logger.info("opencode activity: task_id=%s evidence=%s", task_id, event.get("evidence_type"), extra=activity_extra)
         db.update_opencode_task_evidence(task_id, event.get("evidence_type", "activity"))
         if task and task["status"] not in ("waiting_for_user", "completed", "failed", "cancelled"):
             db.update_task_status(task_id, "running")

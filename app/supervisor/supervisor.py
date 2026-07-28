@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import uuid
+from typing import Any
 
 import app.database as db
 from app.supervisor.tools import ToolRegistry
@@ -15,11 +16,13 @@ from app.supervisor.llm import LLMProvider, FakeLLMProvider
 from app.supervisor.context import build_context
 from app import deferral
 from app import attention_manager
+from app import trace
+from app.connection_manager import ConnectionManager
 
 logger = logging.getLogger(__name__)
 
 MAX_TOOL_CALLS = 5
-def _supervisor_enabled():
+def _supervisor_enabled() -> bool:
     return os.environ.get("JARVIS_SUPERVISOR_ENABLED", "1") == "1"
 
 
@@ -55,7 +58,7 @@ def get_supervisor_state() -> str:
     return "processing" if _active_turns > 0 else "idle"
 
 
-def set_broadcast_hook(conn_manager) -> None:
+def set_broadcast_hook(conn_manager: ConnectionManager) -> None:
     global _broadcast_hook
     _broadcast_hook = conn_manager
 
@@ -68,9 +71,13 @@ async def _broadcast(event_type: str, payload: dict) -> None:
     # facing hot path for a subsystem nobody is currently watching.
     if _broadcast_hook is None or not _broadcast_hook.has_observers():
         return
+    # ADR-020: every call site of _broadcast() runs inside the same
+    # asyncio Task that process_message() bound a trace_id into, so this
+    # is always the current turn's trace_id (or None outside any turn).
+    trace_id = trace.current_trace_id()
     try:
-        content = json.dumps(payload)
-        db.save_event(event_type, content)
+        content = json.dumps({**payload, "trace_id": trace_id})
+        db.save_event(event_type, content, trace_id=trace_id)
         await _broadcast_hook.broadcast_observers({"type": event_type, "timestamp": db.utcnow(), "content": content})
     except Exception as e:
         logger.warning("%s broadcast failed (state unaffected): %s", event_type, e)
@@ -91,6 +98,7 @@ You have access to a set of bounded tools. Use them to answer the user's questio
 9. When the user says "Stop it" and there is exactly one cancellable task, use cancel_task.
 10. When the user provides a follow-up instruction about an active task, use send_opencode_instruction.
 11. Your responses are spoken aloud by text-to-speech, never displayed as formatted text. Never use markdown (no **bold**, no #headings, no bullet lists, no code fences) — plain spoken sentences only.
+12. When the user asks what a completed or failed task found, did, or reported (e.g. "what did it find", "list the modified files", "what changed"), use get_task_result — never start a new task to re-answer a question about one that already finished.
 
 ## Available Tools
 Use the provided function definitions to interact with Jarvis services.
@@ -100,14 +108,14 @@ Use the provided function definitions to interact with Jarvis services.
 class Supervisor:
     """Main supervisor orchestrator."""
 
-    def __init__(self, task_manager=None, opencode_supervisor=None):
+    def __init__(self, task_manager: Any = None, opencode_supervisor: Any = None) -> None:
         self.tm = task_manager
         self.oc = opencode_supervisor
         self.tools = ToolRegistry(task_manager, opencode_supervisor)
-        self._llm = None
+        self._llm: LLMProvider | FakeLLMProvider | None = None
         self._configure_llm()
 
-    def _configure_llm(self):
+    def _configure_llm(self) -> None:
         if os.environ.get("JARVIS_LLM_API_KEY"):
             self._llm = LLMProvider()
         elif os.environ.get("JARVIS_TEST_MODE") == "1" or not _supervisor_enabled():
@@ -116,12 +124,13 @@ class Supervisor:
             self._llm = FakeLLMProvider()
 
     @property
-    def llm(self):
+    def llm(self) -> LLMProvider | FakeLLMProvider | None:
         return self._llm
 
     async def process_message(
         self, user_message: str, conversation_id: str | None = None,
         bound_attention_request_id: str | None = None,
+        confirm_before_tools: frozenset[str] | None = None,
     ) -> dict:
         """Public entry point -- see _process_message_inner for the actual
         logic. This thin wrapper only maintains the Control Center's
@@ -129,19 +138,39 @@ class Supervisor:
         once, is simpler and safer than threading an increment/decrement
         through every one of _process_message_inner's several early-return
         branches, and correctly still decrements even if something in
-        there raises past its own exception handling."""
+        there raises past its own exception handling.
+
+        confirm_before_tools (Interaction Layer v1, Goal 5): tool names
+        that must be read back to the user for confirmation before
+        executing, instead of running immediately when the LLM proposes
+        them. Only VoiceSessionManager ever passes this (voice-specific —
+        speech recognition can mis-hear technical identifiers in a way
+        typed text cannot); every other/existing caller passes None,
+        unchanged behavior."""
         global _active_turns
         _active_turns += 1
+        # ADR-020: one trace_id per turn (per unit of work), bound into a
+        # ContextVar for the duration of this asyncio Task so every layer
+        # below -- tool persistence, OpenCode task creation -- can read it
+        # via trace.current_trace_id() without threading a new parameter
+        # through ToolRegistry.call() and every tool handler signature.
+        trace_id = trace.new_trace_id()
+        token = trace.bind_trace_id(trace_id)
         try:
-            return await self._process_message_inner(
+            result = await self._process_message_inner(
                 user_message, conversation_id, bound_attention_request_id,
+                confirm_before_tools,
             )
+            result["trace_id"] = trace_id
+            return result
         finally:
+            trace.reset_trace_id(token)
             _active_turns -= 1
 
     async def _process_message_inner(
         self, user_message: str, conversation_id: str | None = None,
         bound_attention_request_id: str | None = None,
+        confirm_before_tools: frozenset[str] | None = None,
     ) -> dict:
         """Process a user message through the supervisor.
 
@@ -252,10 +281,18 @@ class Supervisor:
         # Main tool-call loop
         tool_call_count = 0
         final_content = None
+        # Interaction Layer v1 (Goal 5): set when the LLM proposes a tool
+        # in confirm_before_tools -- the loop stops *before* calling it,
+        # so nothing executes until the user confirms on the next turn
+        # (see VoiceSessionManager's STATE_CONFIRMING handling, the only
+        # caller that ever passes a non-empty confirm_before_tools; text/
+        # browser chat callers pass none and this is always None for them,
+        # unchanged behavior).
+        pending_confirmation = None
 
         try:
             while tool_call_count < MAX_TOOL_CALLS:
-                llm_response = await self._llm.chat_completion(messages, tools=tool_defs)
+                llm_response = await self._llm.chat_completion(messages, tools=tool_defs)  # type: ignore[union-attr]  # TODO(F1.x): self._llm always non-None post-__init__; _configure_llm() sets on all branches
 
                 if llm_response.get("tool_calls"):
                     tool_call_count += 1
@@ -269,7 +306,11 @@ class Supervisor:
                         except json.JSONDecodeError:
                             args = {}
 
-                        logger.info("Tool call #%d: %s(%s)", tool_call_count, name, func["arguments"][:100])
+                        if confirm_before_tools and name in confirm_before_tools:
+                            pending_confirmation = {"name": name, "args": args}
+                            break
+
+                        logger.info("Tool call #%d: %s(%s)", tool_call_count, name, func["arguments"][:100], extra={"conversation_id": conversation_id, "tool": name})
                         result = await self.tools.call(name, args)
                         _persist_tool_call(conversation_id, name, args, result)
                         await _broadcast("supervisor_tool_call", {
@@ -285,6 +326,10 @@ class Supervisor:
                             "tool_call_id": tc["id"],
                             "content": result,
                         })
+
+                    if pending_confirmation:
+                        final_content = _build_confirmation_prompt(pending_confirmation["name"], pending_confirmation["args"])
+                        break
                 else:
                     final_content = llm_response.get("content") or "Done."
                     break
@@ -304,7 +349,54 @@ class Supervisor:
         _persist_conversation(conversation_id, "user", user_message)
         _persist_conversation(conversation_id, "assistant", final_content)
 
-        return await _emit_turn(final_content, tool_call_count=tool_call_count)
+        turn_result = await _emit_turn(final_content, tool_call_count=tool_call_count)
+        if pending_confirmation:
+            turn_result["pending_tool_call"] = pending_confirmation
+        return turn_result
+
+    async def resolve_pending_tool_confirmation(
+        self, conversation_id: str, transcript: str, pending_tool_call: dict,
+    ) -> dict:
+        """Interaction Layer v1 (Goal 5): resolves a yes/no reply to a
+        confirmation prompt _build_confirmation_prompt generated. Called
+        only by VoiceSessionManager while a session is in STATE_CONFIRMING
+        — never re-enters the LLM tool loop, since the user is confirming
+        exact arguments already proposed on a prior turn, not starting a
+        new one. Mirrors process_message()'s persistence/broadcast/return
+        shape (including an optional pending_tool_call in the result, for
+        an "unclear" reply that re-asks rather than guessing) so the
+        caller can treat both the same way."""
+        _persist_conversation(conversation_id, "user", transcript)
+        decision = _classify_yes_no(transcript)
+        name = pending_tool_call["name"]
+        args = pending_tool_call["args"]
+
+        if decision == "yes":
+            logger.info(
+                "Confirmed tool call: %s(%s)", name, json.dumps(args)[:100],
+                extra={"conversation_id": conversation_id, "tool": name},
+            )
+            result = await self.tools.call(name, args)
+            _persist_tool_call(conversation_id, name, args, result)
+            await _broadcast("supervisor_tool_call", {
+                "conversation_id": conversation_id,
+                "sequence": 1,
+                "tool": name,
+                "args": args,
+                "result_summary": result[:300] if isinstance(result, str) else str(result)[:300],
+            })
+            response = result if isinstance(result, str) else str(result)
+            _persist_conversation(conversation_id, "assistant", response)
+            return {"response": response, "conversation_id": conversation_id}
+
+        if decision == "no":
+            response = "Okay, I won't do that. What would you like instead?"
+            _persist_conversation(conversation_id, "assistant", response)
+            return {"response": response, "conversation_id": conversation_id}
+
+        response = "Sorry, was that a yes or a no?"
+        _persist_conversation(conversation_id, "assistant", response)
+        return {"response": response, "conversation_id": conversation_id, "pending_tool_call": pending_tool_call}
 
     def _build_tool_definitions(self) -> list[dict]:
         definitions = self.tools.list_definitions()
@@ -466,13 +558,15 @@ async def _resolve_defer_command(msg: str, bound_attention_request_id: str | Non
     if result.kind == "vague":
         return result.message
 
-    ok = await attention_manager.defer(target_id, result.deferred_until)
+    deferred_until = result.deferred_until
+    assert deferred_until is not None  # guaranteed: kind="resolved" always has deferred_until set (deferral.py)
+    ok = await attention_manager.defer(target_id, deferred_until)
     if not ok:
         return "I couldn't defer that — it may have already been resolved."
-    return f"Okay. I'll come back to this {_describe_relative(result.deferred_until)}."
+    return f"Okay. I'll come back to this {_describe_relative(deferred_until)}."
 
 
-async def _resolve_bound_command(msg: str, tools, attention_request_id: str) -> str | None:
+async def _resolve_bound_command(msg: str, tools: ToolRegistry, attention_request_id: str) -> str | None:
     """Milestone 8 Phase 12: same grammar as _resolve_deterministic_command,
     but always targets the bound AttentionRequest's exact source — never
     counts pending items, never asks "which one". If the bound request is
@@ -521,7 +615,7 @@ async def _resolve_bound_command(msg: str, tools, attention_request_id: str) -> 
     return None
 
 
-async def _resolve_deterministic_command(msg: str, tools) -> str | None:
+async def _resolve_deterministic_command(msg: str, tools: ToolRegistry) -> str | None:
     """Deterministic, LLM-free resolution for "Answer B", "Approve it",
     "Reject it", "Stop it" (and close variants).
 
@@ -596,15 +690,72 @@ async def _resolve_deterministic_command(msg: str, tools) -> str | None:
 
 # ── Conversation persistence ──────────────────────────────────────
 
-def _persist_conversation(conversation_id: str, role: str, content: str):
-    """Store a conversation message."""
-    db.save_conversation_message(conversation_id, role, content)
+# Interaction Layer v1 (Goal 5): a small, deterministic yes/no grammar —
+# matches this module's existing no-guessing-under-ambiguity philosophy
+# (_resolve_deterministic_command above). Never inferred from arbitrary
+# phrasing — an unmatched (or self-contradictory) reply is "unclear", not
+# silently treated as either answer.
+#
+# Word/phrase-boundary matching, not prefix-only: a real-device finding
+# during capability testing (Level 5) showed a natural correction —
+# "that was a no, I need you to..." — silently fell through as "unclear"
+# because the leading-prefix check only ever looked at the first word.
+# People embed "yes"/"no" naturally anywhere in a sentence ("no, that's
+# not what I said"), especially when correcting a misunderstanding; the
+# matcher has to find the word, not just the start of the string. Single
+# words are matched on token boundaries (so "know" never matches "no");
+# multi-word phrases are matched as substrings of the punctuation-
+# stripped text, since they can't be tokens themselves.
+_YES_TOKENS = frozenset({"yes", "yeah", "yep", "yup", "correct", "right", "confirm", "confirmed", "sure", "affirmative"})
+_NO_TOKENS = frozenset({"no", "nope", "negative", "wrong", "incorrect", "cancel", "don't", "stop"})
+_YES_PHRASES = ("go ahead", "do it")
+_NO_PHRASES = ("never mind",)
 
 
-def _persist_tool_call(conversation_id: str, tool_name: str, args: dict, result: str):
+def _classify_yes_no(transcript: str) -> str:
+    cleaned = transcript.strip().lower()
+    tokens = set(re.findall(r"[a-z']+", cleaned))
+
+    is_yes = bool(tokens & _YES_TOKENS) or any(p in cleaned for p in _YES_PHRASES)
+    is_no = bool(tokens & _NO_TOKENS) or any(p in cleaned for p in _NO_PHRASES)
+
+    if is_yes and is_no:
+        return "unclear"  # e.g. "no wait yes" -- genuinely ambiguous, never guess
+    if is_yes:
+        return "yes"
+    if is_no:
+        return "no"
+    return "unclear"
+
+
+def _build_confirmation_prompt(name: str, args: dict) -> str:
+    """Interaction Layer v1 (Goal 5): read back a technical delegation
+    instruction before executing it. Speech recognition can silently
+    mis-hear filenames/extensions/technical identifiers — a real, live
+    finding during capability testing: "level3_probe.txt" was transcribed
+    as "level 3_probe.text" and executed exactly as heard, with no chance
+    to catch it. Scoped to start_opencode_task only (per the milestone's
+    own scope): the one tool whose arguments are free-form technical text
+    with a real filesystem side effect — other tools take small enums/IDs
+    the deterministic fast paths or the LLM already resolve safely."""
+    if name == "start_opencode_task":
+        instruction = args.get("instruction", "")
+        project = args.get("project_alias", "the project")
+        return f"I heard: {instruction} — for the {project} project. Should I go ahead?"
+    return "Should I go ahead with that?"
+
+
+def _persist_conversation(conversation_id: str, role: str, content: str) -> None:
+    """Store a conversation message. trace_id (ADR-020) is read from the
+    ContextVar rather than threaded as a parameter -- every call site sits
+    inside the same asyncio Task process_message() bound it into."""
+    db.save_conversation_message(conversation_id, role, content, trace_id=trace.current_trace_id())
+
+
+def _persist_tool_call(conversation_id: str, tool_name: str, args: dict, result: str) -> None:
     """Store a tool call as a tool-role message."""
     content = json.dumps({"tool": tool_name, "args": args, "result": result[:500]})
-    db.save_conversation_message(conversation_id, "tool", content)
+    db.save_conversation_message(conversation_id, "tool", content, trace_id=trace.current_trace_id())
 
 
 def _load_conversation(conversation_id: str, max_turns: int = 10) -> list[dict]:

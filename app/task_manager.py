@@ -102,6 +102,7 @@ class TaskManager:
         )
 
         self._processes[task_id] = proc
+        assert proc.stdin is not None  # guaranteed by stdin=PIPE
         self._stdins[task_id] = proc.stdin
         create_task_record(task_id, name, "/mock-agent")
 

@@ -35,8 +35,7 @@ class FakeOpenCodeServer:
     """In-process fake OpenCode HTTP server for testing."""
 
     def __init__(self):
-        import httpx
-        from socket import socket, AF_INET, SOCK_STREAM
+        from socket import AF_INET, SOCK_STREAM, socket
 
         sock = socket(AF_INET, SOCK_STREAM)
         sock.bind(("127.0.0.1", 0))
@@ -128,7 +127,7 @@ class FakeOpenCodeServer:
 
         @app.post("/question/{request_id}/reply")
         async def reply_question(request_id: str, request: Request):
-            body = await request.json()
+            await request.json()
             svc.questions = [q for q in svc.questions if q.get("requestID") != request_id]
             return "", 204
 

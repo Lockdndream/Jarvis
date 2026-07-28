@@ -7,7 +7,7 @@ PROJECTS_FILE = os.environ.get(
     os.path.join(os.path.dirname(__file__), "..", "..", "projects.json"),
 )
 
-_default_projects = {}
+_default_projects: dict = {}
 
 
 def _load_projects() -> dict:

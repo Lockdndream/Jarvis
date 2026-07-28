@@ -1,5 +1,4 @@
 """Normalize OpenCode native events into Jarvis internal events."""
-import json
 import logging
 
 logger = logging.getLogger(__name__)

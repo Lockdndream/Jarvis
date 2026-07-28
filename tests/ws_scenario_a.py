@@ -1,5 +1,8 @@
 """Quick WebSocket test for scenario A (deterministic fast path)."""
-import asyncio, json, websockets
+import asyncio
+import json
+
+import websockets
 
 async def main():
     ws = await websockets.connect("ws://127.0.0.1:8000/ws")

@@ -1,0 +1,86 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jarvis"
+version = "0.1.0"
+description = "Local-first personal AI assistant"
+requires-python = ">=3.11"
+readme = "README.md"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.34.0",
+    "httpx>=0.28.0",
+    "python-dotenv>=1.1.0",
+    "pywebpush>=2.0.0",
+    "PyJWT>=2.10.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24.0",
+    "websockets>=12.0",
+    "playwright>=1.40.0",
+    "pytest-timeout>=2.3.0",
+]
+dev = [
+    "ruff>=0.16,<0.17",
+    "mypy>=2.3,<3",
+    "jarvis[test]",
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.setuptools.package-data]
+app = ["static/**/*", "operations_static/**/*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = [
+    "spikes",
+    "android",
+    "logs",
+    ".playwright",
+    "app/static",
+    "app/operations_static",
+    "certs",
+]
+
+[tool.ruff.lint]
+# Phase 1 scope is deliberately narrow: pyflakes (real bugs) + pycodestyle errors.
+# E501 (line length): this codebase predates any linter; reformatting ~18k lines is out
+#   of scope for F1 — see MILESTONE_F1 "no over-engineering".
+# E402 (import not at top): load-bearing here. app/main.py calls load_dotenv() before its
+#   imports because downstream modules read env vars at import time (see F1.12 "vars frozen
+#   at import time"). Tests bootstrap sys.path the same way. "Fixing" these would break
+#   startup. Revisit after F1.12 centralizes config.
+# Strictness ramps post-F1: E402, I (isort), UP (pyupgrade), B (bugbear), SIM.
+select = ["E", "F"]
+ignore = ["E501", "E402"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+exclude = "^(spikes|android|\\.playwright)/"
+warn_redundant_casts = true
+# Phase 1 is default (non-strict) checking across app/. Per-module strictness for the five
+# modules named in MILESTONE_F1 F1.3 is added in a follow-up task. Strictness ramps post-F1.
+
+# MILESTONE_F1 F1.3: the five modules named in the milestone get stricter checking.
+# Strictness ramps to the rest of app/ post-F1.
+[[tool.mypy.overrides]]
+module = [
+    "app.database",
+    "app.supervisor.supervisor",
+    "app.supervisor.tools",
+    "app.connection_manager",
+    "app.interruption_policy",
+]
+disallow_untyped_defs = true

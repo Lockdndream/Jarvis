@@ -8,7 +8,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from app.integrations.ws_tokens import (
     DEFAULT_TTL_SECONDS,
-    TokenVerificationResult,
     _get_secret,
     issue_ws_token,
     verify_ws_token,

@@ -1,3 +1,4 @@
+import json
 import re
 import sqlite3
 import uuid
@@ -6,25 +7,25 @@ from datetime import datetime, timezone
 DB_PATH = "jarvis.db"
 
 
-def get_conn():
+def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     return conn
 
 
-def save_event(event_type: str, content: str | None = None):
+def save_event(event_type: str, content: str | None = None, trace_id: str | None = None) -> None:
     conn = get_conn()
     timestamp = utcnow()
     conn.execute(
-        "INSERT INTO events (type, timestamp, content) VALUES (?, ?, ?)",
-        (event_type, timestamp, content),
+        "INSERT INTO events (type, timestamp, content, trace_id) VALUES (?, ?, ?, ?)",
+        (event_type, timestamp, content, trace_id),
     )
     conn.commit()
     conn.close()
 
 
-def get_recent_events(limit: int = 100):
+def get_recent_events(limit: int = 100) -> list[dict]:
     conn = get_conn()
     rows = conn.execute(
         "SELECT type, timestamp, content FROM events ORDER BY id DESC LIMIT ?",
@@ -37,21 +38,54 @@ def get_recent_events(limit: int = 100):
     ]
 
 
+def get_events_by_trace_id(trace_id: str) -> list[dict]:
+    """ADR-020: every event recorded during one traced unit of work, in
+    emission order. The minimal read path proving trace_id actually
+    survives end-to-end — the full Execution Trace surface (joining in
+    conversations/tasks/opencode_tasks) is a later milestone's job."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT id, type, timestamp, content, trace_id FROM events WHERE trace_id=? ORDER BY id ASC",
+        (trace_id,),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def purge_events_older_than(days: int, now: str | None = None) -> int:
+    """ADR-020 retention policy: delete `events` rows older than `days`.
+    `events` is the fastest-growing trace-carrying table (one row per
+    broadcastable turn/tool-call/lifecycle step) and the one this milestone
+    puts a concrete ceiling on; the other eight tables TD-019 already names
+    remain open. Returns the number of rows deleted. Not wired to a
+    scheduler here — that is an operational/plumbing concern for a later
+    milestone; this function is the enforceable policy itself."""
+    from datetime import timedelta
+
+    now_dt = datetime.fromisoformat((now or utcnow()).replace("Z", "+00:00"))
+    cutoff = (now_dt - timedelta(days=days)).isoformat().replace("+00:00", "Z")
+    conn = get_conn()
+    cur = conn.execute("DELETE FROM events WHERE timestamp < ?", (cutoff,))
+    conn.commit()
+    conn.close()
+    return cur.rowcount
+
+
 def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def create_task_record(task_id: str, name: str, command: str):
+def create_task_record(task_id: str, name: str, command: str, trace_id: str | None = None) -> None:
     conn = get_conn()
     conn.execute(
-        "INSERT INTO tasks (task_id, name, command, started_at) VALUES (?, ?, ?, ?)",
-        (task_id, name, command, utcnow()),
+        "INSERT INTO tasks (task_id, name, command, started_at, trace_id) VALUES (?, ?, ?, ?, ?)",
+        (task_id, name, command, utcnow(), trace_id),
     )
     conn.commit()
     conn.close()
 
 
-def update_task_status(task_id: str, status: str, exit_code: int | None = None):
+def update_task_status(task_id: str, status: str, exit_code: int | None = None) -> None:
     conn = get_conn()
     completed_at = utcnow() if status in ("completed", "failed", "cancelled") else None
     conn.execute(
@@ -136,7 +170,7 @@ def mark_running_tasks_interrupted() -> list[str]:
     return sorted(affected)
 
 
-def create_question_record(question_id, task_id, question_text, context, options_json):
+def create_question_record(question_id: str, task_id: str, question_text: str, context: str | None, options_json: str | None) -> None:
     conn = get_conn()
     conn.execute(
         "INSERT INTO questions (question_id, task_id, question, context, options_json, asked_at) VALUES (?, ?, ?, ?, ?, ?)",
@@ -146,7 +180,7 @@ def create_question_record(question_id, task_id, question_text, context, options
     conn.close()
 
 
-def answer_question_record(question_id, answer):
+def answer_question_record(question_id: str, answer: str) -> None:
     conn = get_conn()
     conn.execute(
         "UPDATE questions SET status='answered', answered_at=?, answer=? WHERE question_id=?",
@@ -156,7 +190,7 @@ def answer_question_record(question_id, answer):
     conn.close()
 
 
-def cancel_question_record(question_id):
+def cancel_question_record(question_id: str) -> None:
     conn = get_conn()
     conn.execute(
         "UPDATE questions SET status='cancelled', answered_at=? WHERE question_id=? AND status='pending'",
@@ -166,14 +200,14 @@ def cancel_question_record(question_id):
     conn.close()
 
 
-def get_question_record(question_id):
+def get_question_record(question_id: str) -> dict | None:
     conn = get_conn()
     row = conn.execute("SELECT * FROM questions WHERE question_id=?", (question_id,)).fetchone()
     conn.close()
     return dict(row) if row else None
 
 
-def get_pending_questions():
+def get_pending_questions() -> list[dict]:
     conn = get_conn()
     rows = conn.execute(
         "SELECT * FROM questions WHERE status='pending' ORDER BY asked_at ASC"
@@ -185,18 +219,22 @@ def get_pending_questions():
 # ── OpenCode tasks ────────────────────────────────────────────────
 
 
-def create_opencode_task_record(task_id: str, session_id: str, project_dir: str, instruction: str | None = None):
+def create_opencode_task_record(
+    task_id: str, session_id: str, project_dir: str, instruction: str | None = None,
+    trace_id: str | None = None,
+) -> None:
     now = utcnow()
     conn = get_conn()
     conn.execute(
-        "INSERT INTO opencode_tasks (task_id, session_id, project_dir, instruction, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (task_id, session_id, project_dir, instruction, now, now),
+        "INSERT INTO opencode_tasks (task_id, session_id, project_dir, instruction, created_at, updated_at, trace_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (task_id, session_id, project_dir, instruction, now, now, trace_id),
     )
     conn.commit()
     conn.close()
 
 
-def update_opencode_task_status(task_id: str, status: str):
+def update_opencode_task_status(task_id: str, status: str) -> None:
     conn = get_conn()
     conn.execute(
         "UPDATE opencode_tasks SET status=?, updated_at=? WHERE task_id=?",
@@ -215,6 +253,20 @@ def update_opencode_task_evidence(task_id: str, evidence_type: str) -> None:
     conn.execute(
         "UPDATE opencode_tasks SET last_evidence_type=?, last_evidence_at=? WHERE task_id=?",
         (evidence_type, utcnow(), task_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def update_opencode_task_result(task_id: str, result_summary: str) -> None:
+    """Delegated Observation and Reporting milestone: persists the
+    substantive result captured at task completion, so a later follow-up
+    question can be answered from this row without re-running the task or
+    re-querying OpenCode."""
+    conn = get_conn()
+    conn.execute(
+        "UPDATE opencode_tasks SET result_summary=? WHERE task_id=?",
+        (result_summary, task_id),
     )
     conn.commit()
     conn.close()
@@ -255,12 +307,16 @@ def get_opencode_running_tasks() -> list[dict]:
 # ── Conversation persistence ────────────────────────────────────────
 
 
-def save_conversation_message(conversation_id: str, role: str, content: str, metadata_json: str | None = None):
+def save_conversation_message(
+    conversation_id: str, role: str, content: str, metadata_json: str | None = None,
+    trace_id: str | None = None,
+) -> None:
     now = utcnow()
     conn = get_conn()
     conn.execute(
-        "INSERT INTO conversations (conversation_id, role, content, metadata_json, created_at) VALUES (?, ?, ?, ?, ?)",
-        (conversation_id, role, content, metadata_json, now),
+        "INSERT INTO conversations (conversation_id, role, content, metadata_json, created_at, trace_id) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (conversation_id, role, content, metadata_json, now, trace_id),
     )
     conn.commit()
     conn.close()
@@ -269,7 +325,8 @@ def save_conversation_message(conversation_id: str, role: str, content: str, met
 def get_conversation_messages(conversation_id: str, limit: int = 100) -> list[dict]:
     conn = get_conn()
     rows = conn.execute(
-        "SELECT id, conversation_id, role, content, metadata_json, created_at FROM conversations WHERE conversation_id=? ORDER BY id ASC LIMIT ?",
+        "SELECT id, conversation_id, role, content, metadata_json, created_at, trace_id "
+        "FROM conversations WHERE conversation_id=? ORDER BY id ASC LIMIT ?",
         (conversation_id, limit),
     ).fetchall()
     conn.close()
@@ -281,6 +338,7 @@ def get_conversation_messages(conversation_id: str, limit: int = 100) -> list[di
             "content": r["content"],
             "metadata_json": r["metadata_json"],
             "created_at": r["created_at"],
+            "trace_id": r["trace_id"],
         }
         for r in rows
     ]
@@ -293,7 +351,7 @@ def new_conversation_id() -> str:
     return f"conv_{uuid.uuid4().hex[:12]}"
 
 
-def is_valid_conversation_id(conversation_id) -> bool:
+def is_valid_conversation_id(conversation_id: str) -> bool:
     """Opaque-identifier format check. Never trust an arbitrary client-
     supplied string as a conversation_id without this — it's used directly
     in a SQL WHERE clause (parameterized, so not an injection vector, but a
@@ -312,7 +370,7 @@ def conversation_exists(conversation_id: str) -> bool:
     return row is not None
 
 
-def _ensure_column(conn, table: str, column: str, coltype: str) -> None:
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, coltype: str) -> None:
     """Add a column to an existing table if it's missing (safe migration for
     DBs created before this column existed). SQLite has no
     'ADD COLUMN IF NOT EXISTS', so check PRAGMA table_info first."""
@@ -321,14 +379,15 @@ def _ensure_column(conn, table: str, column: str, coltype: str) -> None:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
 
 
-def init_db():
+def init_db() -> None:
     conn = get_conn()
     conn.execute("""
         CREATE TABLE IF NOT EXISTS events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             type TEXT NOT NULL,
             timestamp TEXT NOT NULL,
-            content TEXT
+            content TEXT,
+            trace_id TEXT
         )
     """)
     conn.execute("""
@@ -340,7 +399,8 @@ def init_db():
             status TEXT NOT NULL DEFAULT 'running',
             started_at TEXT NOT NULL,
             completed_at TEXT,
-            exit_code INTEGER
+            exit_code INTEGER,
+            trace_id TEXT
         )
     """)
     conn.execute("""
@@ -368,11 +428,20 @@ def init_db():
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             last_evidence_type TEXT,
-            last_evidence_at TEXT
+            last_evidence_at TEXT,
+            trace_id TEXT,
+            result_summary TEXT
         )
     """)
     _ensure_column(conn, "opencode_tasks", "last_evidence_type", "TEXT")
     _ensure_column(conn, "opencode_tasks", "last_evidence_at", "TEXT")
+    # Delegated Observation and Reporting milestone: the substantive result
+    # of a completed/failed task (the delegated agent's own final text
+    # answer, or a fallback derived from tool output) -- additive next to
+    # the existing lifecycle columns above, not a replacement for them.
+    # Real-device finding this milestone traces back to: Jarvis could track
+    # that a task finished but had no way to say what it actually found.
+    _ensure_column(conn, "opencode_tasks", "result_summary", "TEXT")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS conversations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -380,7 +449,8 @@ def init_db():
             role TEXT NOT NULL,
             content TEXT NOT NULL,
             metadata_json TEXT,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            trace_id TEXT
         )
     """)
     conn.execute("""
@@ -471,7 +541,8 @@ def init_db():
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             closed_at TEXT,
-            termination_reason TEXT
+            termination_reason TEXT,
+            pending_tool_call TEXT
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_events_id ON events(id)")
@@ -501,14 +572,32 @@ def init_db():
     # afterward. Existing rows from before this column existed simply read
     # NULL, which formats as "n/a" everywhere this is displayed.
     _ensure_column(conn, "voice_sessions", "termination_reason", "TEXT")
+    # Interaction Layer v1 (Goal 5): the exact tool name/args a voice
+    # session is waiting on a yes/no confirmation for (JSON), set only
+    # while state=confirming and cleared the moment it resolves either
+    # way. Session-scoped rather than a separate table — at most one
+    # pending confirmation can exist per session, by construction (the
+    # tool loop stops proposing further actions the moment one is
+    # generated; see supervisor.py's pending_confirmation handling).
+    _ensure_column(conn, "voice_sessions", "pending_tool_call", "TEXT")
+    # ADR-020 (trace_id, Owner Experience M-OX.1): additive migration for
+    # DBs created before the trace_id column existed on these four tables.
+    _ensure_column(conn, "events", "trace_id", "TEXT")
+    _ensure_column(conn, "tasks", "trace_id", "TEXT")
+    _ensure_column(conn, "opencode_tasks", "trace_id", "TEXT")
+    _ensure_column(conn, "conversations", "trace_id", "TEXT")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_contact_attempts_attention_id ON contact_attempts(attention_request_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_voice_sessions_conversation_id ON voice_sessions(conversation_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_voice_sessions_attention_id ON voice_sessions(attention_request_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_events_trace_id ON events(trace_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_trace_id ON tasks(trace_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_oc_tasks_trace_id ON opencode_tasks(trace_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_conversations_trace_id ON conversations(trace_id)")
     conn.commit()
     conn.close()
 
 
-def mark_running_opencode_tasks_interrupted():
+def mark_running_opencode_tasks_interrupted() -> None:
     """Mark non-terminal OpenCode tasks 'degraded' (not 'failed') on Jarvis
     restart. Unlike a local subprocess (which Jarvis owns directly and can
     prove is dead), an OpenCode session lives in OpenCode's own persistent
@@ -796,7 +885,7 @@ def transition_attention_status(
     attention_request_id: str,
     from_statuses: tuple[str, ...],
     to_status: str,
-    **extra_fields,
+    **extra_fields: object,
 ) -> bool:
     """Guarded conditional UPDATE: only transitions if the row's *current*
     status is one of `from_statuses` — this is the concurrency protection
@@ -1004,6 +1093,28 @@ def update_voice_session_state(voice_session_id: str, state: str, termination_re
         "termination_reason=COALESCE(?, termination_reason) "
         "WHERE voice_session_id=?",
         (state, now, closed_at, termination_reason, voice_session_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def set_pending_tool_call(voice_session_id: str, name: str, args: dict) -> None:
+    """Interaction Layer v1 (Goal 5): persists the exact tool call a voice
+    session is awaiting a yes/no confirmation for."""
+    conn = get_conn()
+    conn.execute(
+        "UPDATE voice_sessions SET pending_tool_call=? WHERE voice_session_id=?",
+        (json.dumps({"name": name, "args": args}), voice_session_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def clear_pending_tool_call(voice_session_id: str) -> None:
+    conn = get_conn()
+    conn.execute(
+        "UPDATE voice_sessions SET pending_tool_call=NULL WHERE voice_session_id=?",
+        (voice_session_id,),
     )
     conn.commit()
     conn.close()

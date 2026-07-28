@@ -120,7 +120,7 @@ async def test_natural_phrasing_matches_single_mentioned_option():
 async def test_natural_phrasing_variant_go_with_b():
     _question("q1")
     tools = FakeTools()
-    result = await _resolve_deterministic_command("let's go with option B please", tools)
+    await _resolve_deterministic_command("let's go with option B please", tools)
     assert tools.calls == [("answer_question", {"question_id": "q1", "answer": "B"})]
 
 
@@ -156,7 +156,7 @@ async def test_natural_phrasing_only_applies_with_exactly_one_pending_question()
 async def test_literal_answer_prefix_still_takes_priority():
     _question("q1")
     tools = FakeTools()
-    result = await _resolve_deterministic_command("Answer B.", tools)
+    await _resolve_deterministic_command("Answer B.", tools)
     assert tools.calls == [("answer_question", {"question_id": "q1", "answer": "B"})]
 
 

@@ -29,6 +29,13 @@ STATE_PROCESSING = "processing"
 STATE_SPEAKING = "speaking"
 STATE_WAITING = "waiting"
 STATE_DEFERRED = "deferred"
+# Interaction Layer v1 (Goal 5): the session is waiting on a yes/no reply
+# to a technical-command confirmation prompt (see supervisor.py's
+# _build_confirmation_prompt / pending_confirmation). Behaves like
+# LISTENING for the purpose of accepting the next transcript (both are
+# legal predecessors of PROCESSING) — the difference is entirely in how
+# handle_transcript() below routes that next transcript once it arrives.
+STATE_CONFIRMING = "confirming"
 STATE_CLOSING = "closing"
 STATE_CLOSED = "closed"
 STATE_FAILED = "failed"
@@ -37,20 +44,29 @@ STATE_FAILED = "failed"
 _LEGAL_TRANSITIONS = {
     STATE_OPENING: (STATE_IDLE,),
     STATE_LISTENING: (STATE_OPENING, STATE_SPEAKING, STATE_WAITING),
-    # Barge-in guard lives here: PROCESSING only accepts LISTENING as its
-    # predecessor, so a second concurrent transcript for the same session
-    # (already PROCESSING) cannot re-enter PROCESSING — see
-    # handle_transcript()'s explicit check of this transition's result.
-    STATE_PROCESSING: (STATE_LISTENING,),
+    # Barge-in guard lives here: PROCESSING only accepts LISTENING/
+    # CONFIRMING as its predecessor, so a second concurrent transcript for
+    # the same session (already PROCESSING) cannot re-enter PROCESSING —
+    # see handle_transcript()'s explicit check of this transition's result.
+    STATE_PROCESSING: (STATE_LISTENING, STATE_CONFIRMING),
     STATE_SPEAKING: (STATE_PROCESSING,),
     STATE_WAITING: (STATE_PROCESSING, STATE_SPEAKING),
     STATE_DEFERRED: (STATE_PROCESSING,),
-    STATE_CLOSING: (STATE_OPENING, STATE_LISTENING, STATE_PROCESSING, STATE_SPEAKING, STATE_WAITING, STATE_DEFERRED),
+    STATE_CONFIRMING: (STATE_PROCESSING,),
+    STATE_CLOSING: (STATE_OPENING, STATE_LISTENING, STATE_PROCESSING, STATE_SPEAKING, STATE_WAITING, STATE_DEFERRED, STATE_CONFIRMING),
     STATE_CLOSED: (STATE_CLOSING, STATE_FAILED),
-    STATE_FAILED: (STATE_OPENING, STATE_LISTENING, STATE_PROCESSING, STATE_SPEAKING, STATE_WAITING),
+    STATE_FAILED: (STATE_OPENING, STATE_LISTENING, STATE_PROCESSING, STATE_SPEAKING, STATE_WAITING, STATE_CONFIRMING),
 }
 
 _TERMINAL_ATTENTION_STATUSES = ("resolved", "cancelled", "expired")
+
+# Interaction Layer v1 (Goal 5): tool names that must be read back to the
+# user for a yes/no confirmation before executing, on voice turns only
+# (see Supervisor.process_message's confirm_before_tools parameter — text/
+# browser chat callers never pass this). Scoped to start_opencode_task
+# only, per the milestone's own scope: the one tool whose arguments are
+# free-form technical text with a real filesystem side effect.
+CONFIRM_BEFORE_TOOLS = frozenset({"start_opencode_task"})
 
 
 def _build_greeting(attention_row: dict) -> str:
@@ -103,23 +119,33 @@ def set_broadcast_hook(conn_manager) -> None:
     _broadcast_hook = conn_manager
 
 
-async def _broadcast_lifecycle(phase: str, session: dict, **extra) -> None:
+async def _broadcast_lifecycle(phase: str, session: dict, trace_id: str | None = None, **extra) -> None:
     # Phase 4 (Control Center hardening): checked before db.save_event,
     # not just before broadcast_observers() inside it -- with no
     # dashboard open, this is an avoidable sqlite write on every voice
     # turn for a subsystem nobody is currently watching.
     if _broadcast_hook is None or not _broadcast_hook.has_observers():
         return
+    # ADR-020: a VoiceSession spans many turns, so it has no single
+    # trace_id of its own -- callers explicitly pass the trace_id of the
+    # turn just completed (from Supervisor.process_message()'s result)
+    # where one exists; phases with no turn behind them yet (session open,
+    # transcript just received, a deterministic reply that never reached
+    # process_message) correctly have none. `trace.current_trace_id()` is
+    # NOT read as a fallback here -- by the time most of these calls run,
+    # process_message() has already returned and reset its ContextVar
+    # binding, so reading it here would silently be stale/None regardless.
     payload = {
         "voice_session_id": session.get("voice_session_id"),
         "conversation_id": session.get("conversation_id"),
         "attention_request_id": session.get("attention_request_id"),
         "phase": phase,
+        "trace_id": trace_id,
         **extra,
     }
     try:
         content = json.dumps(payload)
-        db.save_event("voice_session_lifecycle", content)
+        db.save_event("voice_session_lifecycle", content, trace_id=trace_id)
         await _broadcast_hook.broadcast_observers({
             "type": "voice_session_lifecycle", "timestamp": db.utcnow(), "content": content,
         })
@@ -160,10 +186,22 @@ class VoiceSessionManager:
             logger.info(
                 "voice session transition rejected: id=%s from=%s to=%s",
                 voice_session_id, session["state"], to_state,
+                extra={"conversation_id": session["conversation_id"]},
             )
             return False
         db.update_voice_session_state(voice_session_id, to_state, termination_reason=termination_reason)
-        logger.info("voice session state: id=%s %s -> %s", voice_session_id, session["state"], to_state)
+        # M-OX.3 live-validation finding: every voice_session_manager log
+        # line carried conversation_id: null despite it being right there
+        # on `session` -- indistinguishable from a concurrent second
+        # session's own lines except by parsing the free-text `id=...`
+        # substring. conversation_id is genuinely known and stable here
+        # (unlike trace_id, which is never bound at any of this method's
+        # call sites -- see ADR-020's own documented transcript_received
+        # limitation -- so it is deliberately not added here).
+        logger.info(
+            "voice session state: id=%s %s -> %s", voice_session_id, session["state"], to_state,
+            extra={"conversation_id": session["conversation_id"]},
+        )
         return True
 
     def open_session(self, conversation_id: str, attention_request_id: str | None = None) -> dict:
@@ -205,9 +243,9 @@ class VoiceSessionManager:
             voice_session_id, conversation_id, attention_request_id,
         )
         session = db.get_voice_session(voice_session_id)
-        session["greeting"] = _build_greeting(bound_row) if bound_row else None
-        _schedule_lifecycle("opened", session)
-        return session
+        session["greeting"] = _build_greeting(bound_row) if bound_row else None  # type: ignore[index]  # TODO(F1.14): transaction boundaries
+        _schedule_lifecycle("opened", session)  # type: ignore[arg-type]  # TODO(F1.14): transaction boundaries
+        return session  # type: ignore[return-value]  # TODO(F1.14): transaction boundaries
 
     async def handle_transcript(self, voice_session_id: str, transcript: str) -> dict:
         """Routes the transcript to the existing Supervisor, scoped to the
@@ -217,6 +255,13 @@ class VoiceSessionManager:
         if not session or session["state"] == STATE_CLOSED:
             raise VoiceSessionError(f"Voice session {voice_session_id} is not open")
 
+        # Interaction Layer v1 (Goal 5): captured *before* the PROCESSING
+        # transition below, since that transition itself overwrites
+        # session["state"] as far as the DB is concerned — this is the
+        # only place that still knows whether the incoming transcript is
+        # an ordinary turn or a yes/no reply to a pending confirmation.
+        was_confirming = session["state"] == STATE_CONFIRMING
+
         if not self._transition(voice_session_id, STATE_PROCESSING):
             # Barge-in / overlap guard: a transcript is already being
             # processed for this session (e.g. two arrived concurrently).
@@ -224,6 +269,47 @@ class VoiceSessionManager:
             raise VoiceSessionError(f"Voice session {voice_session_id} is already processing a turn")
 
         await _broadcast_lifecycle("transcript_received", session, transcript=transcript[:500])
+
+        if was_confirming:
+            pending_json = session.get("pending_tool_call")
+            pending = json.loads(pending_json) if pending_json else None
+            if pending is None:
+                # Defensive only — CONFIRMING and pending_tool_call are
+                # always set together (see supervisor.py's
+                # pending_confirmation handling), so this should be
+                # unreachable. Never crash a live voice turn on an
+                # inconsistent row; fall back to plain listening.
+                result = {"response": "Sorry, I lost track of what I was confirming. What would you like to do?", "conversation_id": session["conversation_id"]}
+            else:
+                result = await self._supervisor.resolve_pending_tool_confirmation(
+                    session["conversation_id"], transcript, pending,
+                )
+
+            still_pending = result.get("pending_tool_call")
+            if still_pending:
+                # "Unclear" reply (see Supervisor.resolve_pending_tool_
+                # confirmation) — re-ask and stay in CONFIRMING rather
+                # than guessing which way the user meant it.
+                db.set_pending_tool_call(voice_session_id, still_pending["name"], still_pending["args"])
+                self._transition(voice_session_id, STATE_CONFIRMING)
+                next_state = STATE_CONFIRMING
+            else:
+                db.clear_pending_tool_call(voice_session_id)
+                self._transition(voice_session_id, STATE_WAITING)
+                self._transition(voice_session_id, STATE_LISTENING)
+                next_state = STATE_LISTENING
+
+            await _broadcast_lifecycle(
+                "turn_completed", session, trace_id=result.get("trace_id"),
+                response=result.get("response", "")[:500], voice_session_state=next_state,
+            )
+            return {
+                "response": result.get("response", ""),
+                "conversation_id": result.get("conversation_id") or session["conversation_id"],
+                "attention_request_id": None,
+                "voice_session_state": next_state,
+                "trace_id": result.get("trace_id"),
+            }
 
         bound_attention_id = session.get("attention_request_id")
         if bound_attention_id:
@@ -246,6 +332,7 @@ class VoiceSessionManager:
 
         result = await self._supervisor.process_message(
             transcript, session["conversation_id"], bound_attention_request_id=bound_attention_id,
+            confirm_before_tools=CONFIRM_BEFORE_TOOLS,
         )
 
         # Milestone 9B.10 (independent review finding): process_message()
@@ -275,7 +362,7 @@ class VoiceSessionManager:
             if post_row and post_row["status"] == "deferred":
                 self._transition(voice_session_id, STATE_DEFERRED)
                 await _broadcast_lifecycle(
-                    "turn_completed", session,
+                    "turn_completed", session, trace_id=result.get("trace_id"),
                     response=result.get("response", "")[:500], voice_session_state=STATE_DEFERRED,
                 )
                 return {
@@ -283,7 +370,31 @@ class VoiceSessionManager:
                     "conversation_id": result.get("conversation_id") or session["conversation_id"],
                     "attention_request_id": bound_attention_id,
                     "voice_session_state": STATE_DEFERRED,
+                    "trace_id": result.get("trace_id"),
                 }
+
+        # Interaction Layer v1 (Goal 5): the LLM proposed a tool in
+        # CONFIRM_BEFORE_TOOLS this turn — process_message() stopped
+        # *before* executing it (see supervisor.py's pending_confirmation
+        # handling) and final_content is already the read-back question.
+        # Persist the pending call and move to CONFIRMING instead of the
+        # usual WAITING -> LISTENING; the next transcript resolves it via
+        # the was_confirming branch above, never re-entering the LLM loop.
+        pending_tool_call = result.get("pending_tool_call")
+        if pending_tool_call:
+            db.set_pending_tool_call(voice_session_id, pending_tool_call["name"], pending_tool_call["args"])
+            self._transition(voice_session_id, STATE_CONFIRMING)
+            await _broadcast_lifecycle(
+                "turn_completed", session, trace_id=result.get("trace_id"),
+                response=result.get("response", "")[:500], voice_session_state=STATE_CONFIRMING,
+            )
+            return {
+                "response": result.get("response", ""),
+                "conversation_id": result.get("conversation_id") or session["conversation_id"],
+                "attention_request_id": bound_attention_id,
+                "voice_session_state": STATE_CONFIRMING,
+                "trace_id": result.get("trace_id"),
+            }
 
         # Milestone 9A real-phone finding (2026-07-10): STATE_WAITING was a
         # dead-end — the legal-transition map already allowed WAITING ->
@@ -299,7 +410,7 @@ class VoiceSessionManager:
         self._transition(voice_session_id, STATE_WAITING)
         self._transition(voice_session_id, STATE_LISTENING)
         await _broadcast_lifecycle(
-            "turn_completed", session,
+            "turn_completed", session, trace_id=result.get("trace_id"),
             response=result.get("response", "")[:500], voice_session_state=STATE_LISTENING,
         )
         return {
@@ -307,6 +418,7 @@ class VoiceSessionManager:
             "conversation_id": result.get("conversation_id") or session["conversation_id"],
             "attention_request_id": bound_attention_id,
             "voice_session_state": STATE_LISTENING,
+            "trace_id": result.get("trace_id"),
         }
 
     def mark_deferred(self, voice_session_id: str) -> bool:

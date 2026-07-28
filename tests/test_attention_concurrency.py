@@ -109,7 +109,7 @@ def test_concurrent_cancel_and_resolve_only_one_wins():
         await am.begin_resolving(aid)
         return await am.resolve(aid, "answered", "x")
 
-    results = _run_concurrently([do_cancel, do_resolve])
+    _run_concurrently([do_cancel, do_resolve])
     final = db.get_attention_request(aid)
     assert final["status"] in ("cancelled", "resolved")
     # Whichever committed last for this row, the DB is left in a single

@@ -2,6 +2,8 @@ import json
 import logging
 from datetime import datetime, timezone
 
+from fastapi import WebSocket
+
 logger = logging.getLogger("jarvis")
 
 
@@ -10,7 +12,7 @@ def _utcnow() -> str:
 
 
 class ConnectionManager:
-    def __init__(self):
+    def __init__(self) -> None:
         self._connections: set = set()
         # Milestone 9B.0 Phase 2: a small per-connection ID makes it
         # possible to tell concurrent connections apart in the log (a real
@@ -54,7 +56,7 @@ class ConnectionManager:
         # from before this feature existed.
         self._observers: set = set()
 
-    async def connect(self, ws) -> int:
+    async def connect(self, ws: WebSocket) -> int:
         await ws.accept()
         self._connections.add(ws)
         conn_id = self._next_id
@@ -63,7 +65,7 @@ class ConnectionManager:
         logger.info("WebSocket client connected (%d total) conn_id=%d", len(self._connections), conn_id)
         return conn_id
 
-    def disconnect(self, ws, code: int | None = None, reason: str | None = None):
+    def disconnect(self, ws: WebSocket, code: int | None = None, reason: str | None = None) -> None:
         conn_id = self._ids.pop(ws, None)
         self._connections.discard(ws)
         self._device_status.pop(ws, None)
@@ -73,7 +75,7 @@ class ConnectionManager:
             len(self._connections), conn_id, code, reason,
         )
 
-    def mark_observer(self, ws) -> None:
+    def mark_observer(self, ws: WebSocket) -> None:
         """Opts this connection into the dashboard-only event fan-out (see
         broadcast_observers). Idempotent; safe to call more than once."""
         self._observers.add(ws)
@@ -88,7 +90,7 @@ class ConnectionManager:
         Center; there is nothing for them to do with zero observers."""
         return bool(self._observers)
 
-    def set_device_status(self, ws, status: dict):
+    def set_device_status(self, ws: WebSocket, status: dict) -> None:
         self._device_status[ws] = status
         device_id = status.get("device_id")
         if device_id:
@@ -101,7 +103,7 @@ class ConnectionManager:
             self._ids.get(ws), status.get("device_id"), status.get("capabilities"),
         )
 
-    def get_device_status(self, ws) -> dict | None:
+    def get_device_status(self, ws: WebSocket) -> dict | None:
         return self._device_status.get(ws)
 
     def get_latest_device_status(self) -> dict | None:
@@ -115,7 +117,7 @@ class ConnectionManager:
             return None
         return next(iter(self._device_status.values()))
 
-    def record_heartbeat(self, ws) -> None:
+    def record_heartbeat(self, ws: WebSocket) -> None:
         """A companion heartbeat frame ({"type":"heartbeat"}, sent every 30s
         by CompanionWebSocketClient) arrived on this connection. Recorded
         globally (not per-ws) — today's deployment has one phone, and the
@@ -138,7 +140,7 @@ class ConnectionManager:
             "device_status": self.get_latest_device_status(),
         }
 
-    async def broadcast(self, data: dict):
+    async def broadcast(self, data: dict) -> None:
         dead = set()
         for ws in list(self._connections):
             try:

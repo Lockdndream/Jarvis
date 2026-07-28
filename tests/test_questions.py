@@ -215,8 +215,7 @@ async def test_answer_delivered():
 async def test_duplicate_answer_rejected():
     cm = ConnectionManager()
     tm = TaskManager(cm)
-    result = await tm.start_mock_agent(test_mode=True)
-    tid = result["task_id"]
+    await tm.start_mock_agent(test_mode=True)
 
     await asyncio.sleep(2)
 
@@ -275,7 +274,7 @@ async def test_cancellation_while_waiting():
 async def test_pending_questions_info():
     cm = ConnectionManager()
     tm = TaskManager(cm)
-    result = await tm.start_mock_agent(test_mode=True)
+    await tm.start_mock_agent(test_mode=True)
 
     await asyncio.sleep(2)
 

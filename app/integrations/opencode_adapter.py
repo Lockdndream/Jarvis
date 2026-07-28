@@ -3,7 +3,6 @@ import asyncio
 import json
 import logging
 import os
-import time
 
 from app.supervisor.llm import validate_free_only_model
 

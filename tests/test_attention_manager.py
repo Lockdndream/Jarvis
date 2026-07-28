@@ -88,7 +88,7 @@ async def test_get_or_create_is_idempotent_by_source():
 @pytest.mark.asyncio
 async def test_second_get_or_create_does_not_recontact():
     cm = make_conn_manager()
-    ws = await _connect(cm)
+    await _connect(cm)
     await am.get_or_create(
         cm, conversation_id="c1", task_id="t1", source_type="local_question",
         source_id="q1", attention_type=am.ATTENTION_TYPE_QUESTION, urgency="HIGH", summary="s",
@@ -125,7 +125,7 @@ async def test_different_sources_create_distinct_requests():
 @pytest.mark.asyncio
 async def test_urgent_connected_first_contact_creates_voice_contact_attempt():
     cm = make_conn_manager()
-    ws = await _connect(cm)
+    await _connect(cm)
     row = await am.get_or_create(
         cm, conversation_id="c1", task_id="t1", source_type="opencode_question",
         source_id="q1", attention_type=am.ATTENTION_TYPE_QUESTION, urgency="URGENT", summary="s",

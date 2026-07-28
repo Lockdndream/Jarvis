@@ -276,7 +276,8 @@ async def scenario_b(page, context):
         fail("Card never reflected the deferred state after snoozing")
 
     async def question_still_pending():
-        import urllib.request, json
+        import json
+        import urllib.request
         try:
             with urllib.request.urlopen(f"{SERVER_URL}/api/question/{qid}") as resp:
                 return json.loads(resp.read())["status"] == "pending"
@@ -415,7 +416,8 @@ async def scenario_e(page, context):
     )
 
     async def resolved():
-        import urllib.request, json
+        import json
+        import urllib.request
         try:
             with urllib.request.urlopen(f"{SERVER_URL}/api/question/{qid}") as resp:
                 return json.loads(resp.read())["status"] != "pending"
@@ -486,7 +488,8 @@ async def scenario_f(page, context):
     await page.locator(f'.question-send-btn[data-question-id="{qid}"]').click()
 
     async def resolved():
-        import urllib.request, json
+        import json
+        import urllib.request
         try:
             with urllib.request.urlopen(f"{SERVER_URL}/api/attention/{aid}") as resp:
                 return json.loads(resp.read())["status"] == "resolved"

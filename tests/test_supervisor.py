@@ -453,7 +453,7 @@ async def test_supervisor_conversation_auto_id():
 @pytest.mark.asyncio
 async def test_supervisor_persists_conversation():
     sv = Supervisor()
-    result = await sv.process_message("hello", "persist-conv-id")
+    await sv.process_message("hello", "persist-conv-id")
     msgs = db.get_conversation_messages("persist-conv-id")
     assert len(msgs) >= 2
     assert msgs[-1]["role"] == "assistant"
@@ -463,7 +463,7 @@ async def test_supervisor_persists_conversation():
 @pytest.mark.asyncio
 async def test_supervisor_persists_fast_path():
     sv = Supervisor()
-    result = await sv.process_message("what needs my attention", "fast-conv-id")
+    await sv.process_message("what needs my attention", "fast-conv-id")
     msgs = db.get_conversation_messages("fast-conv-id")
     assert len(msgs) >= 2
 
@@ -840,3 +840,187 @@ async def test_broadcast_failure_is_swallowed_not_raised():
     supervisor_module.set_broadcast_hook(RaisingConnManager())
 
     await supervisor_module._broadcast("supervisor_turn", {"x": 1})  # must not raise
+
+
+# ── Interaction Layer v1 (Goal 5): technical command confirmation ──────
+
+from app.supervisor.supervisor import _classify_yes_no, _build_confirmation_prompt
+
+
+def test_classify_yes_no_recognizes_yes_variants():
+    for phrase in ["yes", "Yes.", "yeah", "yep", "yup", "correct", "right", "go ahead", "do it", "sure", "confirmed"]:
+        assert _classify_yes_no(phrase) == "yes", phrase
+
+
+def test_classify_yes_no_recognizes_no_variants():
+    for phrase in ["no", "No.", "nope", "negative", "wrong", "cancel", "don't", "never mind"]:
+        assert _classify_yes_no(phrase) == "no", phrase
+
+
+def test_classify_yes_no_unclear_for_anything_else():
+    for phrase in ["maybe", "what?", "create the file instead", ""]:
+        assert _classify_yes_no(phrase) == "unclear", phrase
+
+
+def test_classify_yes_no_matches_naturally_phrased_replies():
+    """Real-device finding (Level 5 capability testing): the original
+    leading-prefix-only matcher missed every one of these, forcing a
+    live session into an unrecoverable "Sorry, was that a yes or a no?"
+    loop on an entirely ordinary correction."""
+    for phrase in ["yes, go ahead", "yes please", "sure, go ahead"]:
+        assert _classify_yes_no(phrase) == "yes", phrase
+    for phrase in [
+        "no, I meant git status",
+        "no, that's not what I said",
+        "that was a no I need you to check git status instead",
+        "that's wrong, I asked for the git status",
+    ]:
+        assert _classify_yes_no(phrase) == "no", phrase
+
+
+def test_classify_yes_no_does_not_false_positive_on_substrings():
+    """"no" must match as a whole word, not as a substring of an unrelated
+    word (e.g. "know") -- the exact failure mode a naive substring search
+    would introduce."""
+    assert _classify_yes_no("I know the file you mean") == "unclear"
+    assert _classify_yes_no("that's not correct") == "yes"  # "correct" token present, expected per current word list
+
+
+def test_classify_yes_no_self_contradictory_reply_is_unclear():
+    assert _classify_yes_no("no wait yes") == "unclear"
+
+
+def test_build_confirmation_prompt_reads_back_instruction_and_project():
+    prompt = _build_confirmation_prompt(
+        "start_opencode_task", {"project_alias": "jarvis-test", "instruction": "create a file"},
+    )
+    assert "create a file" in prompt
+    assert "jarvis-test" in prompt
+
+
+def test_build_confirmation_prompt_generic_fallback_for_other_tools():
+    """Goal 5 is scoped to start_opencode_task only, per the milestone's
+    own scope -- but the fallback must still produce something sane
+    rather than crash if confirm_before_tools is ever given another tool
+    name."""
+    prompt = _build_confirmation_prompt("some_other_tool", {})
+    assert "go ahead" in prompt.lower()
+
+
+@pytest.mark.asyncio
+async def test_confirm_before_tools_stops_before_executing_and_returns_pending_call(supervisor, monkeypatch):
+    called = []
+
+    async def fake_call(name, args):
+        called.append((name, args))
+        return "should not run"
+    monkeypatch.setattr(supervisor.tools, "call", fake_call)
+
+    llm = FakeLLMProvider()
+    llm.add_response({
+        "role": "assistant",
+        "tool_calls": [{
+            "id": "call_1",
+            "function": {
+                "name": "start_opencode_task",
+                "arguments": json.dumps({"project_alias": "jarvis", "instruction": "create a file"}),
+            },
+        }],
+    })
+    supervisor._llm = llm
+
+    result = await supervisor.process_message(
+        "start an opencode task", conversation_id="c1",
+        confirm_before_tools=frozenset({"start_opencode_task"}),
+    )
+
+    assert called == []  # never executed -- confirmation gates it
+    assert result["pending_tool_call"] == {
+        "name": "start_opencode_task",
+        "args": {"project_alias": "jarvis", "instruction": "create a file"},
+    }
+    assert "create a file" in result["response"]
+
+
+@pytest.mark.asyncio
+async def test_without_confirm_before_tools_the_tool_executes_normally(supervisor, monkeypatch):
+    """Regression guard: text/browser chat callers never pass
+    confirm_before_tools, so this exact same LLM proposal must execute
+    immediately, unchanged from before Goal 5 existed."""
+    called = []
+
+    async def fake_call(name, args):
+        called.append((name, args))
+        return "executed"
+    monkeypatch.setattr(supervisor.tools, "call", fake_call)
+
+    llm = FakeLLMProvider()
+    llm.add_response({
+        "role": "assistant",
+        "tool_calls": [{
+            "id": "call_1",
+            "function": {
+                "name": "start_opencode_task",
+                "arguments": json.dumps({"project_alias": "jarvis", "instruction": "create a file"}),
+            },
+        }],
+    })
+    llm.add_response({"role": "assistant", "content": "Done."})
+    supervisor._llm = llm
+
+    result = await supervisor.process_message("start an opencode task", conversation_id="c1")
+
+    assert called == [("start_opencode_task", {"project_alias": "jarvis", "instruction": "create a file"})]
+    assert "pending_tool_call" not in result
+
+
+@pytest.mark.asyncio
+async def test_resolve_pending_tool_confirmation_yes_executes_the_stored_call(supervisor, monkeypatch):
+    called = []
+
+    async def fake_call(name, args):
+        called.append((name, args))
+        return "File created."
+    monkeypatch.setattr(supervisor.tools, "call", fake_call)
+
+    result = await supervisor.resolve_pending_tool_confirmation(
+        "c1", "yes", {"name": "start_opencode_task", "args": {"project_alias": "jarvis", "instruction": "create a file"}},
+    )
+
+    assert called == [("start_opencode_task", {"project_alias": "jarvis", "instruction": "create a file"})]
+    assert result["response"] == "File created."
+    assert "pending_tool_call" not in result
+
+
+@pytest.mark.asyncio
+async def test_resolve_pending_tool_confirmation_no_never_executes(supervisor, monkeypatch):
+    called = []
+
+    async def fake_call(name, args):
+        called.append((name, args))
+        return "should not run"
+    monkeypatch.setattr(supervisor.tools, "call", fake_call)
+
+    result = await supervisor.resolve_pending_tool_confirmation(
+        "c1", "no", {"name": "start_opencode_task", "args": {}},
+    )
+
+    assert called == []
+    assert "won't do that" in result["response"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_pending_tool_confirmation_unclear_reasks_without_executing(supervisor, monkeypatch):
+    called = []
+
+    async def fake_call(name, args):
+        called.append((name, args))
+        return "should not run"
+    monkeypatch.setattr(supervisor.tools, "call", fake_call)
+
+    pending = {"name": "start_opencode_task", "args": {"project_alias": "jarvis", "instruction": "x"}}
+    result = await supervisor.resolve_pending_tool_confirmation("c1", "maybe", pending)
+
+    assert called == []
+    assert result["pending_tool_call"] == pending
+    assert "yes or a no" in result["response"]
