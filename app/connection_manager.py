@@ -90,6 +90,16 @@ class ConnectionManager:
         Center; there is nothing for them to do with zero observers."""
         return bool(self._observers)
 
+    def has_user_surfaces(self) -> bool:
+        """True when at least one NON-observer connection is attached.
+
+        ADR-018/019: the Control Center is a read-only observer. Its
+        connections must never make Jarvis believe a user-facing surface
+        (phone / PWA) is present, because InterruptionPolicy uses that to
+        decide whether an URGENT item can be delivered now. TD-029.
+        """
+        return bool(self._connections - self._observers)
+
     def set_device_status(self, ws: WebSocket, status: dict) -> None:
         self._device_status[ws] = status
         device_id = status.get("device_id")

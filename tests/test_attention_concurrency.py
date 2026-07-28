@@ -46,6 +46,9 @@ def reset_broadcast_hook():
 class _FakeConnManager:
     _connections = []
 
+    def has_user_surfaces(self) -> bool:
+        return False
+
     async def broadcast(self, msg):
         pass
 

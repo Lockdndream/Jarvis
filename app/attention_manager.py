@@ -115,8 +115,9 @@ async def _transition(attention_request_id: str, to_status: str, **extra_fields)
 
 
 def _connected(conn_manager) -> bool:
+    """TD-029: user-facing surfaces only — dashboard observers must not count."""
     try:
-        return len(conn_manager._connections) > 0
+        return bool(conn_manager.has_user_surfaces())
     except Exception:
         return False
 

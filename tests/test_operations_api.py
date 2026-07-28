@@ -252,14 +252,6 @@ def test_duplicate_concurrent_start_requests_only_one_wins(client):
 
 # ── Failure handling ─────────────────────────────────────────────────
 
-@pytest.mark.xfail(
-    strict=False,
-    reason="TD-032 / MILESTONE_F1 F1.8: order-dependent failure. sv.last_operation_error "
-           "is None on CI even though state reaches FAILED — module-global contamination "
-           "between tests. Passes in isolation and on Windows dev machines, fails on GitHub "
-           "Actions. Marked non-strict because it PASSES locally; strict=True would turn "
-           "those runs into XPASS failures. F1.8 fixes the contamination and removes this.",
-)
 def test_start_failure_reported_as_failed_not_running(client):
     c, sv = client
     sv.server.fail_start = True
@@ -271,6 +263,41 @@ def test_start_failure_reported_as_failed_not_running(client):
 
     status = c.get("/api/operations/opencode/status").json()
     assert status["state"] == "FAILED"
+
+
+def test_failed_state_invariant_error_set_before_finalize(client):
+    """TD-032 regression: after _do_start() fails, state == FAILED must
+    imply last_operation_error is already set, BEFORE _finalize() runs.
+    Call _do_start() directly (no polling, no await boundary) to assert
+    the ordering deterministically rather than relying on a race."""
+    c, sv = client
+    sv.server.fail_start = True
+    sv.state = OperationalState.STOPPED
+    assert sv.claim_start() is True
+
+    ok, error = asyncio.run(sv._do_start())
+
+    assert ok is False
+    assert error is not None
+    assert sv.state == OperationalState.FAILED
+    assert sv.last_operation_error is not None
+    assert sv.last_operation_result is None  # _finalize()'s job, not _do_start()'s
+
+
+def test_failed_stop_state_invariant_error_set_before_finalize(client):
+    """TD-032 regression: same invariant for the _do_stop() failure path."""
+    c, sv = client
+    sv.server.fail_stop = True
+    sv.state = OperationalState.RUNNING
+    assert sv.claim_stop() is True
+
+    ok, error = asyncio.run(sv._do_stop())
+
+    assert ok is False
+    assert error is not None
+    assert sv.state == OperationalState.FAILED
+    assert sv.last_operation_error is not None
+    assert sv.last_operation_result is None
 
 
 def test_restart_stop_failure_does_not_report_running(client):

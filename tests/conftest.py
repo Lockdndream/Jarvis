@@ -13,10 +13,27 @@ run earlier, an order-dependent contamination no test currently asserts
 on (so it causes no visible failure today) but is exactly the kind of
 thing that should not be left to chance.
 """
+import asyncio
+import time
+from collections.abc import Callable
+from typing import Any
+
 import pytest
 
 import app.supervisor.supervisor as supervisor_module
 import app.voice_session_manager as voice_session_manager_module
+
+
+async def _wait_until(predicate: Callable[[], Any], timeout: float = 20.0,
+                       interval: float = 0.05) -> Any:
+    """Poll until predicate() is truthy; assert-fail on timeout."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        result = predicate()
+        if result:
+            return result
+        await asyncio.sleep(interval)
+    raise AssertionError(f"condition not met within {timeout}s")
 
 
 @pytest.fixture(autouse=True)

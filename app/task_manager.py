@@ -43,15 +43,15 @@ class TaskManager:
 
     # ── start methods ──────────────────────────────────────────────
 
-    async def start_demo(self) -> dict:
+    async def start_demo(self, steps: int = 15) -> dict:
         task_id = str(uuid.uuid4())
         name = "Demo Task"
 
         code = (
             "import sys, time\n"
             "print('Starting demo task', flush=True)\n"
-            "for i in range(1, 16):\n"
-            "    print(f'Progress {i}/15', flush=True)\n"
+            f"for i in range(1, {steps + 1}):\n"
+            f"    print(f'Progress {{i}}/{steps}', flush=True)\n"
             "    time.sleep(1)\n"
             "print('Demo task complete', flush=True)\n"
         )

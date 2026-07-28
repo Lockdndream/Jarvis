@@ -263,3 +263,176 @@ def test_snapshot_tasks_field_excludes_raw_command_text():
         real_db.DB_PATH = old_path
         if os.path.exists(path):
             os.unlink(path)
+
+
+# ── TD-029 / F1.7: has_user_surfaces() and policy-level isolation ────
+
+from app.connection_manager import ConnectionManager
+
+
+class _FakeWS:
+    async def accept(self):
+        pass
+
+    async def send_text(self, text):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_has_user_surfaces_false_with_zero_connections():
+    cm = ConnectionManager()
+    assert cm.has_user_surfaces() is False
+
+
+@pytest.mark.asyncio
+async def test_has_user_surfaces_false_with_observer_only():
+    cm = ConnectionManager()
+    ws = _FakeWS()
+    await cm.connect(ws)
+    cm.mark_observer(ws)
+    assert cm.has_user_surfaces() is False
+    assert cm.has_observers() is True
+
+
+@pytest.mark.asyncio
+async def test_has_user_surfaces_true_with_non_observer():
+    cm = ConnectionManager()
+    ws = _FakeWS()
+    await cm.connect(ws)
+    assert cm.has_user_surfaces() is True
+
+
+@pytest.mark.asyncio
+async def test_has_user_surfaces_true_with_both_observer_and_non_observer():
+    cm = ConnectionManager()
+    observer = _FakeWS()
+    phone = _FakeWS()
+    await cm.connect(observer)
+    await cm.connect(phone)
+    cm.mark_observer(observer)
+    assert cm.has_user_surfaces() is True
+    assert cm.has_observers() is True
+
+
+@pytest.mark.asyncio
+async def test_has_user_surfaces_false_after_disconnecting_only_non_observer():
+    cm = ConnectionManager()
+    observer = _FakeWS()
+    phone = _FakeWS()
+    await cm.connect(observer)
+    await cm.connect(phone)
+    cm.mark_observer(observer)
+    assert cm.has_user_surfaces() is True
+    cm.disconnect(phone)
+    assert cm.has_user_surfaces() is False
+
+
+@pytest.mark.asyncio
+async def test_policy_connected_is_false_when_only_observer_attached(monkeypatch):
+    from app import attention_manager as am
+    from app import interruption_policy
+
+    old_path = db.DB_PATH
+    f, path = tempfile.mkstemp(suffix=".db")
+    os.close(f)
+    db.DB_PATH = path
+    db.init_db()
+    try:
+        captured = {}
+
+        def fake_decide(attention_row, *, connected, prior_contact_count, now=None):
+            captured["connected"] = connected
+            return interruption_policy.ACTION_SILENT
+
+        monkeypatch.setattr(interruption_policy, "decide", fake_decide)
+
+        cm = ConnectionManager()
+        ws = _FakeWS()
+        await cm.connect(ws)
+        cm.mark_observer(ws)
+
+        attention_row = {
+            "attention_request_id": "attn_test_001",
+            "status": "pending",
+            "attention_type": "QUESTION",
+            "urgency": "URGENT",
+            "summary": "test",
+            "task_id": "t1",
+            "contact_attempt_count": 0,
+        }
+        db.create_attention_request(
+            attention_request_id="attn_test_001",
+            conversation_id=None,
+            task_id="t1",
+            source_type="test",
+            source_id="s1",
+            attention_type="QUESTION",
+            urgency="URGENT",
+            summary="test",
+            context_json=None,
+            contact_policy=None,
+            dedup_key="test:s1",
+        )
+
+        await am.initiate_contact(cm, attention_row)
+
+        assert captured["connected"] is False
+    finally:
+        db.DB_PATH = old_path
+        if os.path.exists(path):
+            os.unlink(path)
+
+
+@pytest.mark.asyncio
+async def test_policy_connected_is_true_when_non_observer_attached(monkeypatch):
+    from app import attention_manager as am
+    from app import interruption_policy
+
+    old_path = db.DB_PATH
+    f, path = tempfile.mkstemp(suffix=".db")
+    os.close(f)
+    db.DB_PATH = path
+    db.init_db()
+    try:
+        captured = {}
+
+        def fake_decide(attention_row, *, connected, prior_contact_count, now=None):
+            captured["connected"] = connected
+            return interruption_policy.ACTION_SILENT
+
+        monkeypatch.setattr(interruption_policy, "decide", fake_decide)
+
+        cm = ConnectionManager()
+        ws = _FakeWS()
+        await cm.connect(ws)
+
+        attention_row = {
+            "attention_request_id": "attn_test_002",
+            "status": "pending",
+            "attention_type": "QUESTION",
+            "urgency": "URGENT",
+            "summary": "test",
+            "task_id": "t1",
+            "contact_attempt_count": 0,
+        }
+        db.create_attention_request(
+            attention_request_id="attn_test_002",
+            conversation_id=None,
+            task_id="t1",
+            source_type="test",
+            source_id="s2",
+            attention_type="QUESTION",
+            urgency="URGENT",
+            summary="test",
+            context_json=None,
+            contact_policy=None,
+            dedup_key="test:s2",
+        )
+
+        await am.initiate_contact(cm, attention_row)
+
+        assert captured["connected"] is True
+    finally:
+        db.DB_PATH = old_path
+        if os.path.exists(path):
+            os.unlink(path)

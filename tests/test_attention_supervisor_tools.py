@@ -16,7 +16,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import app.database as db
 from app import attention_manager as am
 from app.connection_manager import ConnectionManager
+from app.supervisor.supervisor import Supervisor
 from app.supervisor.tools import ToolRegistry
+from app.voice_session_manager import VoiceSessionManager
 
 
 @pytest.fixture(autouse=True)
@@ -59,7 +61,8 @@ async def _attention(source_id="q1"):
 
 
 def make_tools():
-    return ToolRegistry(task_manager=None, opencode_supervisor=FakeOpenCodeSupervisor())
+    oc_sv = FakeOpenCodeSupervisor()
+    return ToolRegistry(task_manager=None, opencode_supervisor=oc_sv, connection_manager=oc_sv.cm)
 
 
 @pytest.mark.asyncio
@@ -134,6 +137,8 @@ async def test_resume_attention_on_deferred_request_marks_due_and_recontacts():
 @pytest.mark.asyncio
 async def test_open_and_close_voice_session_round_trip():
     tools = make_tools()
+    vsm = VoiceSessionManager(Supervisor())
+    tools.set_voice_session_manager(vsm)
     opened = await tools.call("open_voice_session", {"conversation_id": "c1"})
     assert "Voice session opened" in opened
     vsid = opened.split(":")[1].strip().split(" ")[0]
@@ -149,6 +154,7 @@ async def test_open_and_close_voice_session_round_trip():
 @pytest.mark.asyncio
 async def test_close_unknown_voice_session_reports_not_found():
     tools = make_tools()
+    tools.set_voice_session_manager(VoiceSessionManager(Supervisor()))
     result = await tools.call("close_voice_session", {"voice_session_id": "vs_nope"})
     assert "not found" in result.lower()
 
@@ -180,7 +186,7 @@ async def test_get_task_result_registered():
 @pytest.mark.asyncio
 async def test_get_task_result_returns_persisted_summary_without_a_live_fetch():
     oc_sv = FakeOpenCodeSupervisor(live_result="should never be reached")
-    tools = ToolRegistry(task_manager=None, opencode_supervisor=oc_sv)
+    tools = ToolRegistry(task_manager=None, opencode_supervisor=oc_sv, connection_manager=oc_sv.cm)
     task_id = _make_opencode_task()
     db.update_opencode_task_result(task_id, "Two files modified: a.py, b.py")
 
@@ -193,7 +199,7 @@ async def test_get_task_result_returns_persisted_summary_without_a_live_fetch():
 @pytest.mark.asyncio
 async def test_get_task_result_falls_back_to_live_fetch_when_nothing_persisted():
     oc_sv = FakeOpenCodeSupervisor(live_result="Fetched live: no .git directory found")
-    tools = ToolRegistry(task_manager=None, opencode_supervisor=oc_sv)
+    tools = ToolRegistry(task_manager=None, opencode_supervisor=oc_sv, connection_manager=oc_sv.cm)
     task_id = _make_opencode_task()  # no result_summary set
 
     result = await tools.call("get_task_result", {"task_id": task_id})
@@ -205,7 +211,7 @@ async def test_get_task_result_falls_back_to_live_fetch_when_nothing_persisted()
 @pytest.mark.asyncio
 async def test_get_task_result_still_running_reports_no_result_yet():
     oc_sv = FakeOpenCodeSupervisor()
-    tools = ToolRegistry(task_manager=None, opencode_supervisor=oc_sv)
+    tools = ToolRegistry(task_manager=None, opencode_supervisor=oc_sv, connection_manager=oc_sv.cm)
     task_id = _make_opencode_task(status="running")
 
     result = await tools.call("get_task_result", {"task_id": task_id})
@@ -232,7 +238,7 @@ async def test_get_task_result_non_opencode_task_reports_clearly():
 @pytest.mark.asyncio
 async def test_get_task_result_nothing_available_after_live_fetch_says_so_honestly():
     oc_sv = FakeOpenCodeSupervisor(live_result=None)  # live fetch found nothing either
-    tools = ToolRegistry(task_manager=None, opencode_supervisor=oc_sv)
+    tools = ToolRegistry(task_manager=None, opencode_supervisor=oc_sv, connection_manager=oc_sv.cm)
     task_id = _make_opencode_task()
 
     result = await tools.call("get_task_result", {"task_id": task_id})

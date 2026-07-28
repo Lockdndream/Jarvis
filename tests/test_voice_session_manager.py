@@ -55,6 +55,9 @@ async def _attention_row(source_id="q1", conversation_id="c1"):
     class _FakeConnManager:
         _connections = []
 
+        def has_user_surfaces(self) -> bool:
+            return False
+
         async def broadcast(self, msg):
             pass
 

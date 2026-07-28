@@ -119,12 +119,19 @@ class OpenCodeSupervisor:
 
     async def _do_start(self) -> tuple[bool, str | None]:
         """Mechanics only -- deliberately does not touch
-        last_operation_result/error. A restart's stop sub-phase completing
-        must never make last_operation_result briefly read "success" for
-        the still-in-progress overall restart (found via live validation:
-        a poll landing between the stop and start phases saw exactly that).
-        Only run_claimed_start()/run_claimed_restart() finalize the
-        user-visible result, once the *whole* requested operation is done.
+        last_operation_result on the success path. A restart's stop
+        sub-phase completing must never make last_operation_result briefly
+        read "success" for the still-in-progress overall restart (found
+        via live validation: a poll landing between the stop and start
+        phases saw exactly that). Only run_claimed_start()/
+        run_claimed_restart() finalize the user-visible result, once the
+        *whole* requested operation is done.
+
+        TD-032 / MILESTONE_F1 F1.8: the failure path DOES set
+        last_operation_error before transitioning to FAILED, so that any
+        observer who sees state == FAILED also sees the error populated.
+        _finalize() handles last_operation_result (success path); only
+        last_operation_error is set here (failure path).
 
         Caller must already hold a successful claim_start() (state ==
         STARTING) before calling this -- this is also the fix for the
@@ -141,14 +148,16 @@ class OpenCodeSupervisor:
             logger.info("OpenCode supervisor started")
             return True, None
         except Exception as e:
+            self.last_operation_error = str(e)
             self.state = OperationalState.FAILED
             logger.error("OpenCode supervisor failed to start: %s", e, exc_info=True)
             return False, str(e)
 
     async def _do_stop(self) -> tuple[bool, str | None]:
-        """Mechanics only -- see _do_start()'s docstring for why this does
-        not touch last_operation_result/error itself. Caller must already
-        hold a successful claim_stop() (state == STOPPING)."""
+        """Mechanics only -- see _do_start()'s docstring for why the success
+        path does not touch last_operation_result. The failure path sets
+        last_operation_error before transitioning to FAILED. Caller must
+        already hold a successful claim_stop() (state == STOPPING)."""
         try:
             self._stopped = True
             if self._sse_task:
@@ -170,6 +179,7 @@ class OpenCodeSupervisor:
             logger.info("OpenCode supervisor stopped")
             return True, None
         except Exception as e:
+            self.last_operation_error = str(e)
             self.state = OperationalState.FAILED
             logger.error("OpenCode supervisor failed to stop: %s", e, exc_info=True)
             return False, str(e)

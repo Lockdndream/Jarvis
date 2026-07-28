@@ -13,6 +13,7 @@ import app.database as db
 from app.connection_manager import ConnectionManager
 from app.task_manager import TaskManager
 from app.protocol import parse_line
+from tests.conftest import _wait_until
 
 
 @pytest.fixture(autouse=True)
@@ -134,7 +135,7 @@ async def test_stdout_streams_before_question():
     result = await tm.start_mock_agent(test_mode=True)
     tid = result["task_id"]
 
-    await asyncio.sleep(1)
+    await _wait_until(lambda: len([e for e in db.get_recent_events(50) if e["type"] == "task_stdout"]) >= 1)
 
     events = db.get_recent_events(50)
     stdout_events = [e for e in events if e["type"] == "task_stdout"]
@@ -151,7 +152,7 @@ async def test_question_detected():
     tid = result["task_id"]
 
     # Wait for question (test mode: 3 steps * 0.1s ≈ 0.3s, plus margin)
-    await asyncio.sleep(2)
+    await _wait_until(lambda: db.get_task(tid)["status"] == "waiting_for_user")
 
     task = db.get_task(tid)
     assert task["status"] == "waiting_for_user", f"Expected waiting_for_user, got {task['status']}"
@@ -179,7 +180,7 @@ async def test_answer_delivered():
     result = await tm.start_mock_agent(test_mode=True)
     tid = result["task_id"]
 
-    await asyncio.sleep(2)
+    await _wait_until(lambda: db.get_task(tid)["status"] == "waiting_for_user")
 
     task = db.get_task(tid)
     assert task["status"] == "waiting_for_user"
@@ -193,7 +194,7 @@ async def test_answer_delivered():
     msg = await tm.answer_question(qid, "B")
     assert "delivered" in msg.lower()
 
-    await asyncio.sleep(1)
+    await _wait_until(lambda: db.get_task(tid)["status"] in ("running", "completed"))
 
     # Task should be running again (or may have completed very fast in test mode)
     task = db.get_task(tid)
@@ -205,7 +206,7 @@ async def test_answer_delivered():
     assert q_record["answer"] == "B"
 
     # Wait for completion
-    await asyncio.sleep(4)
+    await _wait_until(lambda: db.get_task(tid)["status"] == "completed")
     task = db.get_task(tid)
     assert task["status"] == "completed", f"Expected completed, got {task['status']}"
     assert task["exit_code"] == 0
@@ -217,7 +218,7 @@ async def test_duplicate_answer_rejected():
     tm = TaskManager(cm)
     await tm.start_mock_agent(test_mode=True)
 
-    await asyncio.sleep(2)
+    await _wait_until(lambda: len(db.get_pending_questions()) >= 1)
 
     questions = db.get_pending_questions()
     qid = questions[0]["question_id"]
@@ -244,7 +245,7 @@ async def test_cancellation_while_waiting():
     result = await tm.start_mock_agent(test_mode=True)
     tid = result["task_id"]
 
-    await asyncio.sleep(2)
+    await _wait_until(lambda: db.get_task(tid)["status"] == "waiting_for_user")
 
     task = db.get_task(tid)
     assert task["status"] == "waiting_for_user"
@@ -255,7 +256,7 @@ async def test_cancellation_while_waiting():
     msg = await tm.cancel(tid)
     assert "cancelled" in msg.lower()
 
-    await asyncio.sleep(1)
+    await _wait_until(lambda: db.get_task(tid)["status"] == "cancelled")
 
     task = db.get_task(tid)
     assert task["status"] == "cancelled"
@@ -276,7 +277,7 @@ async def test_pending_questions_info():
     tm = TaskManager(cm)
     await tm.start_mock_agent(test_mode=True)
 
-    await asyncio.sleep(2)
+    await _wait_until(lambda: len(tm.get_pending_questions_info()) >= 1)
 
     info = tm.get_pending_questions_info()
     assert len(info) >= 1
@@ -290,7 +291,7 @@ async def test_attention_summary():
     tm = TaskManager(cm)
     await tm.start_mock_agent(test_mode=True)
 
-    await asyncio.sleep(2)
+    await _wait_until(lambda: "waiting" in tm.get_attention_summary().lower())
 
     summary = tm.get_attention_summary()
     assert "waiting" in summary.lower()
@@ -308,7 +309,10 @@ async def test_two_workers_isolation():
     tid1, tid2 = r1["task_id"], r2["task_id"]
 
     # Wait for both to emit questions (test mode: ~1s each)
-    await asyncio.sleep(3)
+    await _wait_until(lambda: all(
+        len([q for q in db.get_pending_questions() if q["task_id"] == t]) >= 1
+        for t in (tid1, tid2)
+    ))
 
     t1 = db.get_task(tid1)
     t2 = db.get_task(tid2)
@@ -330,7 +334,11 @@ async def test_two_workers_isolation():
         msg2 = await tm.answer_question(q_for_t2[0]["question_id"], "B")
         assert "delivered" in msg2.lower()
 
-    await asyncio.sleep(1)
+    if q_for_t1 or q_for_t2:
+        await _wait_until(lambda: any(
+            db.get_question_record(q["question_id"])["status"] == "answered"
+            for q in q_for_t1 + q_for_t2
+        ))
 
     # Verify answers were recorded correctly
     for q in q_for_t1:
@@ -344,7 +352,10 @@ async def test_two_workers_isolation():
             assert qr["answer"] == "B", f"Worker 2 expected B, got {qr['answer']}"
 
     # Let both complete
-    await asyncio.sleep(4)
+    await _wait_until(lambda: all(
+        db.get_task(t)["status"] in ("completed", "cancelled")
+        for t in (tid1, tid2)
+    ))
 
     task1 = db.get_task(tid1)
     task2 = db.get_task(tid2)

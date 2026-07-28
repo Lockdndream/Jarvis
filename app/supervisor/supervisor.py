@@ -108,12 +108,18 @@ Use the provided function definitions to interact with Jarvis services.
 class Supervisor:
     """Main supervisor orchestrator."""
 
-    def __init__(self, task_manager: Any = None, opencode_supervisor: Any = None) -> None:
+    def __init__(self, task_manager: Any = None, opencode_supervisor: Any = None, connection_manager: Any = None) -> None:
         self.tm = task_manager
         self.oc = opencode_supervisor
-        self.tools = ToolRegistry(task_manager, opencode_supervisor)
+        self.tools = ToolRegistry(task_manager, opencode_supervisor, connection_manager)
         self._llm: LLMProvider | FakeLLMProvider | None = None
         self._configure_llm()
+
+    def set_voice_session_manager(self, vsm: Any) -> None:
+        """Forward late-bound voice session manager injection to the tool
+        registry. See ToolRegistry.set_voice_session_manager() for why this
+        cannot be constructor-injected."""
+        self.tools.set_voice_session_manager(vsm)
 
     def _configure_llm(self) -> None:
         if os.environ.get("JARVIS_LLM_API_KEY"):
@@ -264,16 +270,19 @@ class Supervisor:
         # Build context
         context = build_context(history)
 
-        # Build LLM messages
+        # Build LLM messages: system -> history -> context -> current turn.
+        # TD-028 / MILESTONE_F1 F1.6: the current message used to be embedded in the
+        # context message AND appended again, and it preceded the history.
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": _format_context(context) + "\n\nUser: " + user_message},
         ]
 
-        # Add history
+        # History first, so the model sees the conversation that led to this turn.
         for h in history:
             messages.append({"role": h["role"], "content": h["content"]})
 
+        # Then the situational context, then the actual current turn.
+        messages.append({"role": "user", "content": _format_context(context)})
         messages.append({"role": "user", "content": user_message})
 
         tool_defs = self._build_tool_definitions()
@@ -292,7 +301,7 @@ class Supervisor:
 
         try:
             while tool_call_count < MAX_TOOL_CALLS:
-                llm_response = await self._llm.chat_completion(messages, tools=tool_defs)  # type: ignore[union-attr]  # TODO(F1.x): self._llm always non-None post-__init__; _configure_llm() sets on all branches
+                llm_response = await self._llm.chat_completion(messages, tools=tool_defs)  # type: ignore[union-attr]  # _llm is set by _configure_llm() on all branches in __init__
 
                 if llm_response.get("tool_calls"):
                     tool_call_count += 1

@@ -1,5 +1,4 @@
 """Tests for Jarvis task management (Milestone 2)."""
-import asyncio
 import json
 import os
 import sys
@@ -12,6 +11,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import app.database as db
 from app.connection_manager import ConnectionManager
 from app.task_manager import TaskManager
+from tests.conftest import _wait_until
 
 
 @pytest.fixture(autouse=True)
@@ -65,7 +65,7 @@ async def test_demo_task_starts():
     """Demo task starts and receives a task_id."""
     cm = ConnectionManager()
     tm = TaskManager(cm)
-    result = await tm.start_demo()
+    result = await tm.start_demo(steps=2)
 
     assert "task_id" in result
     assert result["name"] == "Demo Task"
@@ -75,7 +75,7 @@ async def test_demo_task_starts():
     assert task is not None
     assert task["status"] == "running"
 
-    await asyncio.sleep(16)
+    await _wait_until(lambda: db.get_task(tid)["status"] == "completed")
 
     task = db.get_task(tid)
     assert task["status"] == "completed"
@@ -87,15 +87,15 @@ async def test_stdout_captured():
     """Stdout is captured and saved as events."""
     cm = ConnectionManager()
     tm = TaskManager(cm)
-    result = await tm.start_demo()
+    result = await tm.start_demo(steps=2)
     tid = result["task_id"]
 
-    await asyncio.sleep(3)
+    await _wait_until(lambda: _count_task_events(tid) >= 1)
 
     count = _count_task_events(tid)
     assert count >= 1, "Should have at least one task event"
 
-    await asyncio.sleep(14)
+    await _wait_until(lambda: db.get_task(tid)["status"] == "completed")
 
 
 @pytest.mark.asyncio
@@ -103,10 +103,10 @@ async def test_demo_task_completion_recorded():
     """Successful completion is recorded correctly."""
     cm = ConnectionManager()
     tm = TaskManager(cm)
-    result = await tm.start_demo()
+    result = await tm.start_demo(steps=2)
     tid = result["task_id"]
 
-    await asyncio.sleep(16)
+    await _wait_until(lambda: db.get_task(tid)["status"] == "completed")
 
     task = db.get_task(tid)
     assert task["status"] == "completed"
@@ -131,12 +131,12 @@ async def test_cancellation():
     result = await tm.start_demo()
     tid = result["task_id"]
 
-    await asyncio.sleep(3)
+    await _wait_until(lambda: _count_task_events(tid) >= 1)
 
     msg = await tm.cancel(tid)
     assert "cancelled" in msg.lower()
 
-    await asyncio.sleep(1)
+    await _wait_until(lambda: db.get_task(tid)["status"] == "cancelled")
 
     task = db.get_task(tid)
     assert task["status"] == "cancelled"
@@ -216,7 +216,7 @@ async def test_cancel_running_from_task_manager():
     assert running[0]["elapsed"] >= 0
 
     await tm.cancel(tid)
-    await asyncio.sleep(1)
+    await _wait_until(lambda: len(tm.get_running_tasks_info()) == 0)
 
     running = tm.get_running_tasks_info()
     assert len(running) == 0

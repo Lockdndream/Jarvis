@@ -17,11 +17,27 @@ logger = logging.getLogger(__name__)
 class ToolRegistry:
     """Registry of bounded supervisor tools backed by service references."""
 
-    def __init__(self, task_manager: Any = None, opencode_supervisor: Any = None) -> None:
+    def __init__(
+        self,
+        task_manager: Any = None,
+        opencode_supervisor: Any = None,
+        connection_manager: Any = None,
+    ) -> None:
         self._tm = task_manager
         self._oc = opencode_supervisor
+        self._cm = connection_manager
+        self._vsm: Any = None
         self._tools: dict[str, dict] = {}
         self._register_all()
+
+    def set_voice_session_manager(self, vsm: Any) -> None:
+        """Late-bound injection. VoiceSessionManager is constructed from the
+        Supervisor (app/main.py), which already owns this ToolRegistry, so it
+        cannot be passed to __init__ -- the object does not exist yet. Setter
+        injection replaces the previous function-level import of the
+        voice_session_manager singleton inside the tool handlers (ADR-005 /
+        F1.10): the tool layer must not import the composition root."""
+        self._vsm = vsm
 
     def _register(self, name: str, description: str, parameters: dict, handler: Any) -> None:
         self._tools[name] = {
@@ -316,17 +332,21 @@ class ToolRegistry:
         if not ok:
             return f"Could not resume '{attention_request_id}'"
         fresh = db.get_attention_request(attention_request_id)
-        await attention_manager.initiate_contact(self._oc.cm, fresh)  # type: ignore[arg-type]  # TODO(F1.10): resolved by injecting connection_manager
+        if not fresh:
+            return f"Could not resume '{attention_request_id}' (it disappeared after marking due)"
+        await attention_manager.initiate_contact(self._cm, fresh)
         return f"Resumed {attention_request_id}"
 
     async def _open_voice_session(self, conversation_id: str, attention_request_id: str | None = None) -> str:
-        from app.main import voice_session_manager
-        session = voice_session_manager.open_session(conversation_id, attention_request_id)
+        if self._vsm is None:
+            return "Voice session manager not available"
+        session = self._vsm.open_session(conversation_id, attention_request_id)
         return f"Voice session opened: {session['voice_session_id']} (state={session['state']})"
 
     async def _close_voice_session(self, voice_session_id: str) -> str:
-        from app.main import voice_session_manager
-        ok = voice_session_manager.close_session(voice_session_id)
+        if self._vsm is None:
+            return "Voice session manager not available"
+        ok = self._vsm.close_session(voice_session_id)
         if not ok:
             return f"Voice session '{voice_session_id}' not found"
         return f"Voice session {voice_session_id} closed"

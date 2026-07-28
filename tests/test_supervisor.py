@@ -1024,3 +1024,149 @@ async def test_resolve_pending_tool_confirmation_unclear_reasks_without_executin
     assert called == []
     assert result["pending_tool_call"] == pending
     assert "yes or a no" in result["response"]
+
+
+# ── Regression: LLM message-array shape (F1.6 / TD-028) ──────────
+#
+# The old bug built the array as:
+#   [system] -> [user: context + "\n\nUser: " + current] -> [*history] -> [user: current]
+# sending the current turn twice and before history. The fix builds:
+#   [system] -> [*history] -> [user: context] -> [user: current]
+# These tests assert on the SHAPE of the array sent to the LLM, not on the
+# response content. If the old ordering comes back, these must fail.
+
+
+@pytest.mark.asyncio
+async def test_message_array_system_message_is_first():
+    conv_id = "shape-sys-first"
+    db.save_conversation_message(conv_id, "user", "prior question")
+    db.save_conversation_message(conv_id, "assistant", "prior answer")
+
+    sv = Supervisor()
+    await sv.process_message("tell me about the weather today", conv_id)
+
+    sent = sv.llm.calls[0]["messages"]
+    assert len(sent) > 0
+    assert sent[0]["role"] == "system"
+
+
+@pytest.mark.asyncio
+async def test_message_array_current_message_appears_exactly_once():
+    conv_id = "shape-once"
+    db.save_conversation_message(conv_id, "user", "prior question")
+    db.save_conversation_message(conv_id, "assistant", "prior answer")
+
+    sv = Supervisor()
+    current_msg = "tell me about the weather today"
+    await sv.process_message(current_msg, conv_id)
+
+    sent = sv.llm.calls[0]["messages"]
+    count = sum(1 for m in sent if m.get("content") == current_msg)
+    assert count == 1, f"Current message appeared {count} times, expected 1"
+
+
+@pytest.mark.asyncio
+async def test_message_array_current_message_after_all_history():
+    conv_id = "shape-order"
+    db.save_conversation_message(conv_id, "user", "first user turn")
+    db.save_conversation_message(conv_id, "assistant", "first assistant reply")
+    db.save_conversation_message(conv_id, "user", "second user turn")
+    db.save_conversation_message(conv_id, "assistant", "second assistant reply")
+
+    sv = Supervisor()
+    current_msg = "tell me about the weather today"
+    await sv.process_message(current_msg, conv_id)
+
+    sent = sv.llm.calls[0]["messages"]
+    history_contents = {
+        "first user turn", "first assistant reply",
+        "second user turn", "second assistant reply",
+    }
+    current_idx = None
+    history_indices = []
+    for i, m in enumerate(sent):
+        if m.get("content") == current_msg:
+            current_idx = i
+        elif m.get("content") in history_contents:
+            history_indices.append(i)
+
+    assert current_idx is not None, "Current message not found in sent array"
+    assert len(history_indices) >= 2, f"Expected >=2 history entries, found {len(history_indices)}"
+    assert current_idx > max(history_indices), (
+        f"Current message at index {current_idx} must be after all history "
+        f"(max history index: {max(history_indices)})"
+    )
+
+
+@pytest.mark.asyncio
+async def test_message_array_current_not_embedded_in_context():
+    conv_id = "shape-no-embed"
+    db.save_conversation_message(conv_id, "user", "prior question")
+    db.save_conversation_message(conv_id, "assistant", "prior answer")
+
+    sv = Supervisor()
+    current_msg = "unique_query_abc123_xyz"
+    await sv.process_message(current_msg, conv_id)
+
+    sent = sv.llm.calls[0]["messages"]
+    for i, m in enumerate(sent):
+        if m.get("content") == current_msg:
+            continue
+        assert current_msg not in (m.get("content") or ""), (
+            f"Current message text found embedded in message at index {i} "
+            f"(role={m['role']})"
+        )
+
+
+@pytest.mark.asyncio
+async def test_message_array_history_present_when_seeded():
+    conv_id = "shape-hist-present"
+    db.save_conversation_message(conv_id, "user", "earlier question")
+    db.save_conversation_message(conv_id, "assistant", "earlier answer")
+
+    sv = Supervisor()
+    await sv.process_message("tell me about the weather today", conv_id)
+
+    sent = sv.llm.calls[0]["messages"]
+    history_contents = {"earlier question", "earlier answer"}
+    found = [m for m in sent if m.get("content") in history_contents]
+    assert len(found) >= 2, f"Expected at least 2 history entries, got {len(found)}"
+
+
+@pytest.mark.asyncio
+async def test_message_array_context_message_comes_after_history():
+    conv_id = "shape-ctx-after-hist"
+    db.save_conversation_message(conv_id, "user", "first user turn")
+    db.save_conversation_message(conv_id, "assistant", "first assistant reply")
+    db.save_conversation_message(conv_id, "user", "second user turn")
+    db.save_conversation_message(conv_id, "assistant", "second assistant reply")
+
+    sv = Supervisor()
+    await sv.process_message("tell me about the weather today", conv_id)
+
+    sent = sv.llm.calls[0]["messages"]
+
+    context_idx = None
+    for i, m in enumerate(sent):
+        if m["role"] == "user" and (m.get("content") or "").startswith("Current time:"):
+            context_idx = i
+            break
+
+    assert context_idx is not None, (
+        "Context message (starting with 'Current time:') not found in sent array"
+    )
+
+    history_contents = {
+        "first user turn", "first assistant reply",
+        "second user turn", "second assistant reply",
+    }
+    history_indices = [
+        i for i, m in enumerate(sent) if m.get("content") in history_contents
+    ]
+    assert len(history_indices) >= 2, (
+        f"Expected >=2 history entries, found {len(history_indices)}"
+    )
+    assert context_idx > max(history_indices), (
+        f"Context message at index {context_idx} must be after all history "
+        f"(max history index: {max(history_indices)})"
+    )
