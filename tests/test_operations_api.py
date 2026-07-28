@@ -252,6 +252,14 @@ def test_duplicate_concurrent_start_requests_only_one_wins(client):
 
 # ── Failure handling ─────────────────────────────────────────────────
 
+@pytest.mark.xfail(
+    strict=False,
+    reason="TD-032 / MILESTONE_F1 F1.8: order-dependent failure. sv.last_operation_error "
+           "is None on CI even though state reaches FAILED — module-global contamination "
+           "between tests. Passes in isolation and on Windows dev machines, fails on GitHub "
+           "Actions. Marked non-strict because it PASSES locally; strict=True would turn "
+           "those runs into XPASS failures. F1.8 fixes the contamination and removes this.",
+)
 def test_start_failure_reported_as_failed_not_running(client):
     c, sv = client
     sv.server.fail_start = True
