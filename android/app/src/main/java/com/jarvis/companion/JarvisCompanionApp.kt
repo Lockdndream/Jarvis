@@ -5,8 +5,11 @@ import com.jarvis.companion.attention.AttentionRepository
 import com.jarvis.companion.core.ConnectionState
 import com.jarvis.companion.core.DeviceIdentity
 import com.jarvis.companion.core.SecureConfigStore
+import com.jarvis.companion.opencode.OpenCodeTaskRepository
 import com.jarvis.companion.pairing.PairingClient
 import com.jarvis.companion.pairing.PairingRepository
+import com.jarvis.companion.settings.ConnectivityPolicy
+import com.jarvis.companion.settings.OperationalSettingsRepository
 import com.jarvis.companion.telemetry.TelemetryRecorder
 import com.jarvis.companion.voice.VoiceSessionRepository
 import com.jarvis.companion.wakeword.WakeWordConfigRepository
@@ -45,12 +48,29 @@ class JarvisCompanionApp : Application() {
     lateinit var voiceSessionRepository: VoiceSessionRepository
         private set
 
+    // Interaction Layer v1 (Goals 2/3): client-side mirror of the most
+    // recent delegated OpenCode task's lifecycle, same sharing rationale
+    // as attentionRepository/voiceSessionRepository above — PresenceService
+    // (writer, via CompanionWebSocketClient) and VoiceActivity/notifications
+    // (readers) observe the same instance.
+    lateinit var openCodeTaskRepository: OpenCodeTaskRepository
+        private set
+
     // Milestone 9B.7: wake-word settings (opt-in enabled flag, confidence
     // threshold, diagnostic mode), same SecureConfigStore-backed pattern
     // as pairingRepository. Shared here so PresenceService (constructs
     // WakeWordManager from it) and a future Settings toggle read/write
     // the same instance.
     lateinit var wakeWordConfigRepository: WakeWordConfigRepository
+        private set
+
+    // Android Companion Integration v1.0 (ADR-023 Android-side enforcement):
+    // cache of the connectivity policy JOPS defines/persists server-side,
+    // same SecureConfigStore-backed sharing rationale as
+    // wakeWordConfigRepository — PresenceService (enforcer) and the
+    // Settings UI (display + Manual-mode Connect/Disconnect control) read
+    // and write the same instance.
+    lateinit var operationalSettingsRepository: OperationalSettingsRepository
         private set
 
     // App-wide, in-memory only (not persisted — this is live status, not
@@ -65,6 +85,45 @@ class JarvisCompanionApp : Application() {
         _connectionState.value = state
     }
 
+    // Live mirror of operationalSettingsRepository.connectivityMode(), so
+    // PresenceService's policy-enforcement collector reacts to a mode
+    // change immediately (Phase 6: "Policy changes while connected/
+    // disconnected") rather than only on the next settings-sync poll.
+    // Seeded from the persisted cache so a fresh process starts from the
+    // last known value, not always "always", before its first sync
+    // completes.
+    private val _connectivityMode = MutableStateFlow(ConnectivityPolicy.DEFAULT_MODE)
+    val connectivityMode: StateFlow<String> = _connectivityMode
+
+    fun updateConnectivityMode(mode: String) {
+        operationalSettingsRepository.setConnectivityMode(mode)
+        _connectivityMode.value = mode
+    }
+
+    // MODE_MANUAL only — mirrors operationalSettingsRepository.
+    // manualConnectRequested() the same way connectivityMode mirrors its
+    // own persisted value, for the same reactive-collector reason.
+    private val _manualConnectRequested = MutableStateFlow(false)
+    val manualConnectRequested: StateFlow<Boolean> = _manualConnectRequested
+
+    fun updateManualConnectRequested(requested: Boolean) {
+        operationalSettingsRepository.setManualConnectRequested(requested)
+        _manualConnectRequested.value = requested
+    }
+
+    // App-wide, in-memory only, same "PresenceService is sole writer"
+    // rationale as connectionState — whether the device's current default
+    // network has the Wi-Fi transport, per ADR-023 Phase 2's MODE_WIFI_ONLY
+    // enforcement. ConnectionStatusActivity's "Current Wi-Fi status" field
+    // reads this rather than registering its own ConnectivityManager
+    // callback.
+    private val _wifiAvailable = MutableStateFlow(false)
+    val wifiAvailable: StateFlow<Boolean> = _wifiAvailable
+
+    fun updateWifiAvailable(available: Boolean) {
+        _wifiAvailable.value = available
+    }
+
     override fun onCreate() {
         super.onCreate()
         secureConfigStore = SecureConfigStore(this)
@@ -74,7 +133,11 @@ class JarvisCompanionApp : Application() {
         telemetry = TelemetryRecorder(this)
         attentionRepository = AttentionRepository()
         voiceSessionRepository = VoiceSessionRepository()
+        openCodeTaskRepository = OpenCodeTaskRepository()
         wakeWordConfigRepository = WakeWordConfigRepository(secureConfigStore)
+        operationalSettingsRepository = OperationalSettingsRepository(secureConfigStore)
+        _connectivityMode.value = operationalSettingsRepository.connectivityMode()
+        _manualConnectRequested.value = operationalSettingsRepository.manualConnectRequested()
         telemetry.record(TelemetryRecorder.APP_CREATED, "deviceId=${deviceIdentity.get()}")
     }
 }

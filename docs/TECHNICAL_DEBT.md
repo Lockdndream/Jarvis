@@ -470,7 +470,14 @@ not urgently), **Low** (cosmetic or very low probability of mattering).
   usage with no current ceiling or archival strategy.
 - **Recommended milestone**: Unscheduled; should be addressed before
   Jarvis is expected to run unattended for very long continuous periods.
-- **Status**: Open, long-disclosed (Known Limitation #4)
+- **Status**: Partially resolved (Owner Experience M-OX.1, ADR-020) —
+  `events` gained `db.purge_events_older_than(days)`, a concrete,
+  callable retention mechanism, deliberately not yet wired to any
+  scheduler (that wiring is an operational concern for a later OX
+  milestone, not a data-model one). `tasks`, `questions`,
+  `opencode_tasks`, `attention_requests`, `contact_attempts`,
+  `voice_sessions`, `notifications`, and `push_subscriptions` remain
+  entirely unaddressed — this item stays open, not closed.
 
 ### TD-020 — `JARVIS_OPENCODE_ALLOW_PAID`'s allowlisted model is hardcoded
 
@@ -647,7 +654,7 @@ not urgently), **Low** (cosmetic or very low probability of mattering).
 | TD-016 | Conversation ownership clarity gap | Documentation | Low |
 | TD-017 | Asymmetric state-machine documentation depth | Documentation | Low |
 | TD-018 | No auth/TLS by default (mechanism symmetry achieved M9B.2; PWA credential-entry UI remains) | Operational | Critical (conditional) |
-| TD-019 | Unbounded table growth | Operational | Medium |
+| TD-019 | Unbounded table growth | Operational | Medium (partially addressed, M-OX.1) |
 | TD-020 | Hardcoded paid-model allowlist | Operational | Low |
 | TD-021 | Android companion retries forever on cert mismatch | Implementation | **Closed (M9B.2)** |
 | TD-022 | Wake-word background/Doze survival, battery, adverse-acoustic recall unproven | Architecture | High (conditional) |

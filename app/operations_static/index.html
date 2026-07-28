@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jarvis Operations</title>
+<link rel="stylesheet" href="/static/operations.css">
+</head>
+<body>
+  <header>
+    <h1>Jarvis Operations</h1>
+    <p class="subtitle">Local operator console (ADR-022/ADR-023) &mdash; acts on Jarvis and OpenCode. Read-only observation stays in the Control Center.</p>
+  </header>
+
+  <main>
+    <section class="panel" id="jarvis-panel">
+      <h2>Jarvis</h2>
+      <dl class="status-grid">
+        <dt>State</dt><dd id="jv-state">&mdash;</dd>
+        <dt>Health</dt><dd id="jv-health">&mdash;</dd>
+        <dt>Last Operation</dt><dd id="jv-last-op">&mdash;</dd>
+        <dt>Operation Result</dt><dd id="jv-last-result">&mdash;</dd>
+        <dt>Last Updated</dt><dd id="jv-last-updated">&mdash;</dd>
+        <dt>Pending Operation</dt><dd id="jv-pending">None</dd>
+      </dl>
+      <div id="jv-error" class="error-banner" hidden></div>
+      <div class="buttons">
+        <button id="jv-start" data-target="jarvis" data-action="start">Start</button>
+        <button id="jv-stop" data-target="jarvis" data-action="stop" class="destructive">Stop</button>
+        <button id="jv-restart" data-target="jarvis" data-action="restart" class="destructive">Restart</button>
+      </div>
+    </section>
+
+    <section class="panel" id="opencode-panel">
+      <h2>OpenCode</h2>
+      <dl class="status-grid">
+        <dt>State</dt><dd id="oc-state">&mdash;</dd>
+        <dt>Health</dt><dd id="oc-health">&mdash;</dd>
+        <dt>Last Operation</dt><dd id="oc-last-op">&mdash;</dd>
+        <dt>Operation Result</dt><dd id="oc-last-result">&mdash;</dd>
+        <dt>Last Updated</dt><dd id="oc-last-updated">&mdash;</dd>
+        <dt>Pending Operation</dt><dd id="oc-pending">None</dd>
+      </dl>
+      <div id="oc-error" class="error-banner" hidden></div>
+      <div class="buttons">
+        <button id="oc-start" data-target="opencode" data-action="start">Start</button>
+        <button id="oc-stop" data-target="opencode" data-action="stop" class="destructive">Stop</button>
+        <button id="oc-restart" data-target="opencode" data-action="restart" class="destructive">Restart</button>
+      </div>
+    </section>
+
+    <section class="panel readonly" id="supervisor-panel">
+      <h2>Supervisor</h2>
+      <dl class="status-grid">
+        <dt>State</dt><dd id="sup-state">&mdash;</dd>
+      </dl>
+      <p class="hint">Observational only &mdash; runs in-process with Jarvis; no separate lifecycle.</p>
+    </section>
+
+    <section class="panel readonly" id="websocket-panel">
+      <h2>WebSocket</h2>
+      <dl class="status-grid">
+        <dt>Connections Now</dt><dd id="ws-connections">&mdash;</dd>
+        <dt>Observers Now</dt><dd id="ws-observers">&mdash;</dd>
+        <dt>Reconnects</dt><dd id="ws-reconnects">&mdash;</dd>
+        <dt>Last Heartbeat</dt><dd id="ws-heartbeat">&mdash;</dd>
+      </dl>
+      <p class="hint">Observational only.</p>
+    </section>
+
+    <section class="panel readonly" id="phone-panel">
+      <h2>Phone</h2>
+      <dl class="status-grid">
+        <dt>Connection</dt><dd id="ph-connection">&mdash;</dd>
+        <dt>Device Status</dt><dd id="ph-device"><code>&mdash;</code></dd>
+      </dl>
+      <p class="hint">Observational only &mdash; reused from existing Control Center primitives, no new command channel to the phone.</p>
+    </section>
+
+    <section class="panel" id="connectivity-panel">
+      <h2>Connectivity Policy</h2>
+      <dl class="status-grid">
+        <dt>Current Mode</dt><dd id="cp-mode">&mdash;</dd>
+      </dl>
+      <div id="cp-error" class="error-banner" hidden></div>
+      <div class="buttons">
+        <select id="cp-select">
+          <option value="always">Always Connected</option>
+          <option value="wifi_only">Wi-Fi Only</option>
+          <option value="manual">Manual</option>
+        </select>
+        <button id="cp-set">Set Policy</button>
+      </div>
+      <p class="hint">Defines the policy only. Android enforcement is separate, tracked work (not yet shipped) &mdash; setting this has no effect on the phone until then.</p>
+    </section>
+
+    <section class="panel" id="history-panel">
+      <h2>Operation History</h2>
+      <div class="buttons filters">
+        <select id="hist-target">
+          <option value="">All targets</option>
+          <option value="jarvis">jarvis</option>
+          <option value="opencode">opencode</option>
+          <option value="connectivity_policy">connectivity_policy</option>
+        </select>
+        <select id="hist-status">
+          <option value="">All statuses</option>
+          <option value="QUEUED">QUEUED</option>
+          <option value="RUNNING">RUNNING</option>
+          <option value="SUCCEEDED">SUCCEEDED</option>
+          <option value="FAILED">FAILED</option>
+          <option value="CANCELLED">CANCELLED</option>
+        </select>
+        <button id="hist-refresh">Refresh</button>
+      </div>
+      <div class="table-wrap">
+        <table id="hist-table">
+          <thead>
+            <tr>
+              <th>Time</th><th>Operator</th><th>Target</th><th>Action</th>
+              <th>Status</th><th>Duration</th><th>Error</th>
+            </tr>
+          </thead>
+          <tbody id="hist-body"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/operations.js"></script>
+</body>
+</html>

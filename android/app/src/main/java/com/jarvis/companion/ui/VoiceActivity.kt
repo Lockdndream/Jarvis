@@ -21,6 +21,13 @@ import com.jarvis.companion.voice.VoiceSessionState
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
 
+private data class VoiceScreenSnapshot(
+    val session: VoiceSession?,
+    val response: String?,
+    val connectionState: ConnectionState,
+    val isSpeaking: Boolean,
+)
+
 /**
  * Maps the server's internal [VoiceSessionState] strings to the five
  * user-facing labels the UI needs to display. The server has more granular
@@ -36,9 +43,40 @@ fun voiceSessionStateToUserFacingLabel(serverState: String?): String = when (ser
     VoiceSessionState.LISTENING -> "listening"
     VoiceSessionState.SPEAKING -> "speaking"
     VoiceSessionState.WAITING -> "waiting"
+    VoiceSessionState.CONFIRMING -> "confirming"
     VoiceSessionState.CLOSED -> "finished"
     VoiceSessionState.FAILED -> "error"
     else -> "waiting"
+}
+
+/**
+ * Interaction Layer v1 (Goal 1): pure decision for whether a spoken
+ * response finishing should automatically resume listening for a
+ * follow-up turn, extracted so the gating logic is exhaustively
+ * unit-testable without a real TTS engine or SpeechRecognizer. The actual
+ * mic start (onMicTap()/startListening()) stays in VoiceActivity — this
+ * only answers "should we", matching the same decision/action split used
+ * for connectivity-policy enforcement.
+ *
+ * True only on the isSpeaking true->false *edge* (never re-fires while
+ * already false, so this can't loop) while the server has signaled it's
+ * the user's turn — LISTENING for an ordinary turn, or CONFIRMING for a
+ * Goal 5 yes/no read-back (both are legal predecessors of PROCESSING
+ * server-side; without CONFIRMING here, Goal 5 would silently regress
+ * Goal 1's hands-free promise for exactly its own confirmation replies)
+ * — there's no active error on screen, and the connection is up.
+ */
+fun shouldAutoResumeListening(
+    wasSpeaking: Boolean,
+    isSpeaking: Boolean,
+    sessionState: String?,
+    hasUserFacingError: Boolean,
+    connectionState: ConnectionState,
+): Boolean {
+    if (!wasSpeaking || isSpeaking) return false
+    if (sessionState != VoiceSessionState.LISTENING && sessionState != VoiceSessionState.CONFIRMING) return false
+    if (hasUserFacingError) return false
+    return connectionState == ConnectionState.CONNECTED
 }
 
 /**
@@ -82,6 +120,12 @@ class VoiceActivity : AppCompatActivity() {
     // onStop() doesn't need to re-parse the intent on every call.
     private var launchedByWakeWord = false
 
+    // Interaction Layer v1 (Goal 1): tracks the previous isSpeaking value
+    // so the auto-resume-listening logic below can detect the true->false
+    // edge (TTS just finished) rather than firing on every collector
+    // emission where isSpeaking happens to already be false.
+    private var wasSpeaking = false
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         app = applicationContext as JarvisCompanionApp
@@ -120,9 +164,10 @@ class VoiceActivity : AppCompatActivity() {
                     app.voiceSessionRepository.current,
                     app.voiceSessionRepository.lastResponse,
                     app.connectionState,
-                ) { session, response, connectionState ->
-                    Triple(session, response, connectionState)
-                }.collect { (session, response, connectionState) ->
+                    playbackManager.isSpeaking,
+                ) { session, response, connectionState, isSpeaking ->
+                    VoiceScreenSnapshot(session, response, connectionState, isSpeaking)
+                }.collect { (session, response, connectionState, isSpeaking) ->
                     if (session != null) hadSession = true
                     // Milestone 9B.9 (ADR-017 Section C, Item 5): a
                     // wake-word-launched screen that never auto-closes
@@ -145,6 +190,36 @@ class VoiceActivity : AppCompatActivity() {
                         )
                     }
                     render(session, response, connectionState)
+
+                    // Interaction Layer v1 (Goal 1): once a spoken response
+                    // finishes playing, automatically resume listening for
+                    // a follow-up turn instead of requiring a manual mic
+                    // tap every turn (the real friction found during
+                    // capability testing). Gated on the isSpeaking
+                    // true->false *edge*, not on response arrival — TTS is
+                    // still audible for a few seconds after the response
+                    // text arrives, and starting the mic while Jarvis is
+                    // still talking would just capture its own voice.
+                    // Also gated on session.state == LISTENING (the
+                    // server's own "your turn" signal — never fires while
+                    // closing/failed/deferred) and on no active error, so
+                    // a failed turn requires an explicit retry tap rather
+                    // than silently retrying forever.
+                    // onMicTap() -> startListening() is itself a no-op
+                    // unless SpeechInputController is IDLE, so this can
+                    // never double-start a session already listening from
+                    // the wake-word-launch path.
+                    if (shouldAutoResumeListening(
+                            wasSpeaking = wasSpeaking,
+                            isSpeaking = isSpeaking,
+                            sessionState = session?.state,
+                            hasUserFacingError = userFacingError != null,
+                            connectionState = connectionState,
+                        )
+                    ) {
+                        onMicTap()
+                    }
+                    wasSpeaking = isSpeaking
                 }
             }
         }

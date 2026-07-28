@@ -61,6 +61,7 @@ object VoiceSessionParser {
                 conversationId = root.optNullableString("conversation_id"),
                 attentionRequestId = root.optNullableString("attention_request_id"),
                 voiceSessionState = root.optNullableString("voice_session_state"),
+                traceId = root.optNullableString("trace_id"),
             )
         } catch (_: Exception) {
             null

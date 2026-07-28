@@ -5,6 +5,8 @@ import com.jarvis.companion.attention.AttentionRepository
 import com.jarvis.companion.core.ConnectionState
 import com.jarvis.companion.core.DeviceCapabilities
 import com.jarvis.companion.core.DeviceStatus
+import com.jarvis.companion.opencode.OpenCodeTaskParser
+import com.jarvis.companion.opencode.OpenCodeTaskRepository
 import com.jarvis.companion.pairing.PairingConfig
 import com.jarvis.companion.pairing.PinnedTrustManager
 import com.jarvis.companion.telemetry.TelemetryRecorder
@@ -84,10 +86,14 @@ data class DeviceStatusSnapshot(
  */
 class CompanionWebSocketClient(
     private val telemetry: TelemetryRecorder,
+    // M-OX.2: The app-wide TelemetryRecorder instance constructed in
+    // JarvisCompanionApp.kt does not yet receive this class's trace-id
+    // provider — app-wide wiring is a separate concern from this class.
     private val deviceId: String,
     private val statusInputs: DeviceStatusInputs,
     private val attentionRepository: AttentionRepository,
     private val voiceSessionRepository: VoiceSessionRepository,
+    private val openCodeTaskRepository: OpenCodeTaskRepository,
 ) {
     private val generationTracker = ConnectionGenerationTracker()
     private val backoff = BackoffPolicy()
@@ -101,6 +107,11 @@ class CompanionWebSocketClient(
     private var reconnectJob: Job? = null
     private var stopped = true
     private var lastHeartbeatSentAtMs: Long? = null
+
+    @Volatile
+    private var lastKnownTraceId: String? = null
+
+    fun currentTraceId(): String? = lastKnownTraceId
 
     @Volatile
     var state: ConnectionState = ConnectionState.DISCONNECTED
@@ -387,13 +398,41 @@ class CompanionWebSocketClient(
         if (!VoiceSessionParser.isVoiceSessionEventType(type)) return
         when (type) {
             "voice_session_opened" -> VoiceSessionParser.parseOpened(text)?.let { voiceSessionRepository.applyOpened(it) }
-            "voice_session_response" -> VoiceSessionParser.parseResponse(text)?.let { voiceSessionRepository.applyResponse(it) }
+            "voice_session_response" -> VoiceSessionParser.parseResponse(text)?.let {
+                it.traceId?.let { tid -> lastKnownTraceId = tid }
+                voiceSessionRepository.applyResponse(it)
+            }
             "voice_session_error" -> VoiceSessionParser.parseError(text)?.let {
                 voiceSessionRepository.applyError(it.voiceSessionId)
                 voiceSessionRepository.applyOpenError(it)
             }
             "voice_session_closed" -> VoiceSessionParser.parseClosed(text)?.let { voiceSessionRepository.applyClosed(it.voiceSessionId, it.reason) }
             "voice_session_invitation" -> voiceSessionRepository.applyInvitation()
+        }
+    }
+
+    /** Interaction Layer v1 (Goals 2/3): sniffs opencode_task_created/
+     * opencode_task_completed — broadcast to every connection already
+     * (app/integrations/opencode_supervisor.py), previously received here
+     * but silently dropped since no handler recognized the type. Same
+     * one-place-only, never-throws pattern as [applyAttentionFrame]/
+     * [applyVoiceSessionFrame]. */
+    private fun applyOpenCodeTaskFrame(text: String) {
+        val type = try {
+            JSONObject(text).optString("type", "")
+        } catch (_: Exception) {
+            return
+        }
+        if (!OpenCodeTaskParser.isOpenCodeTaskEventType(type)) return
+        when (type) {
+            "opencode_task_created" -> OpenCodeTaskParser.parseCreated(text)?.let {
+                openCodeTaskRepository.applyCreated(it)
+                telemetry.record(TelemetryRecorder.OPENCODE_TASK_CREATED, "taskId=${it.taskId}")
+            }
+            "opencode_task_completed" -> OpenCodeTaskParser.parseCompleted(text)?.let {
+                openCodeTaskRepository.applyCompleted(it)
+                telemetry.record(TelemetryRecorder.OPENCODE_TASK_COMPLETED, "taskId=${it.taskId} status=${it.status}")
+            }
         }
     }
 
@@ -464,6 +503,7 @@ class CompanionWebSocketClient(
             telemetry.record(TelemetryRecorder.WS_FRAME_RECEIVED, "bytes=${text.length} generation=$generation")
             applyAttentionFrame(text)
             applyVoiceSessionFrame(text)
+            applyOpenCodeTaskFrame(text)
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {

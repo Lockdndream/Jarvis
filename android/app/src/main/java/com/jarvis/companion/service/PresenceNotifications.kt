@@ -30,6 +30,20 @@ const val PRESENCE_NOTIFICATION_ID = 1001
 private const val HANDOFF_CHANNEL_ID = "jarvis_wakeword_handoff"
 const val WAKEWORD_HANDOFF_NOTIFICATION_ID = 1002
 
+// Interaction Layer v1 (Goals 2/3): a delegated OpenCode task's lifecycle.
+// TASK_RUNNING reuses CHANNEL_ID (IMPORTANCE_LOW, ambient) — it's an
+// ongoing, ID-updated notification for the whole task duration, not
+// something that should interrupt. The terminal notification uses its own
+// IMPORTANCE_DEFAULT channel so completion/failure actually surfaces
+// (sound + brief heads-up) instead of silently joining the low-priority
+// status notification — this is the concrete fix for the real gap found
+// during capability testing (a task completed with zero signal to the
+// user, traced to a missing push dependency; this path doesn't depend on
+// push at all, it rides the same WebSocket connection already open).
+const val OPENCODE_TASK_RUNNING_NOTIFICATION_ID = 1003
+const val OPENCODE_TASK_TERMINAL_NOTIFICATION_ID = 1004
+private const val TASK_TERMINAL_CHANNEL_ID = "jarvis_opencode_task_terminal"
+
 /** Owns the foreground-service notification channel and content — kept out
  * of PresenceService itself so the service's lifecycle logic isn't tangled
  * with notification-building detail. */
@@ -128,6 +142,65 @@ class PresenceNotifications(private val context: Context) {
             .setFullScreenIntent(fullScreenIntent, true)
             .setAutoCancel(true)
             .setCategory(Notification.CATEGORY_CALL)
+            .build()
+    }
+
+    private fun ensureTaskTerminalChannel(): String {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            val channel = NotificationChannel(
+                TASK_TERMINAL_CHANNEL_ID,
+                "Jarvis task completed",
+                NotificationManager.IMPORTANCE_DEFAULT,
+            )
+            nm.createNotificationChannel(channel)
+        }
+        return TASK_TERMINAL_CHANNEL_ID
+    }
+
+    /** Ongoing (not auto-cancel), reused low-priority channel — ambient
+     * "still working" visibility for the whole task duration, updated in
+     * place rather than re-notifying (see PresenceService's collector,
+     * which calls this on every distinct RUNNING emission for the same
+     * task, always with the same notification ID). */
+    fun buildOpenCodeTaskRunning(instruction: String?): Notification {
+        val channelId = ensureChannel()
+        val summary = instruction?.take(80) ?: "Delegated task"
+        val contentIntent = PendingIntent.getActivity(
+            context, 0, Intent(context, ConnectionStatusActivity::class.java),
+            PendingIntent.FLAG_IMMUTABLE,
+        )
+        return Notification.Builder(context, channelId)
+            .setContentTitle("OpenCode task running…")
+            .setContentText(summary)
+            .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+            .setContentIntent(contentIntent)
+            .setOngoing(true)
+            .build()
+    }
+
+    /** status is the server's own "completed"/"failed" string (see
+     * OpenCodeTaskParser) — anything else still renders, just without a
+     * dedicated title, rather than silently dropping an unrecognized
+     * future status. */
+    fun buildOpenCodeTaskTerminal(status: String, instruction: String?): Notification {
+        val channelId = ensureTaskTerminalChannel()
+        val title = when (status) {
+            "completed" -> "Task completed"
+            "failed" -> "Task failed"
+            else -> "Task finished: $status"
+        }
+        val summary = instruction?.take(80) ?: "Delegated task"
+        val contentIntent = PendingIntent.getActivity(
+            context, 0, Intent(context, ConnectionStatusActivity::class.java),
+            PendingIntent.FLAG_IMMUTABLE,
+        )
+        return Notification.Builder(context, channelId)
+            .setContentTitle(title)
+            .setContentText(summary)
+            .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+            .setContentIntent(contentIntent)
+            .setAutoCancel(true)
             .build()
     }
 }

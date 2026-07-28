@@ -31,7 +31,7 @@ def test_db():
 
 
 class FakeSupervisor:
-    async def process_message(self, user_message, conversation_id=None, bound_attention_request_id=None):
+    async def process_message(self, user_message, conversation_id=None, bound_attention_request_id=None, confirm_before_tools=None):
         return {"response": "OK", "conversation_id": conversation_id}
 
 

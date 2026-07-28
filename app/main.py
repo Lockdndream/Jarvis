@@ -49,11 +49,12 @@ from .voice_session_manager import VoiceSessionManager, VoiceSessionError
 from . import voice_session_manager as voice_session_manager_module
 from .voice_session_reaper import VoiceSessionReaper
 from .integrations.ws_tokens import issue_ws_token, verify_ws_token
+from . import operations as operations_module
+from . import operations_connectivity as operations_connectivity_module
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-)
+from .structured_logging import configure_structured_logging, get_logging_status
+
+configure_structured_logging()
 logger = logging.getLogger("jarvis")
 
 # Bounded conversation history sent to the browser on handshake/reconnect —
@@ -73,6 +74,12 @@ attention_manager.set_broadcast_hook(conn_manager)
 # set-once-at-startup hook as attention_manager's, just above.
 supervisor_module.set_broadcast_hook(conn_manager)
 voice_session_manager_module.set_broadcast_hook(conn_manager)
+# ADR-022: Jarvis Operations wiring -- injected, not imported by
+# app.operations, to avoid a circular import (app.main -> app.operations
+# would otherwise need app.operations -> app.main for this instance).
+operations_module.set_opencode_supervisor(opencode_supervisor)
+operations_module.set_connection_manager(conn_manager)
+operations_connectivity_module.set_connection_manager(conn_manager)
 
 # Server process start time, for the dashboard's uptime display
 # (Connectivity Monitor / System Health). Set at import time — the
@@ -108,6 +115,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Jarvis", lifespan=lifespan)
+app.include_router(operations_module.router)
+app.include_router(operations_connectivity_module.router)
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -251,7 +260,16 @@ async def push_unsubscribe(body: PushUnsubscribeRequest, _=Depends(_require_api_
 @app.get("/api/settings")
 async def get_settings():
     from . import attention_policy
-    return {"notify_on_completion": attention_policy.notify_on_completion()}
+    from . import operations_connectivity
+    return {
+        "notify_on_completion": attention_policy.notify_on_completion(),
+        # ADR-023: the phone-readable half of the connectivity-policy
+        # split -- JOPS defines/persists this via the localhost-only
+        # /api/operations/connectivity/policy endpoint; this is the
+        # existing, already-LAN-open channel the phone reads any setting
+        # from, deliberately not a new command channel to the phone.
+        "connectivity_mode": get_setting("connectivity_mode", operations_connectivity.DEFAULT_MODE),
+    }
 
 
 @app.post("/api/settings")
@@ -418,6 +436,7 @@ async def dashboard_snapshot(_=Depends(_require_api_token)):
             for a in get_unresolved_attention_requests()
         ],
         "recent_events": get_recent_events(200),
+        "logging": get_logging_status(),
     }
 
 
@@ -658,6 +677,7 @@ async def websocket_endpoint(ws: WebSocket):
                     "conversation_id": result.get("conversation_id"),
                     "attention_request_id": result.get("attention_request_id"),
                     "voice_session_state": result.get("voice_session_state"),
+                    "trace_id": result.get("trace_id"),
                 }))
                 continue
 
@@ -720,6 +740,7 @@ async def websocket_endpoint(ws: WebSocket):
                                 "timestamp": _now(),
                                 "content": response_text,
                                 "conversation_id": result.get("conversation_id", ""),
+                                "trace_id": result.get("trace_id"),
                             }
                         )
                     )

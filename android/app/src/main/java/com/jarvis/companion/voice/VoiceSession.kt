@@ -15,6 +15,7 @@ data class VoiceSessionResponse(
     val conversationId: String?,
     val attentionRequestId: String?,
     val voiceSessionState: String?,
+    val traceId: String? = null,
 )
 
 data class VoiceSessionError(
@@ -52,6 +53,10 @@ object VoiceSessionState {
     const val SPEAKING = "speaking"
     const val WAITING = "waiting"
     const val DEFERRED = "deferred"
+    // Interaction Layer v1 (Goal 5): awaiting a yes/no reply to a
+    // technical-command read-back confirmation — see
+    // app/voice_session_manager.py's STATE_CONFIRMING.
+    const val CONFIRMING = "confirming"
     const val CLOSING = "closing"
     const val CLOSED = "closed"
     const val FAILED = "failed"

@@ -2,6 +2,7 @@ package com.jarvis.companion.telemetry
 
 import android.content.Context
 import android.util.Log
+import org.json.JSONObject
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -22,23 +23,46 @@ import kotlin.concurrent.withLock
  * Ported from spikes/android-presence/TelemetryRecorder.kt (validated
  * across the Milestone 9B.0 survival tests); production adds a size cap so
  * a long-running install doesn't grow the log file unbounded.
+ *
+ * M-OX.2 (ADR-021): outputs JSON Lines, supports trace_id propagation via
+ * an optional [traceIdProvider] lambda, and rotates into numbered files.
  */
-class TelemetryRecorder(context: Context) {
+class TelemetryRecorder(
+    context: Context,
+    private val traceIdProvider: (() -> String?)? = null,
+) {
 
     private val logFile = File(context.filesDir, "telemetry.log")
     private val lock = ReentrantLock()
     private val timestampFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSXXX", Locale.US)
 
-    fun record(event: String, detail: String = "") {
-        val line = buildString {
-            append(timestampFormat.format(Date(System.currentTimeMillis())))
-            append(" ")
-            append(event)
-            if (detail.isNotEmpty()) {
-                append(" ")
-                append(detail)
-            }
-        }
+    fun record(
+        event: String,
+        detail: String = "",
+        severity: String = "INFO",
+        traceId: String? = null,
+        conversationId: String? = null,
+        taskId: String? = null,
+        fields: Map<String, Any?> = emptyMap(),
+    ) {
+        val resolvedTraceId = traceId ?: traceIdProvider?.invoke()
+        val line = JSONObject().apply {
+            put("timestamp", timestampFormat.format(Date(System.currentTimeMillis())))
+            put("severity", severity)
+            put("component", componentFor(event))
+            put("message", buildString {
+                append(event)
+                if (detail.isNotEmpty()) {
+                    append(" ")
+                    append(detail)
+                }
+            })
+            put("trace_id", resolvedTraceId)
+            put("conversation_id", conversationId)
+            put("task_id", taskId)
+            put("runtime_task", Thread.currentThread().name)
+            put("fields", JSONObject(fields))
+        }.toString()
         Log.i(TAG, line)
         lock.withLock {
             try {
@@ -51,10 +75,34 @@ class TelemetryRecorder(context: Context) {
         }
     }
 
+    private fun componentFor(event: String): String = when {
+        event.startsWith("WS_") || event == "DEVICE_STATUS_SENT" -> "android.websocket"
+        event.startsWith("WAKEWORD_") -> "android.wakeword"
+        event.startsWith("ATTENTION_") -> "android.attention"
+        event.startsWith("PAIRING_") -> "android.pairing"
+        event.startsWith("CONNECTIVITY_POLICY_") || event.startsWith("SETTINGS_SYNC_") -> "android.connectivity"
+        event.startsWith("OPENCODE_TASK_") -> "android.opencode"
+        event.startsWith("APP_") || event.startsWith("SERVICE_") || event.startsWith("FOREGROUND_") ||
+            event.startsWith("NOTIFICATION_") || event == "TASK_REMOVED" ||
+            event.startsWith("NETWORK_") || event.startsWith("SCREEN_") -> "android.presence"
+        else -> "android.other"
+    }
+
     private fun rotateIfOversized() {
         if (logFile.exists() && logFile.length() > MAX_LOG_BYTES) {
-            val kept = logFile.readLines().takeLast(MAX_LOG_KEPT_LINES)
-            logFile.writeText(kept.joinToString("\n") + "\n")
+            val logDir = logFile.parentFile ?: return
+            // Remove the oldest rotated file if it exists (index 4 is the cap)
+            val oldest = File(logDir, "telemetry.log.4")
+            if (oldest.exists()) oldest.delete()
+            // Shift existing rotated files up by one index
+            for (i in 3 downTo 1) {
+                val src = File(logDir, "telemetry.log.$i")
+                if (src.exists()) {
+                    src.renameTo(File(logDir, "telemetry.log.${i + 1}"))
+                }
+            }
+            // Rename current active file to .1, then start fresh
+            logFile.renameTo(File(logDir, "telemetry.log.1"))
         }
     }
 
@@ -69,7 +117,6 @@ class TelemetryRecorder(context: Context) {
     companion object {
         const val TAG = "JarvisCompanion"
         private const val MAX_LOG_BYTES = 1_000_000L
-        private const val MAX_LOG_KEPT_LINES = 2_000
 
         // Exact event vocabulary — do not invent new event names ad hoc,
         // extend this list deliberately.
@@ -131,5 +178,24 @@ class TelemetryRecorder(context: Context) {
         // from a wake-word detection to a launched VoiceActivity.
         const val WAKEWORD_HANDOFF_LAUNCHED = "WAKEWORD_HANDOFF_LAUNCHED"
         const val WAKEWORD_HANDOFF_FAILED = "WAKEWORD_HANDOFF_FAILED"
+
+        // Android Companion Integration v1.0 (ADR-023 Android-side
+        // enforcement): settings sync (GET /api/settings, at minimum
+        // connectivity_mode) and the policy-driven start()/stop() calls
+        // PresenceService makes as a result — every state transition ADR-020/
+        // 021 requires be observable through logging, per that milestone's
+        // explicit requirement.
+        const val SETTINGS_SYNC_STARTED = "SETTINGS_SYNC_STARTED"
+        const val SETTINGS_SYNC_SUCCEEDED = "SETTINGS_SYNC_SUCCEEDED"
+        const val SETTINGS_SYNC_FAILED = "SETTINGS_SYNC_FAILED"
+        const val CONNECTIVITY_POLICY_WIFI_TRANSPORT_CHANGED = "CONNECTIVITY_POLICY_WIFI_TRANSPORT_CHANGED"
+        const val CONNECTIVITY_POLICY_CONNECT = "CONNECTIVITY_POLICY_CONNECT"
+        const val CONNECTIVITY_POLICY_DISCONNECT = "CONNECTIVITY_POLICY_DISCONNECT"
+
+        // Interaction Layer v1 (Goals 2/3): delegated OpenCode task
+        // lifecycle events reaching the phone (previously silently
+        // dropped — see CompanionWebSocketClient.applyOpenCodeTaskFrame).
+        const val OPENCODE_TASK_CREATED = "OPENCODE_TASK_CREATED"
+        const val OPENCODE_TASK_COMPLETED = "OPENCODE_TASK_COMPLETED"
     }
 }

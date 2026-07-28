@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import app.database as db
 from app.connection_manager import ConnectionManager
-from app.integrations.opencode_supervisor import OpenCodeSupervisor
+from app.integrations.opencode_supervisor import OpenCodeSupervisor, _extract_result_text
 
 
 @pytest.fixture(autouse=True)
@@ -157,6 +157,81 @@ async def test_session_idle_does_not_complete_while_question_pending():
     assert task["status"] != "completed"
 
 
+# ── M-OX.3 live-validation fixes: terminal-state logging carries trace_id ─
+#
+# A real end-to-end run against a live server found these terminal-state
+# log lines always carried trace_id: null, because _handle_session_failed/
+# _handle_session_idle/_handle_activity run on the SSE loop's own asyncio
+# Task, never the turn's -- trace.current_trace_id() is always None there.
+# Fixed by recovering trace_id from the opencode_tasks row (already
+# persisted at creation, per ADR-020) and passing it explicitly via
+# extra=, plus fixing JarvisContextFilter to respect that explicit value
+# instead of unconditionally overwriting it back to None.
+
+@pytest.mark.asyncio
+async def test_session_error_log_line_recovers_trace_id_and_logs_at_warning(caplog):
+    import logging as _logging
+
+    sv = make_supervisor()
+    task_id = "oc_trace_fail1"
+    session_id = "ses_trace_fail1"
+    db.create_task_record(task_id, "Test Task", "do the thing", trace_id="trace_fail_abc123")
+    db.create_opencode_task_record(task_id, session_id, "/tmp/proj", "do the thing", trace_id="trace_fail_abc123")
+
+    with caplog.at_level(_logging.WARNING, logger="app.integrations.opencode_supervisor"):
+        await sv._handle_sse_event(frame(None, "session.error", {"sessionID": session_id, "error": {}}))
+
+    terminal_records = [r for r in caplog.records if "terminal state observed" in r.message]
+    assert len(terminal_records) == 1
+    record = terminal_records[0]
+    assert record.levelname == "WARNING"
+    assert record.trace_id == "trace_fail_abc123"
+    assert record.task_id == task_id
+    assert record.status == "failed"
+    assert isinstance(record.duration_seconds, float)
+
+
+@pytest.mark.asyncio
+async def test_session_idle_log_line_recovers_trace_id(caplog):
+    import logging as _logging
+
+    sv = make_supervisor()
+    task_id = "oc_trace_ok1"
+    session_id = "ses_trace_ok1"
+    db.create_task_record(task_id, "Test Task", "do the thing", trace_id="trace_ok_def456")
+    db.create_opencode_task_record(task_id, session_id, "/tmp/proj", "do the thing", trace_id="trace_ok_def456")
+
+    with caplog.at_level(_logging.INFO, logger="app.integrations.opencode_supervisor"):
+        await sv._handle_sse_event(frame(None, "session.idle", {"sessionID": session_id}))
+
+    terminal_records = [r for r in caplog.records if "terminal state observed" in r.message]
+    assert len(terminal_records) == 1
+    record = terminal_records[0]
+    assert record.trace_id == "trace_ok_def456"
+    assert record.task_id == task_id
+    assert record.status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_activity_evidence_log_line_includes_task_id_and_trace_id(caplog):
+    import logging as _logging
+
+    sv = make_supervisor()
+    task_id = "oc_trace_activity1"
+    session_id = "ses_trace_activity1"
+    db.create_task_record(task_id, "Test Task", "do the thing", trace_id="trace_activity_xyz")
+    db.create_opencode_task_record(task_id, session_id, "/tmp/proj", "do the thing", trace_id="trace_activity_xyz")
+
+    with caplog.at_level(_logging.INFO, logger="app.integrations.opencode_supervisor"):
+        await sv._handle_sse_event(frame("/tmp/proj", "message.part.delta", {"sessionID": session_id}))
+
+    activity_records = [r for r in caplog.records if "opencode first execution event observed" in r.message]
+    assert len(activity_records) == 1
+    record = activity_records[0]
+    assert record.task_id == task_id
+    assert record.trace_id == "trace_activity_xyz"
+
+
 @pytest.mark.asyncio
 async def test_session_idle_after_error_reset_by_new_instruction_can_complete():
     """A follow-up instruction resets the error flag so a later idle for the
@@ -257,4 +332,155 @@ async def test_reconcile_on_startup_handles_query_failure_gracefully():
 async def test_reconcile_on_startup_noop_when_nothing_degraded():
     sv = make_supervisor()
     sv.adapter = None  # would raise AttributeError if reconcile tried to use it
+
+
+# ── Delegated Observation and Reporting milestone ────────────────────
+# Real-device finding this traces back to: OpenCode's own message history
+# was reachable the whole time (OpenCodeAdapter.get_messages(), Milestone
+# 9A) but nothing ever called it, so a completed task's actual result was
+# invisible to the Supervisor. Message shapes below are copied verbatim
+# from a live probe against a real completed OpenCode session (git status
+# on a non-git directory) -- not invented.
+
+_REAL_MESSAGES = [
+    {
+        "info": {"role": "user"},
+        "parts": [{"type": "text", "text": "Run git status and tell me the current status."}],
+    },
+    {
+        "info": {"role": "assistant"},
+        "parts": [
+            {"type": "step-start"},
+            {"type": "reasoning", "text": "The user wants git status."},
+            {
+                "type": "tool",
+                "tool": "bash",
+                "state": {
+                    "status": "completed",
+                    "output": "fatal: not a git repository (or any of the parent directories): .git\n",
+                },
+            },
+            {"type": "step-finish"},
+        ],
+    },
+    {
+        "info": {"role": "assistant"},
+        "parts": [
+            {"type": "step-start"},
+            {"type": "reasoning", "text": "I should explain this to the user."},
+            {
+                "type": "text",
+                "text": "This directory is not a Git repository — there is no .git directory present.",
+            },
+            {"type": "step-finish"},
+        ],
+    },
+]
+
+
+def test_extract_result_text_prefers_the_last_assistant_text_part():
+    assert _extract_result_text(_REAL_MESSAGES) == "This directory is not a Git repository — there is no .git directory present."
+
+
+def test_extract_result_text_falls_back_to_tool_output_with_no_closing_text():
+    messages = [m for m in _REAL_MESSAGES if not any(p.get("type") == "text" for p in m.get("parts", []))]
+    assert "fatal: not a git repository" in _extract_result_text(messages)
+
+
+def test_extract_result_text_ignores_reasoning_and_user_messages():
+    messages = [
+        {"info": {"role": "user"}, "parts": [{"type": "text", "text": "the question"}]},
+        {"info": {"role": "assistant"}, "parts": [{"type": "reasoning", "text": "internal thoughts only"}]},
+    ]
+    assert _extract_result_text(messages) is None
+
+
+def test_extract_result_text_empty_list_returns_none():
+    assert _extract_result_text([]) is None
+
+
+def test_extract_result_text_tolerates_malformed_entries():
+    assert _extract_result_text([None, {}, {"info": {}}, "not a dict"]) is None
+
+
+class FakeMessagesAdapter:
+    def __init__(self, messages=None, raises=False):
+        self._messages = messages if messages is not None else _REAL_MESSAGES
+        self._raises = raises
+        self.calls = []
+
+    async def get_messages(self, session_id, directory, limit=20):
+        self.calls.append((session_id, directory))
+        if self._raises:
+            raise ConnectionError("opencode unreachable")
+        return self._messages
+
+
+@pytest.mark.asyncio
+async def test_fetch_task_result_text_returns_extracted_text():
+    sv = make_supervisor()
+    sv.adapter = FakeMessagesAdapter()
+    task_id, session_id = make_task()
+
+    text = await sv.fetch_task_result_text(task_id)
+
+    assert text == "This directory is not a Git repository — there is no .git directory present."
+    assert sv.adapter.calls == [(session_id, "/tmp/proj")]
+
+
+@pytest.mark.asyncio
+async def test_fetch_task_result_text_unknown_task_returns_none():
+    sv = make_supervisor()
+    sv.adapter = FakeMessagesAdapter()
+    assert await sv.fetch_task_result_text("oc_does_not_exist") is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_task_result_text_adapter_failure_returns_none_not_raise():
+    sv = make_supervisor()
+    sv.adapter = FakeMessagesAdapter(raises=True)
+    task_id, _ = make_task()
+    assert await sv.fetch_task_result_text(task_id) is None
+
+
+@pytest.mark.asyncio
+async def test_session_idle_captures_and_persists_result_summary():
+    sv = make_supervisor()
+    sv.adapter = FakeMessagesAdapter()
+    task_id, session_id = make_task()
+
+    await sv._handle_sse_event(frame(None, "session.idle", {"sessionID": session_id}))
+
+    oc_task = db.get_opencode_task(task_id)
+    assert oc_task["status"] == "completed"
+    assert oc_task["result_summary"] == "This directory is not a Git repository — there is no .git directory present."
+
+
+@pytest.mark.asyncio
+async def test_session_error_captures_and_persists_result_summary():
+    sv = make_supervisor()
+    sv.adapter = FakeMessagesAdapter()
+    task_id, session_id = make_task()
+
+    await sv._handle_sse_event(frame(None, "session.error", {"sessionID": session_id, "error": {}}))
+
+    oc_task = db.get_opencode_task(task_id)
+    assert oc_task["status"] == "failed"
+    assert oc_task["result_summary"] == "This directory is not a Git repository — there is no .git directory present."
+
+
+@pytest.mark.asyncio
+async def test_session_idle_completes_normally_even_when_capture_fails():
+    """A result-capture failure must never affect the terminal state
+    transition that already happened -- same never-break-the-primary-flow
+    discipline as every other observability concern in this module."""
+    sv = make_supervisor()
+    sv.adapter = FakeMessagesAdapter(raises=True)
+    task_id, session_id = make_task()
+
+    await sv._handle_sse_event(frame(None, "session.idle", {"sessionID": session_id}))
+
+    oc_task = db.get_opencode_task(task_id)
+    assert oc_task["status"] == "completed"
+    assert oc_task["result_summary"] is None
     await sv.reconcile_on_startup()  # must return immediately, no adapter call

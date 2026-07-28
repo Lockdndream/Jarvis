@@ -118,3 +118,7 @@ Every ADR uses the same section structure, in this order:
 | [ADR-017](ADR-017-production-wakeword-foundation.md) | Production Wake-Word Foundation | Accepted |
 | [ADR-018](ADR-018-jarvis-control-center-observability-architecture.md) | Jarvis Control Center — Observability Architecture | Accepted |
 | [ADR-019](ADR-019-separation-of-observability-and-operations.md) | Separation of Observability and Operations | Accepted |
+| [ADR-020](ADR-020-trace-id-execution-correlation-model.md) | Trace ID — Execution Correlation Model | Accepted |
+| [ADR-021](ADR-021-structured-logging-architecture.md) | Structured Logging Architecture | Accepted |
+| [ADR-022](ADR-022-jarvis-operations-subsystem.md) | Jarvis Operations Subsystem | Accepted |
+| [ADR-023](ADR-023-jops-v1-operation-model-and-jarvis-self-management.md) | JOPS v1.0 — Operation Model, Jarvis Self-Management, Connectivity Policy Split | Accepted |

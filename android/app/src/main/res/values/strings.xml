@@ -36,6 +36,20 @@
     <string name="connection_state_disconnected">Disconnected</string>
     <string name="connection_state_unpaired">Not paired</string>
     <string name="connection_state_failed_permanent">Connection failed — re-pairing required</string>
+    <string name="connectivity_mode_always">Policy: Always Connected</string>
+    <string name="connectivity_mode_wifi_only">Policy: Wi-Fi Only</string>
+    <string name="connectivity_mode_manual">Policy: Manual</string>
+    <string name="wifi_status_on_wifi">Wi-Fi: connected</string>
+    <string name="wifi_status_not_on_wifi">Wi-Fi: not connected</string>
+    <string name="last_synced_at">Last synced: %1$s</string>
+    <string name="last_synced_never">Last synced: never</string>
+    <string name="manual_connect_button">Connect</string>
+    <string name="manual_disconnect_button">Disconnect</string>
+    <string name="opencode_task_running">Task running…</string>
+    <string name="opencode_task_completed">Task completed</string>
+    <string name="opencode_task_failed">Task failed</string>
+    <string name="opencode_task_other">Task: %1$s</string>
+    <string name="opencode_task_with_summary">%1$s — %2$s</string>
 
     <!-- Diagnostics screen -->
     <string name="diagnostics_title">Diagnostics</string>

@@ -60,6 +60,7 @@ import os
 from datetime import datetime, timezone
 
 from app.integrations import process_utils
+from app.integrations import owner_marker
 
 logger = logging.getLogger(__name__)
 
@@ -166,26 +167,15 @@ class ServerClassification:
 
 
 def _read_owner_marker() -> dict | None:
-    try:
-        with open(OWNER_MARKER_PATH, encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return None
+    return owner_marker.read_owner_marker(OWNER_MARKER_PATH)
 
 
 def _write_owner_marker(pid: int, port: int) -> None:
-    try:
-        with open(OWNER_MARKER_PATH, "w", encoding="utf-8") as f:
-            json.dump({"pid": pid, "port": port}, f)
-    except OSError:
-        logger.warning("Could not write OpenCode owner marker at %s", OWNER_MARKER_PATH)
+    owner_marker.write_owner_marker(OWNER_MARKER_PATH, pid, port)
 
 
 def _clear_owner_marker() -> None:
-    try:
-        os.remove(OWNER_MARKER_PATH)
-    except OSError:
-        pass
+    owner_marker.clear_owner_marker(OWNER_MARKER_PATH)
 
 
 async def classify_existing_server(port: int, base_url: str, auth_header: str) -> tuple[str, dict]:

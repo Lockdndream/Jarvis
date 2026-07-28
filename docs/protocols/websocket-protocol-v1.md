@@ -124,6 +124,19 @@ Sent in response to client messages or server-side events:
 in `ARCHITECTURE.md` (not re-enumerated here — those are business-logic
 events, not part of the connection/auth protocol this document covers).
 
+#### 2.2.1 `trace_id` (ADR-020, additive)
+
+`voice_session_response` and `supervisor_message` each carry a `trace_id`
+field: the server-minted correlation id for the turn that produced this
+response, or `null` if the reply never reached a full Supervisor turn
+(e.g. a stale-attention early reply). No client currently reads this
+field — it exists so a future client can correlate its own local state
+with the server's execution record for that turn (Owner Experience
+Milestone 1). Not currently accepted from the client on any inbound
+message; see ADR-020 for why `client_request_id` (§2.1's
+`voice_session_open`, unchanged here) was deliberately not extended to
+every message type yet.
+
 ---
 
 ## 3. What this document does not cover

@@ -40,8 +40,14 @@ def reset_broadcast_hook():
 
 
 class FakeOpenCodeSupervisor:
-    def __init__(self):
+    def __init__(self, live_result=None):
         self.cm = ConnectionManager()
+        self._live_result = live_result
+        self.fetch_calls = []
+
+    async def fetch_task_result_text(self, task_id):
+        self.fetch_calls.append(task_id)
+        return self._live_result
 
 
 async def _attention(source_id="q1"):
@@ -152,3 +158,83 @@ async def test_call_with_missing_required_arg_returns_deterministic_error_not_a_
     tools = make_tools()
     result = await tools.call("defer_attention", {"attention_request_id": "attn_x"})  # missing deferred_until
     assert result.startswith("Error")
+
+
+# ── Delegated Observation and Reporting milestone ────────────────────
+
+def _make_opencode_task(task_id="oc_1", status="completed"):
+    db.create_task_record(task_id, "Test Task", "do the thing")
+    db.create_opencode_task_record(task_id, "ses_1", "/tmp/proj", "do the thing")
+    db.update_task_status(task_id, status, 0 if status == "completed" else None)
+    db.update_opencode_task_status(task_id, status)
+    return task_id
+
+
+@pytest.mark.asyncio
+async def test_get_task_result_registered():
+    tools = make_tools()
+    names = {d["name"] for d in tools.list_definitions()}
+    assert "get_task_result" in names
+
+
+@pytest.mark.asyncio
+async def test_get_task_result_returns_persisted_summary_without_a_live_fetch():
+    oc_sv = FakeOpenCodeSupervisor(live_result="should never be reached")
+    tools = ToolRegistry(task_manager=None, opencode_supervisor=oc_sv)
+    task_id = _make_opencode_task()
+    db.update_opencode_task_result(task_id, "Two files modified: a.py, b.py")
+
+    result = await tools.call("get_task_result", {"task_id": task_id})
+
+    assert result == "Two files modified: a.py, b.py"
+    assert oc_sv.fetch_calls == []  # persisted result answers it -- no re-fetch, no re-run
+
+
+@pytest.mark.asyncio
+async def test_get_task_result_falls_back_to_live_fetch_when_nothing_persisted():
+    oc_sv = FakeOpenCodeSupervisor(live_result="Fetched live: no .git directory found")
+    tools = ToolRegistry(task_manager=None, opencode_supervisor=oc_sv)
+    task_id = _make_opencode_task()  # no result_summary set
+
+    result = await tools.call("get_task_result", {"task_id": task_id})
+
+    assert result == "Fetched live: no .git directory found"
+    assert oc_sv.fetch_calls == [task_id]
+
+
+@pytest.mark.asyncio
+async def test_get_task_result_still_running_reports_no_result_yet():
+    oc_sv = FakeOpenCodeSupervisor()
+    tools = ToolRegistry(task_manager=None, opencode_supervisor=oc_sv)
+    task_id = _make_opencode_task(status="running")
+
+    result = await tools.call("get_task_result", {"task_id": task_id})
+
+    assert "still running" in result.lower()
+    assert oc_sv.fetch_calls == []  # never fetches/re-runs for a task that isn't terminal yet
+
+
+@pytest.mark.asyncio
+async def test_get_task_result_unknown_task_reports_not_found():
+    tools = make_tools()
+    result = await tools.call("get_task_result", {"task_id": "oc_does_not_exist"})
+    assert "not found" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_get_task_result_non_opencode_task_reports_clearly():
+    db.create_task_record("t_local", "Local task", "do it")
+    tools = make_tools()
+    result = await tools.call("get_task_result", {"task_id": "t_local"})
+    assert "not an opencode task" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_get_task_result_nothing_available_after_live_fetch_says_so_honestly():
+    oc_sv = FakeOpenCodeSupervisor(live_result=None)  # live fetch found nothing either
+    tools = ToolRegistry(task_manager=None, opencode_supervisor=oc_sv)
+    task_id = _make_opencode_task()
+
+    result = await tools.call("get_task_result", {"task_id": task_id})
+
+    assert "no result" in result.lower()

@@ -39,6 +39,15 @@ Thumbs.db
 # Logs (dev/test server run output)
 *.log
 
+# ADR-021: structured JSONL logs (JARVIS_LOG_DIR, default "logs/") —
+# machine-specific runtime output, regenerated on every server start,
+# not meant to be committed. Found created-but-untracked during M-OX.2
+# review: importing app.main (as every TestClient-based test does)
+# already calls configure_structured_logging() at import time, so a
+# plain `pytest` run creates this directory with no server ever
+# explicitly started.
+logs/
+
 # Local machine-specific project aliases (see app/supervisor/projects.py)
 projects.json
 
@@ -68,3 +77,6 @@ local.properties
 .remember/
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
+
+# Capability-test scratch artifacts (manual probe files created during capability testing)
+tests/test_projects/safe-test/

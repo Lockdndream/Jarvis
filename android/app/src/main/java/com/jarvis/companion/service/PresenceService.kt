@@ -15,6 +15,10 @@ import com.jarvis.companion.JarvisCompanionApp
 import com.jarvis.companion.core.ConnectionState
 import com.jarvis.companion.network.CompanionWebSocketClient
 import com.jarvis.companion.network.DeviceStatusSnapshot
+import com.jarvis.companion.opencode.OpenCodeTaskStatus
+import com.jarvis.companion.pairing.PairingConfig
+import com.jarvis.companion.settings.ConnectivityPolicy
+import com.jarvis.companion.settings.OperationalSettingsClient
 import com.jarvis.companion.settings.PermissionsHelper
 import com.jarvis.companion.telemetry.TelemetryRecorder
 import com.jarvis.companion.voice.VoiceSessionOpenOutcome
@@ -25,12 +29,17 @@ import com.jarvis.companion.widget.AttentionWidgetProvider
 import java.util.UUID
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 
 /**
@@ -46,6 +55,8 @@ import kotlinx.coroutines.withTimeoutOrNull
  * "Default" battery status) is handled by the Settings screen during setup,
  * not here — this service assumes it has already been granted.
  */
+private const val SETTINGS_RESYNC_INTERVAL_MS = 5 * 60 * 1000L
+
 class PresenceService : Service() {
 
     private lateinit var app: JarvisCompanionApp
@@ -88,6 +99,41 @@ class PresenceService : Service() {
         }
     }
 
+    // Android Companion Integration v1.0 (ADR-023 Phase 2): tracks whether
+    // the device's current *default* network has the Wi-Fi transport,
+    // feeding ConnectivityPolicy.shouldBeConnected() for MODE_WIFI_ONLY.
+    // Deliberately a separate registerDefaultNetworkCallback rather than
+    // reusing networkCallback above: networkCallback's generic
+    // NET_CAPABILITY_INTERNET request fires for *any* qualifying network
+    // (used only for coarse NETWORK_AVAILABLE/NETWORK_LOST telemetry) and
+    // can't distinguish Wi-Fi from cellular, or tell which one the OS is
+    // actually routing through during a handover where both are briefly
+    // up. registerDefaultNetworkCallback is the platform-correct primitive
+    // for "which network am I actually using right now" and leaves the
+    // existing telemetry callback's behavior untouched. Written to
+    // app.wifiAvailable (not a PresenceService-local field) for the same
+    // "PresenceService is sole writer" sharing rationale as
+    // app.connectionState, so ConnectionStatusActivity's "Current Wi-Fi
+    // status" field can read it without binding to this service.
+    private val defaultNetworkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
+            setWifiAvailable(capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI))
+        }
+
+        override fun onLost(network: Network) {
+            setWifiAvailable(false)
+        }
+
+        private fun setWifiAvailable(onWifi: Boolean) {
+            if (app.wifiAvailable.value != onWifi) {
+                app.updateWifiAvailable(onWifi)
+                telemetry.record(TelemetryRecorder.CONNECTIVITY_POLICY_WIFI_TRANSPORT_CHANGED, "onWifi=$onWifi")
+            }
+        }
+    }
+
+    private var policyEnforcementStarted = false
+
     private val screenStateReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             when (intent.action) {
@@ -110,6 +156,7 @@ class PresenceService : Service() {
             .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
             .build()
         connectivityManager.registerNetworkCallback(request, networkCallback)
+        connectivityManager.registerDefaultNetworkCallback(defaultNetworkCallback)
 
         val filter = IntentFilter().apply {
             addAction(Intent.ACTION_SCREEN_OFF)
@@ -174,6 +221,33 @@ class PresenceService : Service() {
                 }
         }
 
+        // Interaction Layer v1 (Goals 2/3): a delegated OpenCode task's
+        // lifecycle, fed by the same opencode_task_created/
+        // opencode_task_completed broadcasts the server already sends to
+        // every connection — previously received but silently dropped.
+        // RUNNING gets an ongoing, low-priority notification for the
+        // whole task duration (progress feedback without a new push
+        // mechanism — it's just "stay visible until terminal" rendering
+        // of state that already exists); a terminal status replaces it
+        // with a one-shot, audible notification, cancelling the running
+        // one. distinctUntilChanged() on the whole data class (taskId +
+        // status + instruction) means this only fires on a genuine
+        // transition, never on a redundant re-emission of the same state.
+        serviceScope.launch {
+            app.openCodeTaskRepository.current
+                .filterNotNull()
+                .distinctUntilChanged()
+                .collect { task ->
+                    val nm = getSystemService(NotificationManager::class.java)
+                    if (task.status == OpenCodeTaskStatus.RUNNING) {
+                        nm.notify(OPENCODE_TASK_RUNNING_NOTIFICATION_ID, notifications.buildOpenCodeTaskRunning(task.instruction))
+                    } else {
+                        nm.cancel(OPENCODE_TASK_RUNNING_NOTIFICATION_ID)
+                        nm.notify(OPENCODE_TASK_TERMINAL_NOTIFICATION_ID, notifications.buildOpenCodeTaskTerminal(task.status, task.instruction))
+                    }
+                }
+        }
+
         // Milestone 9B.9 (ADR-017 Section C): the confirmation-gated
         // handoff. WakeWordManager has already self-transitioned to
         // PAUSED_VOICE_SESSION synchronously before this event fires (see
@@ -212,6 +286,72 @@ class PresenceService : Service() {
                     lastHandoffOutcome = "failed:late_reply_closed"
                     lastHandoffAtMs = System.currentTimeMillis()
                     activeClient?.sendVoiceSessionClose(outcome.session.voiceSessionId)
+                }
+            }
+        }
+    }
+
+    // Android Companion Integration v1.0 (ADR-023 Phase 1): pulls
+    // connectivity_mode from the existing GET /api/settings and updates
+    // the app-wide cache. Called once per successful connect (see
+    // onStateChange below) rather than on a wall-clock timer — a periodic
+    // re-sync while disconnected would reintroduce the background drain
+    // Wi-Fi-Only mode exists to eliminate. Tolerates server unavailability:
+    // any failure is logged and the last-known cached mode is kept as-is,
+    // never crashes the service or blocks the connection itself.
+    // Re-sync interval while connected only (see onStateChange below,
+    // which cancels periodicSettingsSyncJob the instant the connection
+    // leaves CONNECTED) — this is what catches a policy change JOPS
+    // issues while the phone stays connected indefinitely (Phase 6:
+    // "Policy changes while connected"), without becoming the periodic
+    // while-disconnected polling loop Phase 5 explicitly rules out. Piggy-
+    // backing on an already-open, already-heartbeating connection is a
+    // negligible addition, not a new source of background drain.
+    private var periodicSettingsSyncJob: Job? = null
+
+    private fun syncOperationalSettings(pairingConfig: PairingConfig) {
+        serviceScope.launch {
+            telemetry.record(TelemetryRecorder.SETTINGS_SYNC_STARTED)
+            try {
+                val mode = withContext(Dispatchers.IO) {
+                    OperationalSettingsClient(pairingConfig).fetchConnectivityMode()
+                }
+                app.updateConnectivityMode(mode)
+                app.operationalSettingsRepository.setLastSyncedAtMs(System.currentTimeMillis())
+                telemetry.record(TelemetryRecorder.SETTINGS_SYNC_SUCCEEDED, "mode=$mode")
+            } catch (e: Exception) {
+                telemetry.record(TelemetryRecorder.SETTINGS_SYNC_FAILED, "${e.javaClass.simpleName}:${e.message}")
+            }
+        }
+    }
+
+    // Android Companion Integration v1.0 (ADR-023 Phase 2/3): the one
+    // place PresenceService decides to call connectionClient.start()/
+    // stop() in response to policy rather than direct pairing/lifecycle
+    // events — reuses the same client instance and the same start()/
+    // stop() primitives onStartCommand/onDestroy already use, so this is
+    // not a second connection state machine, just another input deciding
+    // when the existing one runs. Started once per service lifetime
+    // (guarded by policyEnforcementStarted, same idiom as
+    // wakeWordManager.start()'s own idempotency), immediately after
+    // connectionClient is created, so its first emission — combine()
+    // emits as soon as every source StateFlow has a value, which they all
+    // do immediately — makes the initial connect-or-not decision instead
+    // of always connecting first and correcting afterward.
+    private fun startConnectivityPolicyEnforcement(client: CompanionWebSocketClient, pairingConfig: PairingConfig) {
+        if (policyEnforcementStarted) return
+        policyEnforcementStarted = true
+        serviceScope.launch {
+            combine(app.connectivityMode, app.wifiAvailable, app.manualConnectRequested) { mode, wifi, manual ->
+                ConnectivityPolicy.shouldBeConnected(mode, wifi, manual)
+            }.distinctUntilChanged().collect { desired ->
+                val currentlyActive = client.state != ConnectionState.DISCONNECTED
+                if (desired && !currentlyActive) {
+                    telemetry.record(TelemetryRecorder.CONNECTIVITY_POLICY_CONNECT, "mode=${app.connectivityMode.value}")
+                    client.start(pairingConfig)
+                } else if (!desired && currentlyActive) {
+                    telemetry.record(TelemetryRecorder.CONNECTIVITY_POLICY_DISCONNECT, "mode=${app.connectivityMode.value}")
+                    client.stop()
                 }
             }
         }
@@ -299,6 +439,7 @@ class PresenceService : Service() {
                 },
                 attentionRepository = app.attentionRepository,
                 voiceSessionRepository = app.voiceSessionRepository,
+                openCodeTaskRepository = app.openCodeTaskRepository,
             )
             client.onStateChange = { state ->
                 app.updateConnectionState(state)
@@ -307,10 +448,26 @@ class PresenceService : Service() {
                     notifications.build(paired = true, state = state, failureReason = client.lastDisconnectReason),
                 )
                 telemetry.record(TelemetryRecorder.NOTIFICATION_POSTED, "state=$state")
+                periodicSettingsSyncJob?.cancel()
+                if (state == ConnectionState.CONNECTED) {
+                    syncOperationalSettings(pairingConfig)
+                    periodicSettingsSyncJob = serviceScope.launch {
+                        while (isActive) {
+                            delay(SETTINGS_RESYNC_INTERVAL_MS)
+                            syncOperationalSettings(pairingConfig)
+                        }
+                    }
+                }
             }
             connectionClient = client
             activeClient = client
-            client.start(pairingConfig)
+            // Deliberately not an unconditional client.start() here — the
+            // connectivity-policy collector below makes that call itself,
+            // based on the current mode/Wi-Fi state, on its first emission.
+            // For MODE_ALWAYS (the default) this connects immediately, same
+            // as before; for MODE_WIFI_ONLY/MODE_MANUAL it avoids briefly
+            // connecting and then immediately disconnecting again.
+            startConnectivityPolicyEnforcement(client, pairingConfig)
         }
 
         // Idempotent: WakeWordManager.start() itself no-ops if not
@@ -336,6 +493,10 @@ class PresenceService : Service() {
         app.updateConnectionState(ConnectionState.DISCONNECTED)
         try {
             connectivityManager.unregisterNetworkCallback(networkCallback)
+        } catch (_: IllegalArgumentException) {
+        }
+        try {
+            connectivityManager.unregisterNetworkCallback(defaultNetworkCallback)
         } catch (_: IllegalArgumentException) {
         }
         try {

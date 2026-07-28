@@ -2120,6 +2120,36 @@ Used for browser smoke testing of Milestone 3. May later be useful for Jarvis br
 
 ## Current Milestone
 
+**Owner Experience Milestones 1 through 3 (M-OX.1, M-OX.2, M-OX.3) are
+complete and accepted; M-OX.4 has not started.** M-OX.1 (ADR-020)
+established `trace_id`, a per-turn correlation primitive spanning
+`conversations`/`tasks`/`opencode_tasks`/`events`, generalizing
+`client_request_id` (ADR-017) — accepted with two governing additions:
+the canonical definition ("a trace represents one logical unit of
+autonomous work initiated or coordinated by the Supervisor") and the
+invariant that every future persisted execution artifact must be able to
+answer "which trace created me?" M-OX.2 (ADR-021) built structured,
+`trace_id`-correlated JSONL logging across the Python backend and
+(evolving, not replacing) Android's existing `TelemetryRecorder`, via
+real delegated implementation with independent review. **M-OX.3 was a
+validation-only milestone** (no new architecture) that drove a real,
+isolated, live Jarvis server through the complete trace pipeline —
+session open, transcript, Supervisor turn, tool call, OpenCode
+completion/failure, session close — plus four real failure scenarios
+(backend restart, WebSocket disconnect, tool failure, idle timeout), and
+found six real, previously-invisible defects purely from live evidence
+(unit tests alone could not have surfaced them) — see the "Owner
+Experience Milestone 3" entry below for the complete list. Final
+verdict: **OBSERVABILITY ACCEPTED** for the backend-observable pipeline,
+with two disclosed (not fixed) gaps: no physical Android device was
+available to validate the wake-word/TTS legs live, and third-party
+log noise / missing `conversation_id` on OpenCode-interaction lines are
+flagged as future convenience improvements, not trust issues. Remaining
+OX projects (Execution Trace, Execution History, Artifact Management,
+Debug Bundle, and the Launcher — re-scoped to the future Jarvis
+Operations layer per ADR-019, not part of Observability) remain
+unstarted, each gated on review of the milestone before it.
+
 **Milestones 6 through 9B.9 complete and closed; production wake-word
 integration (ADR-017, Milestones 9B.6–9B.9) is live in
 `android/app/src/main/java/com/jarvis/companion/wakeword/` — this
@@ -2792,6 +2822,262 @@ pytest passing**, Android build clean (zero Android files touched by
 any Control Center or operational-improvements work), and every new
 behavior confirmed live against the real running server, not merely
 unit-tested in isolation.
+
+### Owner Experience Milestone 1 (M-OX.1) — Trace ID Execution Correlation Model (2026-07-22)
+
+**Context**: after 9B.10's Control Center work closed, the user opened a new, explicitly larger initiative — "Owner Experience" (OX): the owner should be able to operate, observe, debug, and trust Jarvis without relying on Claude. Six projects were specified (Launcher, Unified Logging, Execution Trace, Execution History, Artifact Management, Debug Bundle) with an explicit gate: design the full architecture, get it approved, and only then implement — starting with one milestone at a time, reassessing after each.
+
+**Architecture presented and approved** (design-only turn, no code written): Projects 2–6 map cleanly onto the existing Observability layer (ADR-018/019's "Control Center observes") — all pure read/record; **Project 1 (Launcher: start/stop/restart Jarvis) was flagged as actually belonging to the future Jarvis Operations layer, not Observability** — ADR-019 named exactly this capability as its own motivating example of what must not live in the Control Center. Resolved by scoping the Launcher as a separate tool, deferred, not folded into this milestone. The keystone dependency identified: every one of the five Observability projects needs a way to answer "which records belong to one request" first — nothing in the codebase answers that today. **M-OX.1 was scoped to build exactly that, alone**, before any of the six projects starts.
+
+**Decision (ADR-020)**: `trace_id` — one id per turn (one call to `Supervisor.process_message()`), generalizing `client_request_id`'s already-stated purpose (ADR-017) rather than inventing a fourth identifier. Server-minted (`app/trace.py:new_trace_id()`), propagated via a `contextvars.ContextVar` rather than a threaded parameter — the call chain that needs it (`ToolRegistry.call()` → `OpenCodeSupervisor.start_session()`) is several layers below `process_message()`, and `_active_turns`' own existing comment already establishes that turns can genuinely overlap (phone + PWA), which a bare module-global could not survive safely. Added as a nullable column to `conversations`/`tasks`/`opencode_tasks`/`events` (not a new table); `voice_sessions` deliberately excluded (a session spans many turns, so has no single trace_id of its own). The hard case — an OpenCode task whose real completion arrives asynchronously, on a different asyncio Task with no ContextVar binding, well after the turn that started it returned — is solved by persisting `trace_id` on the `opencode_tasks`/`tasks` rows *at creation*, inside `OpenCodeSupervisor.start_session()`, so a later SSE-driven handler can recover it from the row rather than needing it threaded through a live callback. `voice_session_response`/`supervisor_message` now echo `trace_id` (additive, `null` when a reply never reached a full Supervisor turn) — no client reads it yet; extending the wire protocol so a client can *supply* one is an explicit, named Future Revisit Condition, deliberately out of this milestone's scope.
+
+**Retention** (required by the approved scope, not deferred again): `db.purge_events_older_than(days)` — a concrete, callable policy for `events` (the fastest-growing trace-carrying table), deliberately not wired to a scheduler yet (that's an operational/plumbing concern for a later OX milestone). TD-019 updated to "partially resolved" — `conversations`/`tasks`/`opencode_tasks` and the other five tables TD-019 names remain fully open.
+
+**Verification**: 22 new tests (`tests/test_trace_id.py`) covering ContextVar isolation under real concurrent asyncio tasks (two turns in flight at once never cross trace_ids), schema/persistence for all four tables, the `_ensure_column` migration path against a hand-built *pre-existing* (old-shape) DB — not just the fresh-DB `CREATE TABLE` path every other test exercises — the full async-leg proof (a real `OpenCodeSupervisor.start_session()` — not a test double — invoked via a genuine `Supervisor.process_message()` → LLM tool-call → `start_opencode_task` path, with the resulting `tasks`/`opencode_tasks` rows checked against the turn's own returned `trace_id`), and `VoiceSessionManager.handle_transcript()`'s propagation into both its returned dict and the `voice_session_lifecycle` "turn_completed" event. All additive — every pre-existing call site of `save_event`/`create_task_record`/`create_opencode_task_record`/`save_conversation_message` continues to work unchanged (new parameter is keyword-only, defaults to `None`). Full regression: **511/511 pytest passing** (489 pre-milestone baseline + 22 new), zero Android files touched.
+
+Scope held deliberately narrow per explicit instruction: trace model, schema, retention policy, and the ADR only — no logging, no Execution History UI, no Artifacts, no Debug Bundle, no Launcher. M-OX.2 onward remain gated on this milestone's review.
+
+### Owner Experience Milestone 2 (M-OX.2) — Structured Logging (2026-07-22/23)
+
+**Acceptance of M-OX.1**: the user accepted trace_id (ADR-020) as
+infrastructure, confirming the ContextVar propagation design, the
+async-OpenCode-completion solution, and the honest partial-TD-019
+resolution were all correct as built. Two clarifications were added to
+ADR-020 at the user's direction, now the project's governing definitions:
+**"A trace represents one logical unit of autonomous work initiated or
+coordinated by the Supervisor"** (the canonical definition), and the
+invariant that every future persisted object from a traced execution
+must be able to answer "which trace created me?" — future subsystems
+(artifacts, execution history, notifications, log records) must reuse
+`trace_id`, never invent an alternative correlation mechanism.
+
+**M-OX.2 approved** with a detailed mission (structured, `trace_id`-
+correlated, exportable-ready logs across Python/Android/OpenCode-
+interaction/Control Center) and explicit engineering discipline:
+architecture first (retained by Claude), then delegated implementation
+(DeepSeek), independent review, hardening, live verification, merge.
+
+**Architecture (ADR-021)**, grounded in the real existing code, not
+assumption: investigation before design found Android's
+`telemetry/TelemetryRecorder.kt` is **not** a greenfield problem — it is
+already real, production code called from ~two dozen sites, already
+persistent and dual-sink (logcat + file), already rotating (crudely).
+The Python side genuinely is a blank slate (`logging.basicConfig`, plain
+text, console-only). ADR-021 defines one canonical JSON-Lines schema
+(`timestamp`/`severity`/`component`/`message`/`trace_id`/`conversation_id`/
+`task_id`/`runtime_task`/`fields`), a component taxonomy for both
+languages, and — critically — decided `trace_id` is the **only** ambient,
+automatically-injected field (via a `logging.Filter` reading
+`app.trace.current_trace_id()` on the Python side, a last-known-trace
+field on `CompanionWebSocketClient` on the Android side); `conversation_id`/
+`task_id` are attached only at specific named call sites, deliberately
+not given a second ContextVar, to avoid multiplying correlation
+mechanisms against ADR-020's own invariant. OpenCode-interaction logging
+is scoped precisely: Jarvis logs its own observations of OpenCode
+(request/session-creation/activity/completion/error/duration), never
+promises visibility into OpenCode's internals. Control Center gains one
+additive, read-only `logging` status field on the existing dashboard
+snapshot endpoint — explicitly not a log viewer (Execution History/Debug
+Bundle territory, not this milestone's).
+
+**Delegation, for real**: before spending anything, the OpenRouter
+credit guardrail (ADR-013) was checked live ($4.24 remaining, above the
+$1.00 threshold) — safe to proceed. Two bounded Builder tasks ran via
+the real `scripts/delegate_opencode_task.py` harness (real DeepSeek V4
+Flash, real paid OpenRouter credit, ports 4201/4202 in parallel): Python
+backend implementation, and Android `TelemetryRecorder` evolution. Both
+were given precise, self-contained prompts built directly from ADR-021's
+contracts (exact schema, exact taxonomy tables, exact call sites) —
+neither Builder had access to this conversation, only the repo and the
+prompt file.
+
+**Independent review found real defects in both deliverables** (this is
+exactly why the discipline exists, not a formality):
+
+- *Python*: the Builder's own new integration test bound a trace_id via
+  `trace.bind_trace_id("trace_integration")` but reset the **wrong
+  token** (`trace.reset_trace_id(trace.bind_trace_id(None))` discards
+  the original binding's token and creates a new one instead) — this
+  leaked `"trace_integration"` into `app.trace`'s ContextVar for the
+  rest of the pytest process, breaking three pre-existing tests in
+  `tests/test_trace_id.py` that assert `current_trace_id() is None`.
+  Fixed by capturing and resetting the correct token, matching the
+  (correct) pattern immediately above it in the same file.
+- *Python*: `_BUILTIN_RECORD_ATTRS` (the hardcoded list of "standard"
+  `LogRecord` attributes used to decide what counts as an extra `fields`
+  entry) was missing `taskName` — a real attribute Python 3.12+ adds to
+  every `LogRecord` automatically, confirmed by inspecting this
+  environment's actual `LogRecord.__dict__` rather than trusting older
+  documentation. Without the fix, every single log line would have
+  carried a spurious `taskName` entry in `fields`.
+- *Python*: two of the Builder's own new tests asserted wrong values —
+  one expected `component == "backend.opencode"` for a logger named
+  `"app.test"` (an apparent copy-paste artifact; `_component_for`'s own
+  contract correctly returns the raw name for anything unmapped), the
+  other constructed a `StringIO`/handler pair that was never actually
+  attached to any logger, so it could never have observed real output.
+  Both fixed.
+- *Python*: `configure_structured_logging()` mutates the process-global
+  root logger with no teardown — since pytest runs every file in one
+  process, this file's tests would otherwise leak stale handlers
+  (pointing at deleted tmp dirs, or at a monkeypatched `sys.stderr` that
+  reverted) into every test file that happens to run afterward. Added an
+  autouse fixture snapshotting/restoring the root logger's handlers and
+  level around each test in this file.
+- *Python (operational, not a test failure)*: `app/main.py` now calls
+  `configure_structured_logging()` at import time — every test that
+  imports `app.main` (any `TestClient`-based test) now creates a real
+  `logs/jarvis.jsonl` in the actual project root, untracked by git.
+  Found via `git status` after a routine test run, not assumed away.
+  Fixed by adding `logs/` to `.gitignore` (same treatment as `cert.pem`/
+  `*.db`) rather than trying to suppress the behavior itself, which is
+  correct and intentional.
+- *Android*: the delegation timed out (10-minute harness limit,
+  `outcome=timeout`) partway through — but OpenCode's file-write tools
+  already apply as they run, independent of whether the harness's own
+  wait-for-completion ever returns, so all four target files and the new
+  test file were already on disk despite the timeout. Verifying this
+  (rather than assuming a timeout means nothing happened) mattered:
+  `VoiceSessionResponse` gained `val traceId: String?` with **no default
+  value**, which compiled fine for production code but broke an
+  *existing* test file (`VoiceSessionRepositoryTest.kt`, 8 call sites)
+  that constructs it without that argument — a real regression the
+  Builder never got to see because the timeout hit before it reached its
+  own verification step. Fixed with `= null` (the same pattern
+  `VoiceSession.clientRequestId` already established, ADR-017). One
+  genuinely dead constant (`MAX_LOG_KEPT_LINES`, left over from the old
+  truncate-in-place rotation the Builder correctly replaced) was removed.
+  The Builder's own new rotation test had a quadratic accumulation bug
+  in its loop condition (summing the *current* file size on every
+  iteration instead of checking it directly) that made the file it was
+  measuring exit the loop at roughly 37KB, never anywhere near the 1MB
+  rotation threshold — the assertion it was building toward was
+  structurally unreachable. Rewritten to loop until rotation
+  demonstrably occurred (`telemetry.log.1` actually appears) rather than
+  trying to predict the exact byte count.
+
+**Verification**: `./gradlew assembleDebug testDebugUnitTest` — **230/230
+Android unit tests pass**, build clean, run directly (Bash lacked
+`JAVA_HOME`; resolved by pointing it at Android Studio's bundled JBR
+rather than assuming the earlier session's successful build meant this
+one would work unchecked). Full Python suite: **530/530 passing** (511
+pre-milestone baseline + 19 new in `tests/test_structured_logging.py`),
+zero regressions. `git status` confirms scope held exactly: no drift
+into Execution History, Artifacts, Debug Bundle, or the Launcher.
+
+ADR-021 moved from Proposed to Accepted on acceptance of this milestone.
+
+### Owner Experience Milestone 3 (M-OX.3) — Observability Validation (2026-07-23)
+
+**M-OX.2 accepted**, with two governing additions confirmed: the canonical
+trace definition and the "which trace created me" invariant, now
+referenced by name rather than restated in later work.
+
+**Mission**: not more logging — prove the trace pipeline is a genuinely
+trustworthy end-to-end debugging tool, live, against a real running
+server, not unit tests alone. Five phases (trace walk, reconstruction,
+failure validation, log quality, engineering usability), explicit rule:
+no ADR-020/ADR-021 redesign, minimal evidence-driven fixes only.
+
+**Setup**: a real, fully isolated validation server instance (separate
+ports 8901/4301, separate DB, separate `JARVIS_OPENCODE_RUNTIME_DIR`/
+owner-marker/`projects.json`, a harmless throwaway dummy project dir —
+never the real repo) was built and run as a live process, specifically
+so this validation could touch nothing belonging to the real, already-
+running production Jarvis instance discovered live on 8443/4097 at the
+start of this milestone. A `FakeLLMProvider` pre-loaded with a scripted
+response queue let the validation drive a real tool call deterministically
+and at zero cost, without needing a real paid LLM decision.
+
+**Real defects found and fixed, all via live evidence, not assumption**:
+
+1. **Terminal-state completion/failure log lines always carried
+   `trace_id: null`** — exactly the gap ADR-020's own Future Revisit
+   Conditions had anticipated. `_handle_session_failed`/
+   `_handle_session_idle`/`_handle_activity` run on the SSE loop's own
+   asyncio Task, never the turn's, so `trace.current_trace_id()` is
+   always `None` there. Fixed two ways: (a) `JarvisContextFilter` was
+   unconditionally overwriting `record.trace_id` even when a call site
+   had already set it explicitly via `extra=` — fixed to respect an
+   explicit non-None value; (b) the three handlers now recover the real
+   `trace_id` from the `opencode_tasks` row (already persisted there at
+   creation, per ADR-020's own async-completion design) and pass it
+   explicitly. Live-reconfirmed after the fix: a real OpenCode task's
+   completion line correctly carried the original turn's `trace_id`.
+2. **`asctime` leaked into every JSONL line's `fields`** — the console
+   handler's formatter (`%(asctime)s`) sets that attribute on the shared
+   `LogRecord` object as a side effect; the JSONL formatter, running
+   second on the same record, didn't know to exclude it. No unit test
+   ever attached two handlers with different formatters to one logger
+   the way real startup does, so this was invisible until a live process
+   actually ran both handlers together.
+3. **A real, live tool failure** ("Cannot start task: Multiple projects
+   match 'jarvis': ...") surfaced from the validation harness's *own*
+   misconfiguration (not isolating `JARVIS_PROJECTS_FILE`, so it read the
+   real project's on-disk `projects.json`) — fixed in the harness, and
+   kept as a legitimate real "tool failure" data point: correctly
+   persisted and correctly tagged with the turn's real `trace_id` even
+   while failing.
+4. **A real protocol-ordering finding, in the validation harness, not the
+   application**: `opencode_task_created` (a general `broadcast()`)
+   arrived before the paired `voice_session_response` for the same turn.
+   The first driver script assumed strict request/response ordering and
+   silently mis-paired frames; fixed to dispatch by `type`, matching how
+   any real client (Android/PWA) already must behave.
+5. **Inconsistent field coverage** (Phase 4): `_handle_activity`'s two
+   log lines carried neither `task_id` nor `trace_id`, unlike their
+   sibling terminal-state handlers in the same class — fixed for
+   consistency. `voice_session_manager._transition()`'s state-change log
+   lines carried `conversation_id: null` despite it being directly
+   available on the already-fetched session row — fixed (deliberately
+   *not* given `trace_id`, since no call site of this method ever has an
+   ambient trace bound, matching ADR-020's own documented
+   `transcript_received` limitation).
+6. **Incorrect severity** (Phase 4): a genuine OpenCode task failure was
+   logged at `INFO` — severity-based error filtering/alerting would have
+   silently missed every real task failure. Changed to `WARNING`.
+
+**Phase 3 (failure validation), all against the real running server**:
+backend restart (a genuinely running OpenCode task's Jarvis-side process
+was killed mid-flight, leaving the OpenCode child alive; on restart,
+Jarvis's own pre-existing stale-server-cleanup logic correctly detected
+and replaced it, `mark_running_opencode_tasks_interrupted`/
+`reconcile_on_startup` correctly marked the task `degraded` — not falsely
+failed, not silently lost — and `trace_id` survived untouched throughout);
+WebSocket disconnect (process-killed mid-session, no clean
+`voice_session_close` ever sent — server correctly closed the session
+with `termination_reason: "disconnect"`, no orphan); tool failure (see
+above); timeout (a real idle-timeout reap forced via the existing
+clock-injection mechanism — correctly zero `trace_id` for a session that
+never did any Supervisor-coordinated work, exactly matching ADR-020's
+canonical definition, not a gap).
+
+**Disclosed, not fixed**: no physical Android device was available in
+this environment (no `adb`, nothing attached) — the wake-word-detection
+and TTS-playback legs of the pipeline are Android-local actions that
+occur before `trace_id` exists or after it has already been returned,
+and were validated only at the unit-test level (M-OX.2), not live against
+real hardware, in this milestone. Third-party library log noise
+(`httpx`, `uvicorn`) is captured by the same root-logger attachment that
+captures Jarvis's own components — pre-existing console behavior, now
+also persisted; flagged as a recommendation for a future increment, not
+fixed here (out of this milestone's minimal-fix mandate). `conversation_id`
+is not present on the OpenCode-interaction log lines — reconstructable
+via `trace_id`, but not directly — also flagged as a future convenience
+improvement, not a trust issue.
+
+**Verification**: 8 new regression tests added directly from the live
+findings (`tests/test_structured_logging.py` ×4, `tests/test_opencode_lifecycle.py`
+×3, `tests/test_voice_session_manager.py` ×1). Full suite: **538/538
+passing** (530 pre-milestone baseline + 8 new), zero regressions. The
+real production Jarvis instance on 8443/4097 was confirmed running,
+untouched, and isolated from throughout.
+
+**Final recommendation: OBSERVABILITY ACCEPTED** for the backend-observable
+portion of the pipeline (voice/text session open → transcript → Supervisor
+turn → tool call → OpenCode completion/failure → session close), with the
+two disclosed gaps above named explicitly rather than silently assumed
+away.
 
 ### Milestone 9B.3 — Android Widget & Attention Surface (closed 2026-07-14)
 
