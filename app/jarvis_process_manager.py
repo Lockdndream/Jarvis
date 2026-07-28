@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 
 import httpx
 
+from app import config
 from app.integrations import process_utils, owner_marker
 from app.operational_state import OperationalState
 
@@ -58,14 +59,11 @@ class JarvisProcessManager:
         self.host = host
         self.port = port
         self.base_url = base_url or f"http://127.0.0.1:{port}"
-        self.python_exe = python_exe or os.environ.get("JARVIS_VENV_PYTHON", "python")
+        self.python_exe = python_exe or config.venv_python()
         self.cwd = cwd or os.getcwd()
         self.ssl_keyfile = ssl_keyfile
         self.ssl_certfile = ssl_certfile
-        self.owner_marker_path = owner_marker_path or os.environ.get(
-            "JARVIS_OPERATIONS_JARVIS_OWNER_MARKER",
-            os.path.join(os.path.dirname(os.path.dirname(__file__)), ".jarvis_operations_jarvis_owner.json"),
-        )
+        self.owner_marker_path = owner_marker_path or config.operations_jarvis_owner_marker_default()
         self.extra_env = extra_env or {}
 
         self._proc: asyncio.subprocess.Process | None = None
@@ -183,7 +181,7 @@ class JarvisProcessManager:
             if self.ssl_keyfile and self.ssl_certfile:
                 args += ["--ssl-keyfile", self.ssl_keyfile, "--ssl-certfile", self.ssl_certfile]
 
-            env = {**os.environ, **self.extra_env}
+            env = config.subprocess_env(self.extra_env)
             logger.info("Starting Jarvis on port %s (cwd=%s)", self.port, self.cwd)
             self._proc = await asyncio.create_subprocess_exec(
                 *args, cwd=self.cwd, env=env,

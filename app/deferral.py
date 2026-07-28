@@ -7,9 +7,10 @@ explicitly for daypart targets (morning/afternoon/evening), never silently
 UTC (datetime.astimezone() with no argument converts to the machine's real
 local timezone).
 """
-import os
 import re
 from datetime import datetime, timedelta, timezone
+
+from app import config
 
 DAYPART_HOURS = {"morning": 8, "afternoon": 15, "evening": 19}
 
@@ -46,14 +47,7 @@ class DeferralResult:
 
 
 def _default_snooze_minutes() -> int | None:
-    val = os.environ.get("JARVIS_DEFAULT_SNOOZE_MINUTES")
-    if val is None:
-        return None
-    try:
-        parsed = int(val)
-        return parsed if parsed > 0 else None
-    except ValueError:
-        return None
+    return config.default_snooze_minutes()
 
 
 def _iso(dt: datetime) -> str:

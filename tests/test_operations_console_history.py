@@ -41,7 +41,7 @@ def client():
         yield c
 
 
-def _wait_for_operations(target, action, count=1, timeout=5):
+def _wait_for_operations(target, action, count=1, timeout=15):
     deadline = time.time() + timeout
     while time.time() < deadline:
         rows = oh.get_recent_operations(target=target, action=action, db_path=_DB_PATH)

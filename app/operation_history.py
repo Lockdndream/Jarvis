@@ -29,6 +29,8 @@ import sqlite3
 import uuid
 from datetime import datetime, timezone
 
+from app import config
+
 
 def _default_db_path() -> str:
     """Deliberately resolved fresh on every call, not baked in as a
@@ -37,10 +39,7 @@ def _default_db_path() -> str:
     to import this module first froze DEFAULT_DB_PATH to whatever
     JARVIS_OPERATIONS_DB was (or wasn't) set to at that moment, silently
     ignoring the env var for every later caller in the same process."""
-    return os.environ.get(
-        "JARVIS_OPERATIONS_DB",
-        os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "JarvisOperationsConsole", "operations.db"),
-    )
+    return config.operations_db()
 
 
 def _now_iso() -> str:
@@ -53,6 +52,8 @@ def _connect(db_path: str) -> sqlite3.Connection:
         os.makedirs(directory, exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
+    # ADR-024: bounded wait for lock contention on the operations DB too.
+    conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
 

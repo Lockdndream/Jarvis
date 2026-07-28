@@ -35,23 +35,24 @@ Storage isolation (Milestone 6.1 — compatibility recovery):
     whatever its own operator configured, not Jarvis's concern.
   - Never touches OpenCode Desktop's storage: different environment
     variables entirely, applied only to the spawned subprocess's own
-    environment dict, never mutating `os.environ` for the Jarvis process
-    itself or anything else on the machine.
+    environment dict, never mutating the parent process environment for
+    the Jarvis process itself or anything else on the machine.
 
 Credential/cost isolation (Milestone 9B.0 — recon fix):
   - Storage isolation alone does not stop the spawned server from
     inheriting ambient provider credentials (e.g. a machine-wide
-    OPENAI_API_KEY) if the subprocess env is built as `{**os.environ, ...}`.
+    OPENAI_API_KEY) if the subprocess env is built as a full copy of the
+    parent process environment.
     Verified real: an inherited OPENAI_API_KEY caused an isolated-runtime
     session to actually run gpt-5.3-chat-latest/gpt-5-nano via OpenAI,
     silently, despite only an OpenRouter key ever being provisioned into
     the isolated auth.json.
   - Fixed by building the owned-spawn subprocess env from an explicit
-    OS-essential allowlist (`isolated_subprocess_env`/`_OS_ESSENTIAL_ENV_VARS`)
-    instead of inheriting the full ambient environment. The isolated
-    server's own provider credential comes only from its isolated
-    auth.json (ensure_isolated_runtime_provisioned), never from the
-    process environment at spawn time.
+    OS-essential allowlist (`isolated_subprocess_env`/
+    `config.OS_ESSENTIAL_ENV_VARS`) instead of inheriting the full ambient
+    environment. The isolated server's own provider credential comes only
+    from its isolated auth.json (ensure_isolated_runtime_provisioned),
+    never from the process environment at spawn time.
 """
 import asyncio
 import json
@@ -59,35 +60,30 @@ import logging
 import os
 from datetime import datetime, timezone
 
+from app import config
 from app.integrations import process_utils
 from app.integrations import owner_marker
 
 logger = logging.getLogger(__name__)
 
-OPENCODE_EXE = os.environ.get(
-    "JARVIS_OPENCODE_EXE",
-    r"C:\Users\Admin\.bun\bin\opencode.exe",
-)
+OPENCODE_EXE = config.opencode_exe_default()
 
-OWNER_MARKER_PATH = os.environ.get(
-    "JARVIS_OPENCODE_OWNER_MARKER",
-    os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), ".jarvis_opencode_owner.json"),
-)
+OWNER_MARKER_PATH = config.opencode_owner_marker_default()
 
 
 def default_runtime_dir() -> str:
     """Outside the repository by default, never committed to Git."""
-    base = os.environ.get("LOCALAPPDATA") or os.environ.get("TEMP") or os.path.expanduser("~")
-    return os.path.join(base, "JarvisOpenCodeRuntime")
+    return config.opencode_runtime_dir()
 
 
 def resolve_runtime_dir() -> str:
-    return os.environ.get("JARVIS_OPENCODE_RUNTIME_DIR") or default_runtime_dir()
+    return config.opencode_runtime_dir()
 
 
 def isolated_env_overrides(runtime_dir: str) -> dict:
     """The verified-effective isolation variables for a Jarvis-owned server.
-    Applied to a subprocess env dict only — never to os.environ directly."""
+    Applied to a subprocess env dict only — never to the parent process
+    environment directly."""
     return {
         "XDG_DATA_HOME": os.path.join(runtime_dir, "data"),
         "XDG_CONFIG_HOME": os.path.join(runtime_dir, "config"),
@@ -96,28 +92,12 @@ def isolated_env_overrides(runtime_dir: str) -> dict:
     }
 
 
-# OS-essential variables a Windows Bun/Node binary needs to run at all.
-# Deliberately an allowlist: storage isolation (XDG_* above) isolates
-# *where* the server reads/writes, but `{**os.environ, ...}` would still
-# hand it every ambient credential on the machine (e.g. a machine-wide
-# OPENAI_API_KEY). The isolated server's own OpenRouter credential comes
-# from ensure_isolated_runtime_provisioned's isolated auth.json, never from
-# the process environment at spawn time, so no provider credential needs to
-# be in this list at all (Milestone 9B.0 — closes a real observed gap: an
-# inherited OPENAI_API_KEY caused a genuine paid gpt-5.3-chat-latest call).
-_OS_ESSENTIAL_ENV_VARS = (
-    "PATH", "SYSTEMROOT", "SYSTEMDRIVE", "COMSPEC", "PATHEXT",
-    "TEMP", "TMP", "USERPROFILE", "USERNAME", "APPDATA", "LOCALAPPDATA",
-    "HOMEDRIVE", "HOMEPATH", "WINDIR",
-    "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE", "PROCESSOR_IDENTIFIER",
-)
-
-
 def isolated_subprocess_env(isolation_env: dict, password: str) -> dict:
     """Build the full env dict for a Jarvis-owned opencode serve subprocess.
 
-    Allowlist, not `{**os.environ, ...}` — see _OS_ESSENTIAL_ENV_VARS."""
-    env = {name: os.environ[name] for name in _OS_ESSENTIAL_ENV_VARS if name in os.environ}
+    Allowlist, not a full copy of the parent process environment — see
+    config.OS_ESSENTIAL_ENV_VARS for the variable list."""
+    env = config.os_essential_subprocess_env()
     env["OPENCODE_SERVER_PASSWORD"] = password
     env.update(isolation_env)
     return env
@@ -138,7 +118,7 @@ def ensure_isolated_runtime_provisioned(runtime_dir: str) -> None:
 
     auth_path = os.path.join(runtime_dir, "data", "opencode", "auth.json")
     if not os.path.exists(auth_path):
-        key = os.environ.get("JARVIS_OPENCODE_OPENROUTER_KEY") or os.environ.get("JARVIS_LLM_API_KEY")
+        key = config.opencode_openrouter_key() or config.llm_api_key()
         if key:
             os.makedirs(os.path.dirname(auth_path), exist_ok=True)
             with open(auth_path, "w", encoding="utf-8") as f:
@@ -253,11 +233,11 @@ class OpenCodeServerManager:
 
     @property
     def password(self) -> str:
-        return os.environ.get("OPENCODE_SERVER_PASSWORD", "")
+        return config.opencode_server_password()
 
     @property
     def username(self) -> str:
-        return os.environ.get("OPENCODE_SERVER_USERNAME", "opencode")
+        return config.opencode_server_username()
 
     @property
     def auth_header(self) -> str:

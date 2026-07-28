@@ -19,11 +19,13 @@ AttentionRequest creation must be idempotent and tied to verified source
 state — never created from UI rendering, repeated polling, notification
 delivery, or SSE replay. See get_or_create()'s dedup_key.
 """
+import asyncio
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 
 import app.database as db
+from app import db_async as adb
 from app import interruption_policy
 from app.contact_channels import get_channel, CHANNEL_IN_APP, CHANNEL_PUSH, CHANNEL_VOICE_SESSION
 
@@ -47,7 +49,7 @@ def set_broadcast_hook(conn_manager) -> None:
 async def _broadcast_attention_update(attention_request_id: str, event: str) -> None:
     if _broadcast_hook is None:
         return
-    row = db.get_attention_request(attention_request_id)
+    row = await adb.get_attention_request(attention_request_id)
     if not row:
         return
     try:
@@ -102,9 +104,9 @@ _ACTION_TO_CHANNEL = {
 
 async def _transition(attention_request_id: str, to_status: str, **extra_fields) -> bool:
     froms = _LEGAL_TRANSITIONS[to_status]
-    ok = db.transition_attention_status(attention_request_id, froms, to_status, **extra_fields)
+    ok = await adb.transition_attention_status(attention_request_id, froms, to_status, **extra_fields)
     if not ok:
-        current = db.get_attention_request(attention_request_id)
+        current = await adb.get_attention_request(attention_request_id)
         logger.info(
             "attention transition rejected: id=%s to=%s current_status=%s (illegal or lost race)",
             attention_request_id, to_status, current["status"] if current else "missing",
@@ -140,7 +142,7 @@ async def get_or_create(
     re-contacts nor duplicates)."""
     dedup_key = f"{source_type}:{source_id}"
     attention_request_id = f"attn_{uuid.uuid4().hex[:12]}"
-    row = db.create_attention_request(
+    row = await adb.create_attention_request(
         attention_request_id=attention_request_id,
         conversation_id=conversation_id,
         task_id=task_id,
@@ -160,7 +162,7 @@ async def get_or_create(
     )
     if row["created"]:
         await initiate_contact(conn_manager, row)
-        row = db.get_attention_request(row["attention_request_id"]) or row
+        row = await adb.get_attention_request(row["attention_request_id"]) or row
     return row
 
 
@@ -183,7 +185,7 @@ async def initiate_contact(conn_manager, attention_row: dict) -> None:
 
     if decision == interruption_policy.ACTION_SILENT:
         delay = interruption_policy.next_retry_delay_minutes()
-        _schedule_retry(attention_row["attention_request_id"], delay)
+        await asyncio.to_thread(_schedule_retry, attention_row["attention_request_id"], delay)
         return
 
     if decision == interruption_policy.ACTION_DEFER:
@@ -191,7 +193,7 @@ async def initiate_contact(conn_manager, attention_row: dict) -> None:
         # user-requested defer: no deferred_until is set (that's reserved
         # for explicit user intent), just a bounded retry later.
         delay = interruption_policy.next_retry_delay_minutes()
-        _schedule_retry(attention_row["attention_request_id"], delay)
+        await asyncio.to_thread(_schedule_retry, attention_row["attention_request_id"], delay)
         return
 
     channel_name = _ACTION_TO_CHANNEL.get(decision)
@@ -204,7 +206,7 @@ async def initiate_contact(conn_manager, attention_row: dict) -> None:
 
     channel = get_channel(channel_name)
     contact_attempt_id = f"cta_{uuid.uuid4().hex[:12]}"
-    db.create_contact_attempt(contact_attempt_id, attention_row["attention_request_id"], channel_name)
+    await adb.create_contact_attempt(contact_attempt_id, attention_row["attention_request_id"], channel_name)
     logger.info("contact attempt planned: id=%s attention_id=%s channel=%s",
                 contact_attempt_id, attention_row["attention_request_id"], channel_name)
 
@@ -214,10 +216,10 @@ async def initiate_contact(conn_manager, attention_row: dict) -> None:
         logger.warning("Contact attempt failed with an exception (attention state unaffected): %s", e)
         result = {"status": "failed", "result": str(e), "error_code": "exception", "notification_id": None}
 
-    db.update_contact_attempt_status(
+    await adb.update_contact_attempt_status(
         contact_attempt_id, result["status"], result.get("result"), result.get("error_code"),
     )
-    db.record_attention_contact(attention_row["attention_request_id"])
+    await adb.record_attention_contact(attention_row["attention_request_id"])
     logger.info("contact attempt executed: id=%s status=%s result=%s",
                 contact_attempt_id, result["status"], result.get("result"))
 
@@ -296,7 +298,7 @@ async def resolve_for_source(source_type: str, source_id: str, resolution_type: 
     delivery succeeded (e.g. OpenCodeSupervisor.answer_question after
     adapter.reply_question() returns without raising) — looks up the
     correlated AttentionRequest and resolves it in one guarded step."""
-    row = db.get_attention_request_by_source(source_type, source_id)
+    row = await adb.get_attention_request_by_source(source_type, source_id)
     if not row:
         return False
     if row["status"] in (STATUS_RESOLVED, STATUS_CANCELLED, STATUS_EXPIRED):
@@ -319,7 +321,7 @@ async def cancel_for_task(task_id: str) -> int:
     AttentionRequests (PENDING/CONTACTING/DEFERRED -> CANCELLED). Does not
     touch already-resolved/cancelled/expired ones."""
     count = 0
-    for row in db.get_attention_requests_for_task(task_id):
+    for row in await adb.get_attention_requests_for_task(task_id):
         if row["status"] in (STATUS_PENDING, STATUS_CONTACTING, STATUS_DEFERRED):
             if await cancel(row["attention_request_id"]):
                 count += 1
@@ -327,7 +329,7 @@ async def cancel_for_task(task_id: str) -> int:
 
 
 async def cancel_for_source(source_type: str, source_id: str) -> bool:
-    row = db.get_attention_request_by_source(source_type, source_id)
+    row = await adb.get_attention_request_by_source(source_type, source_id)
     if not row:
         return False
     if row["status"] not in (STATUS_PENDING, STATUS_CONTACTING, STATUS_DEFERRED):

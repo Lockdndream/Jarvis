@@ -12,11 +12,12 @@ Default TTL is 900 seconds (15 minutes):
   single reconnect.
 """
 
-import os
 import secrets
 import time
 
 import jwt
+
+from app import config
 
 DEFAULT_TTL_SECONDS = 900
 
@@ -27,7 +28,7 @@ def _get_secret() -> str:
     global _SECRET
     if _SECRET is not None:
         return _SECRET
-    env_secret = os.environ.get("JARVIS_WS_TOKEN_SECRET")
+    env_secret = config.ws_token_secret()
     if env_secret:
         _SECRET = env_secret
     else:
@@ -38,13 +39,7 @@ def _get_secret() -> str:
 
 
 def ws_token_ttl_seconds() -> int:
-    raw = os.environ.get("JARVIS_WS_TOKEN_TTL_SECONDS")
-    if raw is not None:
-        try:
-            return int(raw)
-        except (ValueError, TypeError):
-            pass
-    return DEFAULT_TTL_SECONDS
+    return config.ws_token_ttl_seconds()
 
 
 class TokenVerificationResult:

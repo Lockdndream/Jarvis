@@ -8,8 +8,9 @@ SILENT, IN_APP, PUSH, VOICE_WHEN_AVAILABLE, DEFER, or ESCALATE.
 
 No speculative AI interruption scoring — Phase 6 explicitly defers that.
 """
-import os
 from datetime import datetime, timezone
+
+from app import config
 
 ACTION_SILENT = "SILENT"
 ACTION_IN_APP = "IN_APP"
@@ -26,7 +27,7 @@ URGENCY_LOW = "LOW"
 # Deterministic backoff after a SILENT/DEFER decision, so an unresolved
 # item doesn't sit forever uncontacted, but also never gets recontacted in
 # a tight loop (Phase 8/9). Configurable.
-DEFAULT_RETRY_MINUTES = int(os.environ.get("JARVIS_ATTENTION_RETRY_MINUTES", "30"))
+DEFAULT_RETRY_MINUTES = config.attention_retry_minutes()
 DEFAULT_QUIET_HOURS_RETRY_MINUTES = 15
 
 
@@ -35,7 +36,7 @@ def _in_quiet_hours(now: datetime) -> bool:
     Off by default — JARVIS_QUIET_HOURS unset. Format: "HH:MM-HH:MM",
     e.g. "22:00-07:00" (wraps past midnight). Never silently assumes UTC —
     astimezone() converts to the server's actual local timezone."""
-    configured = os.environ.get("JARVIS_QUIET_HOURS")
+    configured = config.quiet_hours()
     if not configured or "-" not in configured:
         return False
     try:

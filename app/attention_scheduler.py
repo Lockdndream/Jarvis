@@ -10,7 +10,7 @@ pattern already used for OpenCodeSupervisor's SSE/poll loops.
 import asyncio
 import logging
 
-import app.database as db
+from app import db_async as adb
 from app import attention_manager
 
 logger = logging.getLogger(__name__)
@@ -57,7 +57,7 @@ class AttentionScheduler:
         """Overdue items must be detected even if Jarvis was offline when
         they became due, not just ones that become due while running
         (Phase 19 restart-recovery requirement)."""
-        due = db.get_due_attention_requests(now=self._now())
+        due = await adb.get_due_attention_requests(now=self._now())
         if due:
             logger.info("scheduler recovery: %d overdue attention request(s) found at startup", len(due))
         await self.run_due_pass(due)
@@ -68,7 +68,7 @@ class AttentionScheduler:
         deterministic rows/clock, without waiting real time. Returns the
         count actually re-contacted."""
         if due_rows is None:
-            due_rows = db.get_due_attention_requests(now=self._now())
+            due_rows = await adb.get_due_attention_requests(now=self._now())
         processed = 0
         for row in due_rows:
             attention_request_id = row["attention_request_id"]
@@ -90,7 +90,7 @@ class AttentionScheduler:
         # returns False and we skip it rather than fighting the race.
         if not await attention_manager.mark_due(row["attention_request_id"]):
             return False
-        fresh = db.get_attention_request(row["attention_request_id"])
+        fresh = await adb.get_attention_request(row["attention_request_id"])
         if not fresh or fresh["status"] != attention_manager.STATUS_PENDING:
             return False
         await attention_manager.initiate_contact(self.cm, fresh)

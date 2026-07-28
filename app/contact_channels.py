@@ -14,7 +14,7 @@ independent of Notification's own dedup bookkeeping.
 """
 import logging
 
-import app.database as db
+from app import db_async as adb
 from app import notifications, attention_policy
 
 logger = logging.getLogger(__name__)
@@ -101,7 +101,7 @@ class PushChannel(ContactChannel):
         # human actually saw a push (S24 FE Doze-idle limitation). Never
         # claim more certainty than the platform provides — distinguish
         # "FCM/push service accepted it" from "user received it".
-        if push_module.vapid_configured() and db.get_push_subscriptions():
+        if push_module.vapid_configured() and await adb.get_push_subscriptions():
             return {
                 "status": "attempted",
                 "result": "PUSH_ACCEPTED_BY_PUSH_SERVICE (delivery to device not confirmed)",

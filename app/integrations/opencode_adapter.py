@@ -2,8 +2,8 @@
 import asyncio
 import json
 import logging
-import os
 
+from app import config
 from app.supervisor.llm import validate_free_only_model
 
 logger = logging.getLogger(__name__)
@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 # and :free/openrouter-free allowlist as Jarvis's own supervisor LLM
 # (app/supervisor/llm.py) — one free-only boundary for all Jarvis-initiated
 # LLM spend, not two independently-configured ones.
-DEFAULT_OPENCODE_PROVIDER_ID = os.environ.get("JARVIS_OPENCODE_MODEL_PROVIDER_ID", "openrouter")
+DEFAULT_OPENCODE_PROVIDER_ID = config.opencode_model_provider_id_default()
 
 # Milestone 9B.0 (temporary dev config, 2026-07-12): sustained free-tier
 # OpenRouter rate-limiting blocked D4 (independent review) delegation for
@@ -36,10 +36,10 @@ def _allow_paid_opencode() -> bool:
     # Read fresh each call (same pattern as validate_free_only_model()'s
     # own JARVIS_LLM_FREE_ONLY check) so tests can monkeypatch the env var
     # without needing to reload this module.
-    return os.environ.get("JARVIS_OPENCODE_ALLOW_PAID", "").lower() in ("true", "1", "yes")
+    return config.opencode_allow_paid()
 
 
-_default_model_env = os.environ.get("JARVIS_OPENCODE_MODEL_ID")
+_default_model_env = config.opencode_model_id()
 if _default_model_env:
     DEFAULT_OPENCODE_MODEL_ID = _default_model_env
 elif _allow_paid_opencode():
@@ -74,8 +74,8 @@ class OpenCodeAdapter:
 
     def __init__(self, base_url: str = "http://127.0.0.1:4097"):
         self.base_url = base_url.rstrip("/")
-        self._password = os.environ.get("OPENCODE_SERVER_PASSWORD", "")
-        self._username = os.environ.get("OPENCODE_SERVER_USERNAME", "opencode")
+        self._password = config.opencode_server_password()
+        self._username = config.opencode_server_username()
         self._auth_header = self._build_auth_header()
 
     def _build_auth_header(self) -> str:

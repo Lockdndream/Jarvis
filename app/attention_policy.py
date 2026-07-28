@@ -12,8 +12,8 @@ No LLM-based importance scoring in Milestone 7 (Phase 7 explicitly defers
 this — the deterministic rule table below is deliberately simple and easy
 to audit). Revisit only if this proves insufficient in practice.
 """
-import os
 
+from app import config
 from app.models import NotificationType, NotificationPriority
 
 ACTION_TIMELINE = "timeline"
@@ -45,7 +45,7 @@ def notify_on_completion() -> bool:
     stored = db.get_setting("notify_on_completion")
     if stored is not None:
         return stored == "true"
-    return os.environ.get("JARVIS_NOTIFY_ON_COMPLETION", "true").lower() in ("1", "true", "yes")
+    return config.notify_on_completion()
 
 
 def decide(kind: str) -> dict:

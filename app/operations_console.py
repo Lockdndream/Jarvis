@@ -26,39 +26,39 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from app import config
 from app.jarvis_process_manager import JarvisProcessManager
 from app import operation_history
 
 operation_history.init_db()
 
-TARGET_URL = os.environ.get("JARVIS_OPERATIONS_TARGET_URL", "https://127.0.0.1:8443")
-CONSOLE_PORT = int(os.environ.get("JARVIS_OPERATIONS_PORT", "8500"))
+TARGET_URL = config.operations_target_url_default()
+CONSOLE_PORT = config.operations_port()
 # Loopback-only call to Jarvis's own self-signed LAN cert (see
 # open_control_center.bat / README.md SS5) -- not a new external trust
 # decision, since this traffic never leaves 127.0.0.1.
-_VERIFY_TLS = os.environ.get("JARVIS_OPERATIONS_VERIFY_TLS", "false").lower() == "true"
+_VERIFY_TLS = config.operations_verify_tls_default()
 
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _target = urlparse(TARGET_URL)
-_default_cwd = os.environ.get("JARVIS_OPERATIONS_CWD", _REPO_ROOT)
-_default_ssl_keyfile = os.environ.get("JARVIS_SSL_KEYFILE")
-_default_ssl_certfile = os.environ.get("JARVIS_SSL_CERTFILE")
+_default_cwd = config.operations_cwd()
+_default_ssl_keyfile = config.ssl_keyfile()
+_default_ssl_certfile = config.ssl_certfile()
 if _target.scheme == "https" and not (_default_ssl_keyfile and _default_ssl_certfile):
     # Matches open_control_center.bat's production launch invocation --
     # only applied when the target URL itself says https, so an isolated
     # http:// validation instance never picks these up.
-    _default_ssl_keyfile = _default_ssl_keyfile or os.path.join(_REPO_ROOT, "certs", "jarvis-lan-key.pem")
-    _default_ssl_certfile = _default_ssl_certfile or os.path.join(_REPO_ROOT, "certs", "jarvis-lan-cert.pem")
+    _default_ssl_keyfile = _default_ssl_keyfile or os.path.join(config.repo_root(), "certs", "jarvis-lan-key.pem")
+    _default_ssl_certfile = _default_ssl_certfile or os.path.join(config.repo_root(), "certs", "jarvis-lan-cert.pem")
 
 jarvis_manager = JarvisProcessManager(
     # The bind host controls what interface a *spawned* Jarvis listens on
     # (0.0.0.0 in production, for LAN/phone access) -- unrelated to
     # TARGET_URL's hostname, which is only how *this console* reaches
     # Jarvis (always via loopback, regardless of Jarvis's own bind host).
-    host=os.environ.get("JARVIS_BIND_HOST", "0.0.0.0"),
+    host=config.bind_host(),
     port=_target.port or (443 if _target.scheme == "https" else 80),
     base_url=TARGET_URL,
-    python_exe=os.environ.get("JARVIS_VENV_PYTHON", "python"),
+    python_exe=config.venv_python(),
     cwd=_default_cwd,
     ssl_keyfile=_default_ssl_keyfile if _target.scheme == "https" else None,
     ssl_certfile=_default_ssl_certfile if _target.scheme == "https" else None,
@@ -297,7 +297,7 @@ async def dashboard():
 
 def main():
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=CONSOLE_PORT)
+    uvicorn.run(app, host="127.0.0.1", port=config.operations_port())
 
 
 if __name__ == "__main__":

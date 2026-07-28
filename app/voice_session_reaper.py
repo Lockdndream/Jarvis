@@ -77,7 +77,7 @@ class VoiceSessionReaper:
         applyClosed() on the Android side already ignores a
         voice_session_id that doesn't match its own current session, so a
         broadcast to every connection is safe."""
-        reaped = self._vsm.reap_idle_sessions(self.max_idle_seconds, now=self._now())
+        reaped = await asyncio.to_thread(self._vsm.reap_idle_sessions, self.max_idle_seconds, now=self._now())
         for session in reaped:
             await self.cm.broadcast({
                 "type": "voice_session_closed",

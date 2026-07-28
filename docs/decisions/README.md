@@ -122,3 +122,4 @@ Every ADR uses the same section structure, in this order:
 | [ADR-021](ADR-021-structured-logging-architecture.md) | Structured Logging Architecture | Accepted |
 | [ADR-022](ADR-022-jarvis-operations-subsystem.md) | Jarvis Operations Subsystem | Accepted |
 | [ADR-023](ADR-023-jops-v1-operation-model-and-jarvis-self-management.md) | JOPS v1.0 — Operation Model, Jarvis Self-Management, Connectivity Policy Split | Accepted |
+| [ADR-024](ADR-024-sqlite-write-concurrency-model.md) | SQLite Write-Concurrency Model | Accepted |

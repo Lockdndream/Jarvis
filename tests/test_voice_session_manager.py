@@ -90,7 +90,8 @@ def test_transition_log_lines_carry_conversation_id(caplog):
     sv = FakeSupervisor()
     vsm = VoiceSessionManager(sv)
     with caplog.at_level(logging.INFO, logger="app.voice_session_manager"):
-        vsm.open_session("conv_transition_test")
+        session = vsm.open_session("conv_transition_test")
+        vsm.close_session(session["voice_session_id"])
     state_records = [r for r in caplog.records if "voice session state:" in r.message]
     assert len(state_records) >= 1
     assert all(r.conversation_id == "conv_transition_test" for r in state_records)

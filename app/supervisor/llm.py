@@ -5,7 +5,8 @@ No SDK dependency — uses httpx directly.
 """
 import asyncio
 import logging
-import os
+
+from app import config
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +37,7 @@ def validate_free_only_model(model: str) -> None:
 
     Raises ModelNotAllowedError on rejection.
     """
-    free_only = os.environ.get("JARVIS_LLM_FREE_ONLY", "").lower() in ("true", "1", "yes")
+    free_only = config.llm_free_only()
     if not free_only:
         return
     if model in _FREE_MODELS_ALLOWED:
@@ -53,10 +54,10 @@ class LLMProvider:
     """Lightweight OpenAI-compatible chat completion client."""
 
     def __init__(self):
-        self._api_key = os.environ.get("JARVIS_LLM_API_KEY", "")
-        self._base_url = os.environ.get("JARVIS_LLM_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-        self._model = os.environ.get("JARVIS_LLM_MODEL", "gpt-4o-mini")
-        self._provider = os.environ.get("JARVIS_LLM_PROVIDER", "openai")
+        self._api_key = config.llm_api_key()
+        self._base_url = config.llm_base_url().rstrip("/")
+        self._model = config.llm_model()
+        self._provider = config.llm_provider()
         self._rejection_reason: str | None = None
         try:
             validate_free_only_model(self._model)

@@ -4,6 +4,8 @@ import sqlite3
 import uuid
 from datetime import datetime, timezone
 
+from app.migrations import migrate
+
 DB_PATH = "jarvis.db"
 
 
@@ -11,6 +13,13 @@ def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    # F1.13: enable FK enforcement. This is a per-connection pragma that
+    # must be set immediately after connect, before any statement that
+    # opens a transaction; it is a no-op if executed inside one.
+    conn.execute("PRAGMA foreign_keys=ON")
+    # ADR-024: bounded wait for lock contention. Per-connection pragma;
+    # must be set on every connection created by get_conn().
+    conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
 
@@ -370,6 +379,8 @@ def conversation_exists(conversation_id: str) -> bool:
     return row is not None
 
 
+# NOTE: _ensure_column is retained for backward compatibility.
+# New schema changes must be migrations, not _ensure_column calls.
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, coltype: str) -> None:
     """Add a column to an existing table if it's missing (safe migration for
     DBs created before this column existed). SQLite has no
@@ -381,6 +392,7 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, coltype: s
 
 def init_db() -> None:
     conn = get_conn()
+    migrate(conn)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1054,6 +1066,63 @@ def get_most_recent_contact_attempt(attention_request_id: str) -> dict | None:
 
 
 # ── VoiceSession (Milestone 8) ─────────────────────────────────────────
+
+
+def open_voice_session_atomic(
+    voice_session_id: str,
+    conversation_id: str,
+    attention_request_id: str | None,
+    opening_state: str,
+    listening_state: str,
+) -> bool:
+    """F1.14: the lease claim + session insert + both state transitions as ONE
+    transaction. Previously these were four separate connections and four
+    commits; a failure after the lease claim left the AttentionRequest with
+    active_voice_session_id pointing at a session that was never created —
+    and because the lease is a set-if-NULL claim, nothing could ever claim it
+    again (Principal Engineer Review 3.7).
+
+    Returns False if the lease could not be claimed (someone else holds it),
+    in which case nothing is written at all. Raises on any other failure,
+    with the whole sequence rolled back.
+
+    Simplification (brief-approved): the freshly-created session's fixed
+    opening→listening path cannot be rejected, so the row is inserted
+    directly in `listening_state` rather than idle→opening→listening via
+    three separate writes. The resulting row is identical to the old code's
+    end state (state=listening, created_at===updated_at since no
+    intermediate timestamps are written). The `opening_state` parameter is
+    accepted for signature compatibility but unused in this simpler route.
+    """
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN")
+        now = utcnow()
+
+        if attention_request_id is not None:
+            cur = conn.execute(
+                "UPDATE attention_requests SET active_voice_session_id=?, updated_at=? "
+                "WHERE attention_request_id=? AND active_voice_session_id IS NULL",
+                (voice_session_id, now, attention_request_id),
+            )
+            if cur.rowcount != 1:
+                conn.rollback()
+                return False
+
+        conn.execute(
+            "INSERT INTO voice_sessions "
+            "(voice_session_id, conversation_id, attention_request_id, state, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (voice_session_id, conversation_id, attention_request_id, listening_state, now, now),
+        )
+
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def create_voice_session(

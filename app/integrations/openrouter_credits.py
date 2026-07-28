@@ -11,9 +11,9 @@ This module only answers "should we pause," it never itself blocks or
 retries a paid call — the caller (Chief-Engineer-side delegation
 orchestration) decides what to do with that answer.
 """
-import os
-
 import httpx
+
+from app import config
 
 DEFAULT_CREDIT_THRESHOLD_USD = 1.0
 
@@ -29,13 +29,7 @@ def credit_threshold_usd() -> float:
     as roughly 20% of this project's current $5 OpenRouter key limit
     (real balance checked during ADR-013's design), leaving enough margin
     to finish an in-flight delegation task rather than pausing mid-way."""
-    raw = os.environ.get("JARVIS_OPENCODE_CREDIT_THRESHOLD_USD")
-    if not raw:
-        return DEFAULT_CREDIT_THRESHOLD_USD
-    try:
-        return float(raw)
-    except ValueError:
-        return DEFAULT_CREDIT_THRESHOLD_USD
+    return config.opencode_credit_threshold_usd()
 
 
 def get_remaining_credit_usd(api_key: str | None = None) -> float | None:
@@ -43,7 +37,7 @@ def get_remaining_credit_usd(api_key: str | None = None) -> float | None:
     if the key has no spending limit set (`limit` is null — unlimited,
     nothing to guard against). Raises CreditCheckError on any failure to
     reach or parse the endpoint."""
-    key = api_key or os.environ.get("JARVIS_LLM_API_KEY")
+    key = api_key or config.llm_api_key()
     if not key:
         raise CreditCheckError("JARVIS_LLM_API_KEY is not set — cannot check OpenRouter credit")
     try:

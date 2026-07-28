@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import uuid
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
@@ -14,6 +15,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from . import config
 from .connection_manager import ConnectionManager
 from .database import (
     init_db,
@@ -156,7 +158,7 @@ def _require_api_token(authorization: str | None = Header(default=None)) -> None
     no-op — consistent with the project's existing LAN-only/no-auth
     prototype trust model (Known Limitation #1, unchanged since Milestone 1).
     Set JARVIS_API_TOKEN before exposing Jarvis beyond a trusted LAN."""
-    required = os.environ.get("JARVIS_API_TOKEN")
+    required = config.api_token()
     if not required:
         return
     if authorization != f"Bearer {required}":
@@ -193,7 +195,7 @@ def _resolve_ws_close_code(ws: WebSocket) -> int | None:
             return None
         return WS_CLOSE_TOKEN_EXPIRED if result.reason == "expired" else WS_CLOSE_TOKEN_INVALID
 
-    required = os.environ.get("JARVIS_API_TOKEN")
+    required = config.api_token()
     if not required:
         return None
     auth_header = ws.headers.get("authorization")
@@ -263,7 +265,7 @@ async def get_settings():
     from . import attention_policy
     from . import operations_connectivity
     return {
-        "notify_on_completion": attention_policy.notify_on_completion(),
+        "notify_on_completion": await asyncio.to_thread(attention_policy.notify_on_completion),
         # ADR-023: the phone-readable half of the connectivity-policy
         # split -- JOPS defines/persists this via the localhost-only
         # /api/operations/connectivity/policy endpoint; this is the
@@ -278,7 +280,7 @@ async def update_settings(body: SettingsUpdateRequest):
     if body.notify_on_completion is not None:
         set_setting("notify_on_completion", "true" if body.notify_on_completion else "false")
     from . import attention_policy
-    return {"notify_on_completion": attention_policy.notify_on_completion()}
+    return {"notify_on_completion": await asyncio.to_thread(attention_policy.notify_on_completion)}
 
 
 @app.get("/api/task/{task_id}")
@@ -633,7 +635,7 @@ async def websocket_endpoint(ws: WebSocket):
                 elif conversation_id is None:
                     conversation_id = new_conversation_id()
                 try:
-                    session = voice_session_manager.open_session(conversation_id, data.get("attention_request_id"))
+                    session = await asyncio.to_thread(voice_session_manager.open_session, conversation_id, data.get("attention_request_id"))
                 except VoiceSessionError as e:
                     # TD-002: most commonly, another device already holds
                     # the lease on the requested attention_request_id.
@@ -685,7 +687,7 @@ async def websocket_endpoint(ws: WebSocket):
             if data.get("type") == "voice_session_close":
                 vsid = data.get("voice_session_id")
                 if vsid:
-                    voice_session_manager.close_session(vsid, reason="client_requested")
+                    await asyncio.to_thread(voice_session_manager.close_session, vsid, reason="client_requested")
                     if vsid == open_voice_session_id:
                         open_voice_session_id = None
                 await ws.send_text(json.dumps({
@@ -762,7 +764,7 @@ async def websocket_endpoint(ws: WebSocket):
         # that item. close_session() is itself idempotent/guarded (no-op if
         # already closed), so this is safe even if a close already ran.
         if open_voice_session_id:
-            voice_session_manager.close_session(open_voice_session_id, reason="disconnect")
+            await asyncio.to_thread(voice_session_manager.close_session, open_voice_session_id, reason="disconnect")
 
 
 def _now() -> str:

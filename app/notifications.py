@@ -20,10 +20,11 @@ Delivery attempts (steps 3/4) only ever run once per notification, exactly
 because step 2 is idempotent: a duplicate call for the same dedup_key finds
 `created=False` and returns without re-broadcasting or re-pushing.
 """
+import asyncio
 import logging
 import uuid
 
-import app.database as db
+from app import db_async as adb
 from app import attention_policy
 from app import push
 
@@ -48,13 +49,13 @@ async def notify(
     is timeline-only (no notification created at all — e.g. task_started,
     or task_completed while notify_on_completion is disabled).
     """
-    decision = attention_policy.decide(kind)
+    decision = await asyncio.to_thread(attention_policy.decide, kind)
     if attention_policy.ACTION_NOTIFY not in decision["actions"]:
         return None
 
     dedup_key = f"{kind}:{source_id or task_id}"
     notification_id = f"notif_{uuid.uuid4().hex[:12]}"
-    row = db.create_notification(
+    row = await adb.create_notification(
         notification_id=notification_id,
         conversation_id=conversation_id,
         task_id=task_id,
@@ -89,7 +90,7 @@ async def notify(
     except Exception as e:
         logger.warning("Notification broadcast failed (notification row still persisted): %s", e)
 
-    db.mark_notification_delivered(row["notification_id"])
+    await adb.mark_notification_delivered(row["notification_id"])
 
     try:
         await push.send_push_to_all(

@@ -21,9 +21,9 @@ push" decision).
 import asyncio
 import json
 import logging
-import os
 
-import app.database as db
+from app import db_async as adb
+from app import config
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +36,7 @@ class _SubscriptionExpired(Exception):
 
 
 def vapid_configured() -> bool:
-    return bool(os.environ.get("JARVIS_VAPID_PRIVATE_KEY")) and bool(os.environ.get("JARVIS_VAPID_PUBLIC_KEY"))
+    return config.vapid_configured()
 
 
 def get_vapid_public_key() -> str | None:
@@ -44,7 +44,7 @@ def get_vapid_public_key() -> str | None:
     VAPID keypair, by design (browsers use it to verify a push subscription
     is being created on behalf of this server, and that later push messages
     actually originate from it)."""
-    return os.environ.get("JARVIS_VAPID_PUBLIC_KEY")
+    return config.vapid_public_key()
 
 
 async def send_push_to_all(
@@ -64,7 +64,7 @@ async def send_push_to_all(
         logger.debug("Push not configured (no VAPID keys set) — foreground delivery already attempted, skipping push")
         return 0
 
-    subscriptions = db.get_push_subscriptions()
+    subscriptions = await adb.get_push_subscriptions()
     if not subscriptions:
         return 0
 
@@ -84,7 +84,7 @@ async def send_push_to_all(
             delivered += 1
         except _SubscriptionExpired:
             logger.info("Push subscription expired/invalid, removing endpoint (not logged in full)")
-            db.delete_push_subscription(sub["endpoint"])
+            await adb.delete_push_subscription(sub["endpoint"])
         except Exception as e:
             logger.warning("Push delivery to one subscription failed (ignored, underlying state unaffected): %s", e)
     return delivered
@@ -103,8 +103,8 @@ def _send_one(sub: dict, payload: str) -> None:
         webpush(
             subscription_info=subscription_info,
             data=payload,
-            vapid_private_key=os.environ["JARVIS_VAPID_PRIVATE_KEY"],
-            vapid_claims={"sub": os.environ.get("JARVIS_VAPID_SUBJECT", "mailto:admin@localhost")},
+            vapid_private_key=config.vapid_private_key(),
+            vapid_claims={"sub": config.vapid_subject()},
             # Real-phone finding (Milestone 7 Phase 18, 2026-07-09): pywebpush
             # defaults to ttl=0, which per the Web Push spec means "attempt
             # delivery once, drop it rather than retry" if the push service

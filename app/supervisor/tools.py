@@ -4,11 +4,12 @@ Tools are async methods registered with name, description, JSON schema.
 The registry is populated by the Supervisor at init time with references
 to existing service layers (TaskManager, OpenCodeSupervisor).
 """
+import asyncio
 import json
 import logging
 from typing import Any
 
-import app.database as db
+from app import db_async as adb
 from app.supervisor.projects import resolve_project, get_projects
 
 logger = logging.getLogger(__name__)
@@ -85,15 +86,15 @@ class ToolRegistry:
         row, so listing both would just show the same item twice
         (Milestone 6 Phase 8 fix).
         """
-        pending_qs = db.get_pending_questions()
+        pending_qs = await adb.get_pending_questions()
         if not pending_qs:
             return "Nothing needs your attention right now."
 
         lines = [f"{len(pending_qs)} item(s) need your attention:"]
         for q in pending_qs:
-            task = db.get_task(q["task_id"])
+            task = await adb.get_task(q["task_id"])
             tn = task["name"] if task else "Unknown"
-            src = " (OpenCode)" if db.get_opencode_task(q["task_id"]) else ""
+            src = " (OpenCode)" if await adb.get_opencode_task(q["task_id"]) else ""
             if q["question"].startswith("Permission:"):
                 detail = q["question"][len("Permission:"):].strip()
                 lines.append(f"  - [{q['question_id']}] {tn}{src} needs permission: {detail[:120]}")
@@ -102,8 +103,8 @@ class ToolRegistry:
         return "\n".join(lines)
 
     async def _list_tasks(self) -> str:
-        active = db.get_opencode_running_tasks()
-        recent = db.get_recent_tasks(10)
+        active = await adb.get_opencode_running_tasks()
+        recent = await adb.get_recent_tasks(10)
         lines = ["Active OpenCode Tasks:"]
         if active:
             for t in active:
@@ -117,7 +118,7 @@ class ToolRegistry:
         return "\n".join(lines)
 
     async def _get_task_status(self, task_id: str) -> str:
-        task = db.get_task(task_id)
+        task = await adb.get_task(task_id)
         if not task:
             return f"Task '{task_id}' not found"
         lines = [f"Task: {task['name']}", f"Status: {task['status']}", f"Started: {task['started_at']}"]
@@ -125,10 +126,10 @@ class ToolRegistry:
             lines.append(f"Completed: {task['completed_at']}")
         if task.get("exit_code") is not None:
             lines.append(f"Exit code: {task['exit_code']}")
-        oc_task = db.get_opencode_task(task_id)
+        oc_task = await adb.get_opencode_task(task_id)
         if oc_task:
             lines.append(f"OpenCode session: {oc_task['session_id'][:20]}")
-        pending_qs = db.get_pending_questions()
+        pending_qs = await adb.get_pending_questions()
         for q in pending_qs:
             if q["task_id"] == task_id:
                 lines.append(f"Pending question: {q['question'][:100]} (id={q['question_id']})")
@@ -149,7 +150,7 @@ class ToolRegistry:
     async def _send_opencode_instruction(self, task_id: str, instruction: str) -> str:
         if not self._oc:
             return "Error: OpenCode supervisor not available"
-        oc_task = db.get_opencode_task(task_id)
+        oc_task = await adb.get_opencode_task(task_id)
         if not oc_task:
             return f"Task '{task_id}' is not an OpenCode task"
         try:
@@ -168,10 +169,10 @@ class ToolRegistry:
         nothing was persisted (e.g. an older task from before this
         capture existed, or the capture itself failed) — never re-runs
         the task to answer a follow-up question about it."""
-        task = db.get_task(task_id)
+        task = await adb.get_task(task_id)
         if not task:
             return f"Task '{task_id}' not found"
-        oc_task = db.get_opencode_task(task_id)
+        oc_task = await adb.get_opencode_task(task_id)
         if not oc_task:
             return f"Task '{task_id}' is not an OpenCode task"
         if oc_task.get("result_summary"):
@@ -186,12 +187,12 @@ class ToolRegistry:
         return f"Task '{task_id}' finished ({task['status']}) but no result text is available."
 
     async def _answer_question(self, question_id: str, answer: str) -> str:
-        q = db.get_question_record(question_id)
+        q = await adb.get_question_record(question_id)
         if not q:
             return f"Question '{question_id}' not found"
         if q["status"] != "pending":
             return f"Question '{question_id}' is already {q['status']}"
-        oc_task = db.get_opencode_task(q["task_id"])
+        oc_task = await adb.get_opencode_task(q["task_id"])
         if oc_task and self._oc:
             try:
                 return await self._oc.answer_question(question_id, answer)
@@ -215,7 +216,7 @@ class ToolRegistry:
             return f"Error resolving permission: {e}"
 
     async def _cancel_task(self, task_id: str) -> str:
-        oc_task = db.get_opencode_task(task_id)
+        oc_task = await adb.get_opencode_task(task_id)
         if oc_task and self._oc:
             try:
                 return await self._oc.cancel_session(task_id)
@@ -233,7 +234,7 @@ class ToolRegistry:
             count = 5
         if count > 50:
             count = 50
-        events = db.get_recent_events(count * 3)
+        events = await adb.get_recent_events(count * 3)
         filtered = []
         for ev in events:
             ev_type = ev.get("type", "")
@@ -284,7 +285,7 @@ class ToolRegistry:
     # unrestricted scheduler control, no silent source mutation.
 
     async def _list_attention_requests(self) -> str:
-        rows = db.get_unresolved_attention_requests()
+        rows = await adb.get_unresolved_attention_requests()
         if not rows:
             return "No unresolved attention requests."
         lines = [f"{len(rows)} unresolved attention request(s):"]
@@ -295,7 +296,7 @@ class ToolRegistry:
         return "\n".join(lines)
 
     async def _get_attention_request(self, attention_request_id: str) -> str:
-        r = db.get_attention_request(attention_request_id)
+        r = await adb.get_attention_request(attention_request_id)
         if not r:
             return f"Attention request '{attention_request_id}' not found"
         lines = [
@@ -313,7 +314,7 @@ class ToolRegistry:
 
     async def _defer_attention(self, attention_request_id: str, deferred_until: str) -> str:
         from app import attention_manager
-        row = db.get_attention_request(attention_request_id)
+        row = await adb.get_attention_request(attention_request_id)
         if not row:
             return f"Attention request '{attention_request_id}' not found"
         ok = await attention_manager.defer(attention_request_id, deferred_until)
@@ -323,7 +324,7 @@ class ToolRegistry:
 
     async def _resume_attention(self, attention_request_id: str) -> str:
         from app import attention_manager
-        row = db.get_attention_request(attention_request_id)
+        row = await adb.get_attention_request(attention_request_id)
         if not row:
             return f"Attention request '{attention_request_id}' not found"
         if row["status"] != "deferred":
@@ -331,7 +332,7 @@ class ToolRegistry:
         ok = await attention_manager.mark_due(attention_request_id)
         if not ok:
             return f"Could not resume '{attention_request_id}'"
-        fresh = db.get_attention_request(attention_request_id)
+        fresh = await adb.get_attention_request(attention_request_id)
         if not fresh:
             return f"Could not resume '{attention_request_id}' (it disappeared after marking due)"
         await attention_manager.initiate_contact(self._cm, fresh)
@@ -340,13 +341,13 @@ class ToolRegistry:
     async def _open_voice_session(self, conversation_id: str, attention_request_id: str | None = None) -> str:
         if self._vsm is None:
             return "Voice session manager not available"
-        session = self._vsm.open_session(conversation_id, attention_request_id)
+        session = await asyncio.to_thread(self._vsm.open_session, conversation_id, attention_request_id)
         return f"Voice session opened: {session['voice_session_id']} (state={session['state']})"
 
     async def _close_voice_session(self, voice_session_id: str) -> str:
         if self._vsm is None:
             return "Voice session manager not available"
-        ok = self._vsm.close_session(voice_session_id)
+        ok = await asyncio.to_thread(self._vsm.close_session, voice_session_id)
         if not ok:
             return f"Voice session '{voice_session_id}' not found"
         return f"Voice session {voice_session_id} closed"

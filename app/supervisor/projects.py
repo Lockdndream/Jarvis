@@ -2,10 +2,9 @@
 import json
 import os
 
-PROJECTS_FILE = os.environ.get(
-    "JARVIS_PROJECTS_FILE",
-    os.path.join(os.path.dirname(__file__), "..", "..", "projects.json"),
-)
+from app import config
+
+PROJECTS_FILE = config.projects_file_default()
 
 _default_projects: dict = {}
 

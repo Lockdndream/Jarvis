@@ -436,7 +436,7 @@ raising, never before or optimistically.
 | Question/Permission protocol | OpenCode ↔ Jarvis | structured question/permission objects over REST/SSE | Implemented |
 
 **Decision on record** (do not reverse without strong evidence — see
-§16 ADR-004): OpenCode integration is REST + SSE, not terminal scraping,
+§16, Principle — OpenCode via REST + SSE, not terminal scraping): OpenCode integration is REST + SSE, not terminal scraping,
 not PTY control. Scored 47/50 against four alternatives; the margin was
 not close.
 
@@ -940,59 +940,63 @@ modifying the reasoning core. The seams that exist today:
 
 ## 16. Architectural Decisions
 
+`docs/decisions/` is the canonical ADR register (ADR-001 through ADR-023).
+This section is a narrative summary that cross-references the canonical
+ADRs rather than a second numbering scheme.
+
 These are the load-bearing decisions that must not be silently reversed.
 Each references the milestone where it was established; full evidence
 lives in `SESSION.md`'s "Architecture Decisions That Must Not Be
-Accidentally Reversed" section, which this ADR list summarizes at the
+Accidentally Reversed" section, which this list summarizes at the
 "why" level rather than duplicating verbatim.
 
-**ADR-001 — The laptop remains the brain.** All reasoning, state
+**[ADR-001](docs/decisions/ADR-001-laptop-remains-the-brain.md) — The laptop remains the brain.** All reasoning, state
 machines, and persistence live on the laptop. No client is permitted to
 accumulate reasoning logic. (§1, §2; reaffirmed at every milestone
 touching a new client surface.)
 
-**ADR-002 — Hybrid Android architecture.** A native Android companion is
+**[ADR-002](docs/decisions/ADR-002-hybrid-android-architecture.md) — Hybrid Android architecture.** A native Android companion is
 justified only for capabilities categorically unavailable to a PWA
 (widget, audio focus, backgrounding-resistant wake word, always-on
 presence) — not as a general replacement for the PWA. (Milestone 9A.)
 
-**ADR-003 — Deterministic attention and interruption.** `AttentionPolicy`
+**[ADR-003](docs/decisions/ADR-003-deterministic-attention-architecture.md) — Deterministic attention and interruption.** `AttentionPolicy`
 and `InterruptionPolicy` are pure functions with no LLM involvement.
 (Milestones 7, 8.)
 
-**ADR-004 — OpenCode via REST + SSE, not terminal scraping.** Scored
+**Principle — OpenCode via REST + SSE, not terminal scraping.** Scored
 47/50 against PTY control, `opencode run`, and ACP across ten weighted
-criteria. (Milestone 4/5/6.)
+criteria. (Milestone 4/5/6.) (No canonical ADR yet — candidate for one.)
 
-**ADR-005 — OpenCode storage isolation.** A Jarvis-owned OpenCode server
+**[ADR-004](docs/decisions/ADR-004-opencode-runtime-isolation.md) — OpenCode storage isolation.** A Jarvis-owned OpenCode server
 never touches OpenCode Desktop's shared database or config. (Milestone
 6.1.)
 
-**ADR-006 — OpenCode credential isolation and explicit model pinning.**
+**Principle — OpenCode credential isolation and explicit model pinning.**
 The owned-spawn subprocess environment is an allowlist, not an inherited
 environment; every delegated prompt pins provider+model explicitly.
-(Milestone 9B.0.)
+(Milestone 9B.0.) (No canonical ADR yet — candidate for one.)
 
-**ADR-007 — Notifications are idempotent by database constraint, not
+**Principle — Notifications are idempotent by database constraint, not
 caller discipline.** `dedup_key` UNIQUE + `INSERT OR IGNORE`. (Milestone
-7.)
+7.) (No canonical ADR yet — candidate for one.)
 
-**ADR-008 — `AttentionRequest` creation is idempotent by source.**
+**Principle — `AttentionRequest` creation is idempotent by source.**
 `get_or_create()`'s `dedup_key`, never created from UI rendering, polling,
-or SSE replay. (Milestone 8.)
+or SSE replay. (Milestone 8.) (No canonical ADR yet — candidate for one.)
 
-**ADR-009 — Voice input shares the exact same code path as typed text.**
+**Principle — Voice input shares the exact same code path as typed text.**
 No voice-specific conversational logic; only the input modality differs.
-(Milestone 7.)
+(Milestone 7.) (No canonical ADR yet — candidate for one.)
 
-**ADR-010 — `VoiceSessionManager` must never duplicate `Supervisor`
+**[ADR-007](docs/decisions/ADR-007-voicesession-ownership.md) — `VoiceSessionManager` must never duplicate `Supervisor`
 reasoning.** Thin pass-through only. (Milestone 8, violated once and
 corrected.)
 
-**ADR-011 — The attention scheduler is entirely DB-driven.** No part of
+**[ADR-003](docs/decisions/ADR-003-deterministic-attention-architecture.md) — The attention scheduler is entirely DB-driven.** No part of
 "when is this due" logic lives client-side. (Milestone 8.)
 
-**ADR-012 — Free-only LLM guard for the Supervisor, with a narrow,
+**[ADR-009](docs/decisions/ADR-009-cost-policy.md) — Free-only LLM guard for the Supervisor, with a narrow,
 separately-scoped, explicitly-approved paid-model allowlist for delegated
 OpenCode workers only.** The two guards share the same underlying
 validation function but are configured independently
@@ -1000,7 +1004,7 @@ validation function but are configured independently
 requires re-approval each time it is enabled. (Milestone 5; Milestone
 9B.0.)
 
-**ADR-013 — Evidence-based state transitions for delegated/native work.**
+**[ADR-010](docs/decisions/ADR-010-evidence-based-engineering.md) — Evidence-based state transitions for delegated/native work.**
 Neither an OpenCode task's completion nor a native device's "survived
 screen-off" claim is accepted without independently-verifiable evidence
 from more than one source where more than one source is available.

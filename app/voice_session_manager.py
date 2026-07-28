@@ -19,6 +19,7 @@ import logging
 import uuid
 
 import app.database as db
+from app import db_async as adb
 
 logger = logging.getLogger(__name__)
 
@@ -145,7 +146,7 @@ async def _broadcast_lifecycle(phase: str, session: dict, trace_id: str | None =
     }
     try:
         content = json.dumps(payload)
-        db.save_event("voice_session_lifecycle", content, trace_id=trace_id)
+        await adb.save_event("voice_session_lifecycle", content, trace_id=trace_id)
         await _broadcast_hook.broadcast_observers({
             "type": "voice_session_lifecycle", "timestamp": db.utcnow(), "content": content,
         })
@@ -221,7 +222,9 @@ class VoiceSessionManager:
             else:
                 bound_row = row
 
-        if attention_request_id and not db.try_claim_voice_session_lease(attention_request_id, voice_session_id):
+        if not db.open_voice_session_atomic(
+            voice_session_id, conversation_id, attention_request_id, STATE_OPENING, STATE_LISTENING,
+        ):
             # TD-002/ADR-007 ownership guard: a second client (e.g. the PWA
             # and the Android companion simultaneously) cannot each open an
             # independent, uncoordinated VoiceSession bound to the same
@@ -235,23 +238,22 @@ class VoiceSessionManager:
                 f"AttentionRequest {attention_request_id} already has an active voice session on another device"
             )
 
-        db.create_voice_session(voice_session_id, conversation_id, attention_request_id)
-        self._transition(voice_session_id, STATE_OPENING)
-        self._transition(voice_session_id, STATE_LISTENING)
         logger.info(
             "voice session opened: id=%s conversation_id=%s attention_request_id=%s",
             voice_session_id, conversation_id, attention_request_id,
         )
         session = db.get_voice_session(voice_session_id)
-        session["greeting"] = _build_greeting(bound_row) if bound_row else None  # type: ignore[index]  # TODO(F1.14): transaction boundaries
-        _schedule_lifecycle("opened", session)  # type: ignore[arg-type]  # TODO(F1.14): transaction boundaries
-        return session  # type: ignore[return-value]  # TODO(F1.14): transaction boundaries
+        if session is None:
+            raise VoiceSessionError(f"Voice session {voice_session_id} was created but could not be read back")
+        session["greeting"] = _build_greeting(bound_row) if bound_row else None
+        _schedule_lifecycle("opened", session)
+        return session
 
     async def handle_transcript(self, voice_session_id: str, transcript: str) -> dict:
         """Routes the transcript to the existing Supervisor, scoped to the
         session's bound AttentionRequest if any (Phase 12). Returns
         {"response", "conversation_id", "attention_request_id"}."""
-        session = db.get_voice_session(voice_session_id)
+        session = await adb.get_voice_session(voice_session_id)
         if not session or session["state"] == STATE_CLOSED:
             raise VoiceSessionError(f"Voice session {voice_session_id} is not open")
 
@@ -262,6 +264,11 @@ class VoiceSessionManager:
         # an ordinary turn or a yes/no reply to a pending confirmation.
         was_confirming = session["state"] == STATE_CONFIRMING
 
+        # F1.15: _transition's read-check-write MUST remain atomic with
+        # respect to the event loop — no await point between read and write —
+        # for the barge-in guard to work. Offloading to asyncio.to_thread
+        # introduces a preemption point that lets two concurrent transcripts
+        # both observe the same from_state and both pass the guard.
         if not self._transition(voice_session_id, STATE_PROCESSING):
             # Barge-in / overlap guard: a transcript is already being
             # processed for this session (e.g. two arrived concurrently).
@@ -290,11 +297,11 @@ class VoiceSessionManager:
                 # "Unclear" reply (see Supervisor.resolve_pending_tool_
                 # confirmation) — re-ask and stay in CONFIRMING rather
                 # than guessing which way the user meant it.
-                db.set_pending_tool_call(voice_session_id, still_pending["name"], still_pending["args"])
+                await adb.set_pending_tool_call(voice_session_id, still_pending["name"], still_pending["args"])
                 self._transition(voice_session_id, STATE_CONFIRMING)
                 next_state = STATE_CONFIRMING
             else:
-                db.clear_pending_tool_call(voice_session_id)
+                await adb.clear_pending_tool_call(voice_session_id)
                 self._transition(voice_session_id, STATE_WAITING)
                 self._transition(voice_session_id, STATE_LISTENING)
                 next_state = STATE_LISTENING
@@ -313,7 +320,7 @@ class VoiceSessionManager:
 
         bound_attention_id = session.get("attention_request_id")
         if bound_attention_id:
-            row = db.get_attention_request(bound_attention_id)
+            row = await adb.get_attention_request(bound_attention_id)
             if not row or row["status"] in _TERMINAL_ATTENTION_STATUSES:
                 # Phase 12: if the bound attention became stale mid-session
                 # (resolved/cancelled elsewhere), report current state
@@ -347,7 +354,7 @@ class VoiceSessionManager:
         # voice_session_state: "listening" for a session that is actually
         # closed — a real, misleading response, not just a theoretical
         # concern.
-        current = db.get_voice_session(voice_session_id)
+        current = await adb.get_voice_session(voice_session_id)
         if not current or current["state"] == STATE_CLOSED:
             raise VoiceSessionError(f"Voice session {voice_session_id} was closed while processing this turn")
 
@@ -358,7 +365,7 @@ class VoiceSessionManager:
         # WAITING for another turn, so the caller (the WS handler) knows
         # not to keep the mic listening.
         if bound_attention_id:
-            post_row = db.get_attention_request(bound_attention_id)
+            post_row = await adb.get_attention_request(bound_attention_id)
             if post_row and post_row["status"] == "deferred":
                 self._transition(voice_session_id, STATE_DEFERRED)
                 await _broadcast_lifecycle(
@@ -382,7 +389,7 @@ class VoiceSessionManager:
         # the was_confirming branch above, never re-entering the LLM loop.
         pending_tool_call = result.get("pending_tool_call")
         if pending_tool_call:
-            db.set_pending_tool_call(voice_session_id, pending_tool_call["name"], pending_tool_call["args"])
+            await adb.set_pending_tool_call(voice_session_id, pending_tool_call["name"], pending_tool_call["args"])
             self._transition(voice_session_id, STATE_CONFIRMING)
             await _broadcast_lifecycle(
                 "turn_completed", session, trace_id=result.get("trace_id"),

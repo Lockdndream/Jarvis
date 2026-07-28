@@ -12,6 +12,8 @@ import logging.handlers
 import os
 from datetime import datetime, timezone
 
+from app import config
+
 # Standard LogRecord attribute names — anything in record.__dict__ beyond
 # these (and not one of trace_id/conversation_id/task_id) is an extra
 # attribute passed via extra= and goes into the `fields` dict.
@@ -145,9 +147,9 @@ class JarvisContextFilter(logging.Filter):
 
 
 def configure_structured_logging() -> None:
-    log_dir = os.environ.get("JARVIS_LOG_DIR", "logs")
-    log_level = os.environ.get("JARVIS_LOG_LEVEL", "INFO")
-    retention_days = int(os.environ.get("JARVIS_LOG_RETENTION_DAYS", "14"))
+    log_dir = config.log_dir()
+    log_level = config.log_level()
+    retention_days = config.log_retention_days()
 
     os.makedirs(log_dir, exist_ok=True)
 

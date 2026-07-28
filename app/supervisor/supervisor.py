@@ -3,14 +3,16 @@ calls LLM, executes tools, and returns conversational responses.
 
 Max 5 tool calls per user turn. No infinite loops.
 """
+import asyncio
 import json
 import logging
-import os
 import re
 import uuid
 from typing import Any
 
 import app.database as db
+from app import db_async as adb
+from app import config
 from app.supervisor.tools import ToolRegistry
 from app.supervisor.llm import LLMProvider, FakeLLMProvider
 from app.supervisor.context import build_context
@@ -23,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 MAX_TOOL_CALLS = 5
 def _supervisor_enabled() -> bool:
-    return os.environ.get("JARVIS_SUPERVISOR_ENABLED", "1") == "1"
+    return config.supervisor_enabled()
 
 
 # Control Center dashboard support (additive). Same set-once-at-startup,
@@ -77,7 +79,7 @@ async def _broadcast(event_type: str, payload: dict) -> None:
     trace_id = trace.current_trace_id()
     try:
         content = json.dumps({**payload, "trace_id": trace_id})
-        db.save_event(event_type, content, trace_id=trace_id)
+        await adb.save_event(event_type, content, trace_id=trace_id)
         await _broadcast_hook.broadcast_observers({"type": event_type, "timestamp": db.utcnow(), "content": content})
     except Exception as e:
         logger.warning("%s broadcast failed (state unaffected): %s", event_type, e)
@@ -122,9 +124,9 @@ class Supervisor:
         self.tools.set_voice_session_manager(vsm)
 
     def _configure_llm(self) -> None:
-        if os.environ.get("JARVIS_LLM_API_KEY"):
+        if config.llm_api_key():
             self._llm = LLMProvider()
-        elif os.environ.get("JARVIS_TEST_MODE") == "1" or not _supervisor_enabled():
+        elif config.test_mode() or not _supervisor_enabled():
             self._llm = FakeLLMProvider()
         else:
             self._llm = FakeLLMProvider()
@@ -224,10 +226,10 @@ class Supervisor:
             return {"response": response_text, "conversation_id": conversation_id}
 
         # Fast path for deterministic status questions
-        fast = _fast_path(user_message)
+        fast = await asyncio.to_thread(_fast_path, user_message)
         if fast:
-            _persist_conversation(conversation_id, "user", user_message)
-            _persist_conversation(conversation_id, "assistant", fast)
+            await asyncio.to_thread(_persist_conversation, conversation_id, "user", user_message)
+            await asyncio.to_thread(_persist_conversation, conversation_id, "assistant", fast)
             return await _emit_turn(fast)
 
         # Milestone 8 Phase 18: deterministic deferral phrases ("Come back
@@ -237,8 +239,8 @@ class Supervisor:
         # first cannot plausibly misfire against an unrelated answer.
         deferred = await _resolve_defer_command(user_message, bound_attention_request_id)
         if deferred:
-            _persist_conversation(conversation_id, "user", user_message)
-            _persist_conversation(conversation_id, "assistant", deferred)
+            await asyncio.to_thread(_persist_conversation, conversation_id, "user", user_message)
+            await asyncio.to_thread(_persist_conversation, conversation_id, "assistant", deferred)
             return await _emit_turn(deferred)
 
         # Milestone 8 Phase 12: when this turn came from a voice session
@@ -249,8 +251,8 @@ class Supervisor:
         if bound_attention_request_id:
             bound = await _resolve_bound_command(user_message, self.tools, bound_attention_request_id)
             if bound:
-                _persist_conversation(conversation_id, "user", user_message)
-                _persist_conversation(conversation_id, "assistant", bound)
+                await asyncio.to_thread(_persist_conversation, conversation_id, "user", user_message)
+                await asyncio.to_thread(_persist_conversation, conversation_id, "assistant", bound)
                 return await _emit_turn(bound)
 
         # Milestone 7 Phase 10: deterministic voice/text command resolution
@@ -260,15 +262,15 @@ class Supervisor:
         # Never guesses under ambiguity; see _resolve_deterministic_command.
         deterministic = await _resolve_deterministic_command(user_message, self.tools)
         if deterministic:
-            _persist_conversation(conversation_id, "user", user_message)
-            _persist_conversation(conversation_id, "assistant", deterministic)
+            await asyncio.to_thread(_persist_conversation, conversation_id, "user", user_message)
+            await asyncio.to_thread(_persist_conversation, conversation_id, "assistant", deterministic)
             return await _emit_turn(deterministic)
 
         # Load conversation history
-        history = _load_conversation(conversation_id, max_turns=10)
+        history = await asyncio.to_thread(_load_conversation, conversation_id, max_turns=10)
 
         # Build context
-        context = build_context(history)
+        context = await asyncio.to_thread(build_context, history)
 
         # Build LLM messages: system -> history -> context -> current turn.
         # TD-028 / MILESTONE_F1 F1.6: the current message used to be embedded in the
@@ -321,7 +323,7 @@ class Supervisor:
 
                         logger.info("Tool call #%d: %s(%s)", tool_call_count, name, func["arguments"][:100], extra={"conversation_id": conversation_id, "tool": name})
                         result = await self.tools.call(name, args)
-                        _persist_tool_call(conversation_id, name, args, result)
+                        await asyncio.to_thread(_persist_tool_call, conversation_id, name, args, result)
                         await _broadcast("supervisor_tool_call", {
                             "conversation_id": conversation_id,
                             "sequence": tool_call_count,
@@ -355,8 +357,8 @@ class Supervisor:
         if final_content is None:
             final_content = "I've reached the maximum number of actions I can take in one response. Please let me know what you'd like to do next."
 
-        _persist_conversation(conversation_id, "user", user_message)
-        _persist_conversation(conversation_id, "assistant", final_content)
+        await asyncio.to_thread(_persist_conversation, conversation_id, "user", user_message)
+        await asyncio.to_thread(_persist_conversation, conversation_id, "assistant", final_content)
 
         turn_result = await _emit_turn(final_content, tool_call_count=tool_call_count)
         if pending_confirmation:
@@ -375,7 +377,7 @@ class Supervisor:
         shape (including an optional pending_tool_call in the result, for
         an "unclear" reply that re-asks rather than guessing) so the
         caller can treat both the same way."""
-        _persist_conversation(conversation_id, "user", transcript)
+        await asyncio.to_thread(_persist_conversation, conversation_id, "user", transcript)
         decision = _classify_yes_no(transcript)
         name = pending_tool_call["name"]
         args = pending_tool_call["args"]
@@ -386,7 +388,7 @@ class Supervisor:
                 extra={"conversation_id": conversation_id, "tool": name},
             )
             result = await self.tools.call(name, args)
-            _persist_tool_call(conversation_id, name, args, result)
+            await asyncio.to_thread(_persist_tool_call, conversation_id, name, args, result)
             await _broadcast("supervisor_tool_call", {
                 "conversation_id": conversation_id,
                 "sequence": 1,
@@ -395,16 +397,16 @@ class Supervisor:
                 "result_summary": result[:300] if isinstance(result, str) else str(result)[:300],
             })
             response = result if isinstance(result, str) else str(result)
-            _persist_conversation(conversation_id, "assistant", response)
+            await asyncio.to_thread(_persist_conversation, conversation_id, "assistant", response)
             return {"response": response, "conversation_id": conversation_id}
 
         if decision == "no":
             response = "Okay, I won't do that. What would you like instead?"
-            _persist_conversation(conversation_id, "assistant", response)
+            await asyncio.to_thread(_persist_conversation, conversation_id, "assistant", response)
             return {"response": response, "conversation_id": conversation_id}
 
         response = "Sorry, was that a yes or a no?"
-        _persist_conversation(conversation_id, "assistant", response)
+        await asyncio.to_thread(_persist_conversation, conversation_id, "assistant", response)
         return {"response": response, "conversation_id": conversation_id, "pending_tool_call": pending_tool_call}
 
     def _build_tool_definitions(self) -> list[dict]:
@@ -552,12 +554,12 @@ async def _resolve_defer_command(msg: str, bound_attention_request_id: str | Non
         return None
 
     if bound_attention_request_id:
-        row = db.get_attention_request(bound_attention_request_id)
+        row = await adb.get_attention_request(bound_attention_request_id)
         if not row or row["status"] in ("resolved", "cancelled", "expired"):
             return "That item is already resolved — there's nothing to come back to."
         target_id = bound_attention_request_id
     else:
-        candidates = [r for r in db.get_unresolved_attention_requests() if r["status"] in ("pending", "contacting")]
+        candidates = [r for r in await adb.get_unresolved_attention_requests() if r["status"] in ("pending", "contacting")]
         if not candidates:
             return None
         if len(candidates) > 1:
@@ -581,7 +583,7 @@ async def _resolve_bound_command(msg: str, tools: ToolRegistry, attention_reques
     counts pending items, never asks "which one". If the bound request is
     already resolved/cancelled/expired, reports that instead of acting on
     a stale source (safety always wins over context binding)."""
-    row = db.get_attention_request(attention_request_id)
+    row = await adb.get_attention_request(attention_request_id)
     if not row:
         return None
     if row["status"] in ("resolved", "cancelled", "expired"):
@@ -597,7 +599,7 @@ async def _resolve_bound_command(msg: str, tools: ToolRegistry, attention_reques
         if m:
             answer_text = cleaned[m.start(1):].strip()
         else:
-            question = db.get_question_record(source_id)
+            question = await adb.get_question_record(source_id)
             if question:
                 answer_text = _match_pending_option(cleaned, question)
         if answer_text:
@@ -640,7 +642,7 @@ async def _resolve_deterministic_command(msg: str, tools: ToolRegistry) -> str |
 
     m = _ANSWER_RE.match(lowered)
     if m:
-        pending = [q for q in db.get_pending_questions() if not q["question"].startswith("Permission:")]
+        pending = [q for q in await adb.get_pending_questions() if not q["question"].startswith("Permission:")]
         if not pending:
             return None
         if len(pending) > 1:
@@ -658,7 +660,7 @@ async def _resolve_deterministic_command(msg: str, tools: ToolRegistry) -> str |
     # question's own options as a natural-language fallback (see
     # _match_pending_option). Only when exactly one question is pending;
     # multiple pending questions still means "ask which", not a guess.
-    pending_for_option_match = [q for q in db.get_pending_questions() if not q["question"].startswith("Permission:")]
+    pending_for_option_match = [q for q in await adb.get_pending_questions() if not q["question"].startswith("Permission:")]
     if len(pending_for_option_match) == 1:
         matched_option = _match_pending_option(cleaned, pending_for_option_match[0])
         if matched_option:
@@ -671,7 +673,7 @@ async def _resolve_deterministic_command(msg: str, tools: ToolRegistry) -> str |
     m = _PERMISSION_RE.match(lowered)
     if m:
         decision = "reject" if m.group(1) in ("reject", "deny") else "approve"
-        pending = [q for q in db.get_pending_questions() if q["question"].startswith("Permission:")]
+        pending = [q for q in await adb.get_pending_questions() if q["question"].startswith("Permission:")]
         if not pending:
             return None
         if len(pending) > 1:
@@ -683,7 +685,7 @@ async def _resolve_deterministic_command(msg: str, tools: ToolRegistry) -> str |
         return "Permission approved." if decision == "approve" else "Permission rejected."
 
     if _STOP_RE.match(lowered):
-        cancellable = _cancellable_tasks()
+        cancellable = await asyncio.to_thread(_cancellable_tasks)
         if not cancellable:
             return None
         if len(cancellable) > 1:

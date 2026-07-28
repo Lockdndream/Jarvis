@@ -3,11 +3,12 @@ import asyncio
 import collections
 import json
 import logging
-import os
 import uuid
 from datetime import datetime, timezone
 
 import app.database as db
+from app import db_async as adb
+from app import config
 from app import notifications
 from app import attention_policy
 from app import worker_events
@@ -20,7 +21,7 @@ from app.operational_state import OperationalState
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_PORT = int(os.environ.get("JARVIS_OPENCODE_PORT", "4097"))
+DEFAULT_PORT = config.opencode_port()
 
 
 def _now_iso() -> str:
@@ -251,7 +252,7 @@ class OpenCodeSupervisor:
         be verified (including the currently-known empty message-history
         endpoint — see SESSION.md) is left 'degraded' rather than guessed.
         """
-        degraded = db.get_opencode_degraded_tasks()
+        degraded = await adb.get_opencode_degraded_tasks()
         if not degraded:
             return
         logger.info("opencode reconciliation started: %d degraded task(s)", len(degraded))
@@ -306,8 +307,8 @@ class OpenCodeSupervisor:
         # turn has already returned, so trace_id must be persisted on the
         # row now, at creation, not passed through a live callback later.
         trace_id = trace.current_trace_id()
-        db.create_task_record(task_id, f"OpenCode: {instruction[:50]}", instruction, trace_id=trace_id)
-        db.create_opencode_task_record(task_id, session_id, project_dir, instruction, trace_id=trace_id)
+        await adb.create_task_record(task_id, f"OpenCode: {instruction[:50]}", instruction, trace_id=trace_id)
+        await adb.create_opencode_task_record(task_id, session_id, project_dir, instruction, trace_id=trace_id)
 
         await self._notify_broadcast({
             "type": "opencode_task_created",
@@ -331,7 +332,7 @@ class OpenCodeSupervisor:
         is correctly evaluated against *this* turn's outcome, not a stale
         failure from an earlier turn.
         """
-        oc_task = db.get_opencode_task(task_id)
+        oc_task = await adb.get_opencode_task(task_id)
         if not oc_task:
             raise ValueError(f"Task '{task_id}' is not an OpenCode task")
         self._error_since_prompt[task_id] = False
@@ -340,15 +341,15 @@ class OpenCodeSupervisor:
 
     async def cancel_session(self, task_id: str) -> str:
         """Cancel an OpenCode session by Jarvis task_id."""
-        oc_task = db.get_opencode_task(task_id)
+        oc_task = await adb.get_opencode_task(task_id)
         if not oc_task:
             return f"Task {task_id} not found or not an OpenCode task"
         try:
             await self.adapter.abort_session(oc_task["session_id"], oc_task["project_dir"])
         except Exception as e:
             logger.warning("Abort API call failed: %s", e)
-        db.update_task_status(task_id, "cancelled", -1)
-        db.update_opencode_task_status(task_id, "cancelled")
+        await adb.update_task_status(task_id, "cancelled", -1)
+        await adb.update_opencode_task_status(task_id, "cancelled")
         if task_id in self._completion_events:
             self._completion_events[task_id].set()
         await self._notify_broadcast({
@@ -371,7 +372,7 @@ class OpenCodeSupervisor:
         "something happened" evidence. Returns None (never raises) if the
         task is unknown, OpenCode is unreachable, or there's no text
         content to extract — callers decide how to degrade."""
-        oc_task = db.get_opencode_task(task_id)
+        oc_task = await adb.get_opencode_task(task_id)
         if not oc_task:
             return None
         try:
@@ -390,7 +391,7 @@ class OpenCodeSupervisor:
         try:
             text = await self.fetch_task_result_text(task_id)
             if text:
-                db.update_opencode_task_result(task_id, text[:4000])
+                await adb.update_opencode_task_result(task_id, text[:4000])
         except Exception:
             logger.warning("Failed to capture result for task_id=%s", task_id, exc_info=True)
 
@@ -412,15 +413,15 @@ class OpenCodeSupervisor:
 
     async def answer_question(self, question_id: str, answer: str) -> str:
         """Reply to an OpenCode question."""
-        record = db.get_question_record(question_id)
+        record = await adb.get_question_record(question_id)
         if not record:
             return f"Question {question_id} not found"
-        oc_task = db.get_opencode_task(record["task_id"])
+        oc_task = await adb.get_opencode_task(record["task_id"])
         if not oc_task:
             return "Not an OpenCode task"
         await self.adapter.reply_question(question_id, oc_task["project_dir"], answer)
-        db.answer_question_record(question_id, answer)
-        self._clear_waiting_state(record["task_id"])
+        await adb.answer_question_record(question_id, answer)
+        await asyncio.to_thread(self._clear_waiting_state, record["task_id"])
         logger.info("opencode answer delivered: task_id=%s question_id=%s", record["task_id"], question_id)
         await self._notify_broadcast({
             "type": "opencode_question_answered",
@@ -434,15 +435,15 @@ class OpenCodeSupervisor:
 
     async def reject_question(self, question_id: str) -> str:
         """Reject an OpenCode question."""
-        record = db.get_question_record(question_id)
+        record = await adb.get_question_record(question_id)
         if not record:
             return f"Question {question_id} not found"
-        oc_task = db.get_opencode_task(record["task_id"])
+        oc_task = await adb.get_opencode_task(record["task_id"])
         if not oc_task:
             return "Not an OpenCode task"
         await self.adapter.reject_question(question_id, oc_task["project_dir"])
-        db.cancel_question_record(question_id)
-        self._clear_waiting_state(record["task_id"])
+        await adb.cancel_question_record(question_id)
+        await asyncio.to_thread(self._clear_waiting_state, record["task_id"])
         await self._notify_broadcast({
             "type": "opencode_question_rejected",
             "question_id": question_id,
@@ -457,18 +458,18 @@ class OpenCodeSupervisor:
 
     async def approve_permission(self, permission_id: str, approved: bool) -> str:
         """Approve or deny an OpenCode permission request."""
-        records = db.get_pending_questions()
+        records = await adb.get_pending_questions()
         record = next((q for q in records if q.get("question_id") == permission_id), None)
         if not record:
             return f"Permission {permission_id} not found"
 
-        oc_task = db.get_opencode_task(record["task_id"])
+        oc_task = await adb.get_opencode_task(record["task_id"])
         if not oc_task:
             return "Not an OpenCode task"
 
         await self.adapter.reply_permission(permission_id, oc_task["project_dir"], approved)
-        db.answer_question_record(permission_id, "approved" if approved else "denied")
-        self._clear_waiting_state(record["task_id"])
+        await adb.answer_question_record(permission_id, "approved" if approved else "denied")
+        await asyncio.to_thread(self._clear_waiting_state, record["task_id"])
         logger.info("opencode permission resolved: task_id=%s permission_id=%s approved=%s", record["task_id"], permission_id, approved)
 
         await self._notify_broadcast({
@@ -487,8 +488,8 @@ class OpenCodeSupervisor:
     async def get_status(self) -> dict:
         """Return current status of all OpenCode tasks and server health."""
         server_alive = self.server.is_alive
-        running_tasks = db.get_opencode_running_tasks()
-        pending_questions = db.get_pending_questions()
+        running_tasks = await adb.get_opencode_running_tasks()
+        pending_questions = await adb.get_pending_questions()
         return {
             "server_alive": server_alive,
             "server_url": self.server.base_url,
@@ -528,7 +529,7 @@ class OpenCodeSupervisor:
         """Background task polling for questions/permissions (backup for SSE)."""
         while not self._stopped:
             try:
-                running_tasks = db.get_opencode_running_tasks()
+                running_tasks = await adb.get_opencode_running_tasks()
                 dirs = {t["project_dir"] for t in running_tasks}
                 for directory in dirs:
                     await self._poll_questions(directory)
@@ -544,10 +545,10 @@ class OpenCodeSupervisor:
                 request_id = oc_q.get("requestID") or oc_q.get("id", "")
                 if not request_id:
                     continue
-                existing = db.get_question_record(request_id)
+                existing = await adb.get_question_record(request_id)
                 if existing:
                     continue
-                oc_task = db.get_opencode_task_by_session(
+                oc_task = await adb.get_opencode_task_by_session(
                     oc_q.get("sessionID", "")
                 )
                 task_id = oc_task["task_id"] if oc_task else "unknown"
@@ -564,10 +565,10 @@ class OpenCodeSupervisor:
                 request_id = oc_p.get("requestID") or oc_p.get("id", "")
                 if not request_id:
                     continue
-                existing = db.get_question_record(request_id)
+                existing = await adb.get_question_record(request_id)
                 if existing:
                     continue
-                oc_task = db.get_opencode_task_by_session(
+                oc_task = await adb.get_opencode_task_by_session(
                     oc_p.get("sessionID", "")
                 )
                 task_id = oc_task["task_id"] if oc_task else "unknown"
@@ -606,7 +607,7 @@ class OpenCodeSupervisor:
 
             oc_task = None
             if session_id:
-                oc_task = db.get_opencode_task_by_session(session_id)
+                oc_task = await adb.get_opencode_task_by_session(session_id)
             task_id = oc_task["task_id"] if oc_task else "unknown"
 
             events = process_sse_event(sse_event, task_id)
@@ -639,7 +640,7 @@ class OpenCodeSupervisor:
         task_id = event["task_id"]
         request_id = event["request_id"]
 
-        db.create_question_record(
+        await adb.create_question_record(
             request_id,
             task_id,
             event["question"],
@@ -659,10 +660,10 @@ class OpenCodeSupervisor:
         await self._notify_broadcast(msg)
 
         logger.info("opencode question received: task_id=%s question_id=%s", task_id, request_id)
-        db.update_task_status(task_id, "waiting_for_user")
-        db.update_opencode_task_status(task_id, "waiting_for_user")
+        await adb.update_task_status(task_id, "waiting_for_user")
+        await adb.update_opencode_task_status(task_id, "waiting_for_user")
 
-        task = db.get_task(task_id)
+        task = await adb.get_task(task_id)
         task_name = task["name"] if task else "A task"
         await worker_events.create_attention(
             self.cm,
@@ -677,7 +678,7 @@ class OpenCodeSupervisor:
         task_id = event["task_id"]
         request_id = event["request_id"]
 
-        db.create_question_record(
+        await adb.create_question_record(
             request_id,
             task_id,
             f"Permission: {event['action']} {event.get('path', '')}",
@@ -696,10 +697,10 @@ class OpenCodeSupervisor:
         await self._notify_broadcast(msg)
 
         logger.info("opencode permission received: task_id=%s permission_id=%s", task_id, request_id)
-        db.update_task_status(task_id, "waiting_for_user")
-        db.update_opencode_task_status(task_id, "waiting_for_user")
+        await adb.update_task_status(task_id, "waiting_for_user")
+        await adb.update_opencode_task_status(task_id, "waiting_for_user")
 
-        task = db.get_task(task_id)
+        task = await adb.get_task(task_id)
         task_name = task["name"] if task else "A task"
         # Phase 15: keep this generic — never include the raw path/action
         # detail here. Full context is already visible in the authenticated
@@ -730,10 +731,10 @@ class OpenCodeSupervisor:
         if task_id == "unknown":
             return
         self._error_since_prompt[task_id] = True
-        task = db.get_task(task_id)
+        task = await adb.get_task(task_id)
         if task and task["status"] in ("completed", "failed", "cancelled"):
             return  # already terminal — ignore late/duplicate error evidence
-        oc_task = db.get_opencode_task(task_id)
+        oc_task = await adb.get_opencode_task(task_id)
         duration = (datetime.now(timezone.utc) - datetime.fromisoformat(oc_task["created_at"].replace("Z", "+00:00"))).total_seconds() if oc_task else 0.0
         # M-OX.3 live-validation finding: this handler runs on the SSE
         # loop's own asyncio Task, not the turn's -- trace.current_trace_id()
@@ -751,9 +752,9 @@ class OpenCodeSupervisor:
             "opencode task terminal state observed: task_id=%s status=failed evidence=session.error", task_id,
             extra={"task_id": task_id, "status": "failed", "duration_seconds": duration, "trace_id": terminal_trace_id},
         )
-        db.update_task_status(task_id, "failed", -1)
-        db.update_opencode_task_status(task_id, "failed")
-        db.update_opencode_task_evidence(task_id, "session.error")
+        await adb.update_task_status(task_id, "failed", -1)
+        await adb.update_opencode_task_status(task_id, "failed")
+        await adb.update_opencode_task_evidence(task_id, "session.error")
         # Delegated Observation and Reporting milestone: a failed task can
         # still have a useful partial result (e.g. the agent's own
         # explanation of what went wrong) -- same capture path as success.
@@ -790,18 +791,18 @@ class OpenCodeSupervisor:
         task_id = event["task_id"]
         if task_id == "unknown":
             return
-        task = db.get_task(task_id)
+        task = await adb.get_task(task_id)
         if task and task["status"] in ("completed", "failed", "cancelled"):
             return  # already terminal
 
         if self._error_since_prompt.get(task_id):
             return  # a session.error for this turn already took precedence
 
-        pending = [q for q in db.get_pending_questions() if q["task_id"] == task_id]
+        pending = [q for q in await adb.get_pending_questions() if q["task_id"] == task_id]
         if pending:
             return  # genuinely waiting on the user, not complete
 
-        oc_task = db.get_opencode_task(task_id)
+        oc_task = await adb.get_opencode_task(task_id)
         duration = (datetime.now(timezone.utc) - datetime.fromisoformat(oc_task["created_at"].replace("Z", "+00:00"))).total_seconds() if oc_task else 0.0
         # M-OX.3 live-validation finding: see the matching comment in
         # _handle_session_failed() -- same asyncio-Task-boundary issue.
@@ -810,9 +811,9 @@ class OpenCodeSupervisor:
             "opencode task terminal state observed: task_id=%s status=completed evidence=session.idle", task_id,
             extra={"task_id": task_id, "status": "completed", "duration_seconds": duration, "trace_id": terminal_trace_id},
         )
-        db.update_task_status(task_id, "completed", 0)
-        db.update_opencode_task_status(task_id, "completed")
-        db.update_opencode_task_evidence(task_id, "session.idle")
+        await adb.update_task_status(task_id, "completed", 0)
+        await adb.update_opencode_task_status(task_id, "completed")
+        await adb.update_opencode_task_evidence(task_id, "session.idle")
         # Delegated Observation and Reporting milestone: capture the
         # delegated agent's own final answer *before* announcing
         # completion, so a follow-up question asked right after "task
@@ -845,8 +846,8 @@ class OpenCodeSupervisor:
         task_id = event["task_id"]
         if task_id == "unknown":
             return
-        task = db.get_task(task_id)
-        oc_task_for_log = db.get_opencode_task(task_id)
+        task = await adb.get_task(task_id)
+        oc_task_for_log = await adb.get_opencode_task(task_id)
         first_activity = task is not None and oc_task_for_log and not oc_task_for_log.get("last_evidence_type")
         # M-OX.3 live-validation finding: these two lines carried neither
         # task_id nor trace_id in structured output, unlike their sibling
@@ -869,10 +870,10 @@ class OpenCodeSupervisor:
             # activity visible continuously instead of one line then a long
             # silent gap. Purely additive logging -- no control flow change.
             logger.info("opencode activity: task_id=%s evidence=%s", task_id, event.get("evidence_type"), extra=activity_extra)
-        db.update_opencode_task_evidence(task_id, event.get("evidence_type", "activity"))
+        await adb.update_opencode_task_evidence(task_id, event.get("evidence_type", "activity"))
         if task and task["status"] not in ("waiting_for_user", "completed", "failed", "cancelled"):
-            db.update_task_status(task_id, "running")
-            db.update_opencode_task_status(task_id, "running")
+            await adb.update_task_status(task_id, "running")
+            await adb.update_opencode_task_status(task_id, "running")
 
     async def _notify_broadcast(self, msg: dict) -> None:
         try:
