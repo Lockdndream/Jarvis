@@ -204,6 +204,11 @@ def llm_api_key() -> str:
     return _str("JARVIS_LLM_API_KEY") or ""
 
 
+def groq_api_key() -> str:
+    """GROQ_API_KEY — Groq API key for Whisper speech-to-text. Default: empty string."""
+    return _str("GROQ_API_KEY") or ""
+
+
 def llm_free_only() -> bool:
     """JARVIS_LLM_FREE_ONLY — filter routes to free models only.
 

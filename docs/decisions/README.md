@@ -123,3 +123,4 @@ Every ADR uses the same section structure, in this order:
 | [ADR-022](ADR-022-jarvis-operations-subsystem.md) | Jarvis Operations Subsystem | Accepted |
 | [ADR-023](ADR-023-jops-v1-operation-model-and-jarvis-self-management.md) | JOPS v1.0 — Operation Model, Jarvis Self-Management, Connectivity Policy Split | Accepted |
 | [ADR-024](ADR-024-sqlite-write-concurrency-model.md) | SQLite Write-Concurrency Model | Accepted |
+| [ADR-025](ADR-025-groq-whisper-stt.md) | Groq Whisper for Speech-to-Text | Accepted |
