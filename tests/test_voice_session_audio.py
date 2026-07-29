@@ -1,9 +1,8 @@
-"""Laptop-side WebSocket stub for incoming audio frames (Groq Whisper STT).
+"""Laptop-side WebSocket audio-frame handling with Groq Whisper STT wired in.
 
-This tests ONLY observability: the receive loop now accepts binary frames
-when preceded by a ``voice_session_audio`` text header, and logs them. Real
-transcription wiring (calling app/stt.py and feeding the result into
-VoiceSessionManager.handle_transcript) is a later task, not covered here.
+Tests for the binary-frame transcription path, the text-frame fallback path
+(via the shared ``_process_transcript`` helper), and the bare-frame-warning
+guard.
 """
 import logging
 import os
@@ -15,6 +14,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import app.database as db
+from app.stt import TranscriptResult, GroqTranscriptionError
 
 _ENV_BEFORE_IMPORT = dict(os.environ)
 import app.main as _main_module
@@ -66,22 +66,127 @@ def _drain_initial(ws):
     return seen_types
 
 
-def test_voice_session_audio_header_then_binary_frame_logs_size(client, caplog):
-    """A voice_session_audio text header followed by a binary frame is observed."""
-    audio = b"RIFF" + b"\x00" * 100
-    with caplog.at_level(logging.INFO, logger="jarvis"):
-        with client.websocket_connect("/ws") as ws:
-            _drain_initial(ws)
-            ws.send_json({"type": "voice_session_audio", "voice_session_id": "vs-audio-1"})
-            ws.send_bytes(audio)
+def test_binary_frame_with_stt_transcribes_and_feeds_pipeline(client, monkeypatch):
+    """Header + binary frame → stt.transcribe returns text → _process_transcript called, voice_session_response sent."""
+    with client.websocket_connect("/ws") as ws:
+        _drain_initial(ws)
 
-    matches = [
-        r
-        for r in caplog.records
-        if r.levelno == logging.INFO
-        and "received voice session audio: session=vs-audio-1 bytes=104" in r.message
-    ]
-    assert len(matches) == 1
+        ws.send_json({"type": "voice_session_open", "conversation_id": None, "attention_request_id": None})
+        opened = ws.receive_json()
+        assert opened["type"] == "voice_session_opened"
+        vsid = opened["voice_session_id"]
+
+        async def fake_handle_transcript(voice_session_id, transcript):
+            assert transcript == "hello world"
+            return {
+                "response": "stt response",
+                "conversation_id": None,
+                "attention_request_id": None,
+                "voice_session_state": "listening",
+                "trace_id": "trace-stt-1",
+            }
+
+        monkeypatch.setattr(
+            _main_module.voice_session_manager,
+            "handle_transcript",
+            fake_handle_transcript,
+        )
+
+        async def fake_transcribe(audio_bytes, filename="audio.webm"):
+            return TranscriptResult(
+                text="hello world",
+                duration_seconds=1.5,
+                cost_usd=0.00002,
+            )
+
+        monkeypatch.setattr(_main_module.stt, "transcribe", fake_transcribe)
+
+        audio = b"RIFF" + b"\x00" * 100
+        ws.send_json({"type": "voice_session_audio", "voice_session_id": vsid})
+        ws.send_bytes(audio)
+
+        reply = ws.receive_json()
+        assert reply["type"] == "voice_session_response"
+        assert reply["voice_session_id"] == vsid
+        assert reply["response"] == "stt response"
+
+
+def test_binary_frame_stt_transcription_error_sends_error(client, monkeypatch):
+    """stt.transcribe raises GroqTranscriptionError → voice_session_error sent, handle_transcript NOT called."""
+    with client.websocket_connect("/ws") as ws:
+        _drain_initial(ws)
+
+        ws.send_json({"type": "voice_session_open", "conversation_id": None, "attention_request_id": None})
+        opened = ws.receive_json()
+        assert opened["type"] == "voice_session_opened"
+        vsid = opened["voice_session_id"]
+
+        handle_called = False
+
+        async def fake_handle_transcript(voice_session_id, transcript):
+            nonlocal handle_called
+            handle_called = True
+            return {}
+
+        monkeypatch.setattr(
+            _main_module.voice_session_manager,
+            "handle_transcript",
+            fake_handle_transcript,
+        )
+
+        async def fake_transcribe_raise(audio_bytes, filename="audio.webm"):
+            raise GroqTranscriptionError("no api key")
+
+        monkeypatch.setattr(_main_module.stt, "transcribe", fake_transcribe_raise)
+
+        audio = b"RIFF" + b"\x00" * 100
+        ws.send_json({"type": "voice_session_audio", "voice_session_id": vsid})
+        ws.send_bytes(audio)
+
+        reply = ws.receive_json()
+        assert reply["type"] == "voice_session_error"
+        assert reply["voice_session_id"] == vsid
+        assert "Transcription failed" in reply["error"]
+        assert not handle_called
+
+
+def test_binary_frame_stt_empty_text_sends_no_speech_error(client, monkeypatch):
+    """stt.transcribe returns whitespace-only text → voice_session_error 'No speech detected', handle_transcript NOT called."""
+    with client.websocket_connect("/ws") as ws:
+        _drain_initial(ws)
+
+        ws.send_json({"type": "voice_session_open", "conversation_id": None, "attention_request_id": None})
+        opened = ws.receive_json()
+        assert opened["type"] == "voice_session_opened"
+        vsid = opened["voice_session_id"]
+
+        handle_called = False
+
+        async def fake_handle_transcript(voice_session_id, transcript):
+            nonlocal handle_called
+            handle_called = True
+            return {}
+
+        monkeypatch.setattr(
+            _main_module.voice_session_manager,
+            "handle_transcript",
+            fake_handle_transcript,
+        )
+
+        async def fake_transcribe_empty(audio_bytes, filename="audio.webm"):
+            return TranscriptResult(text="  \n ", duration_seconds=0.0, cost_usd=0.0)
+
+        monkeypatch.setattr(_main_module.stt, "transcribe", fake_transcribe_empty)
+
+        audio = b"RIFF" + b"\x00" * 100
+        ws.send_json({"type": "voice_session_audio", "voice_session_id": vsid})
+        ws.send_bytes(audio)
+
+        reply = ws.receive_json()
+        assert reply["type"] == "voice_session_error"
+        assert reply["voice_session_id"] == vsid
+        assert "No speech detected" in reply["error"]
+        assert not handle_called
 
 
 def test_bare_binary_frame_without_header_logs_warning(client, caplog):
@@ -106,7 +211,6 @@ def test_voice_session_transcript_round_trip_unchanged_after_loop_restructure(cl
     with client.websocket_connect("/ws") as ws:
         _drain_initial(ws)
 
-        # Use a real voice session so the session id is valid.
         ws.send_json({"type": "voice_session_open", "conversation_id": None, "attention_request_id": None})
         opened = ws.receive_json()
         assert opened["type"] == "voice_session_opened"

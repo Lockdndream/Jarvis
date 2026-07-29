@@ -16,6 +16,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import config
+from . import stt
+from .stt import GroqTranscriptionError
+import httpx
 from .connection_manager import ConnectionManager
 from .database import (
     init_db,
@@ -544,7 +547,26 @@ async def websocket_endpoint(ws: WebSocket):
             "running_tasks": oc_status["running_tasks"],
             "pending_questions": oc_status["pending_questions"],
         })
-    )
+        )
+
+    async def _process_transcript(vsid: str, transcript: str) -> str | None:
+        try:
+            result = await voice_session_manager.handle_transcript(vsid, transcript)
+        except VoiceSessionError as e:
+            await ws.send_text(json.dumps({
+                "type": "voice_session_error", "voice_session_id": vsid, "error": str(e),
+            }))
+            return None
+        await ws.send_text(json.dumps({
+            "type": "voice_session_response",
+            "voice_session_id": vsid,
+            "response": result.get("response", ""),
+            "conversation_id": result.get("conversation_id"),
+            "attention_request_id": result.get("attention_request_id"),
+            "voice_session_state": result.get("voice_session_state"),
+            "trace_id": result.get("trace_id"),
+        }))
+        return result.get("conversation_id")
 
     try:
         while True:
@@ -554,12 +576,30 @@ async def websocket_endpoint(ws: WebSocket):
             if "bytes" in message:
                 audio_bytes = message["bytes"]
                 if pending_audio_voice_session_id is not None:
-                    logger.info(
-                        "received voice session audio: session=%s bytes=%d",
-                        pending_audio_voice_session_id,
-                        len(audio_bytes),
-                    )
+                    vsid = pending_audio_voice_session_id
                     pending_audio_voice_session_id = None
+                    try:
+                        stt_result = await stt.transcribe(audio_bytes, "audio.wav")
+                    except (GroqTranscriptionError, httpx.HTTPError) as e:
+                        logger.error("groq transcription failed: session=%s error=%s", vsid, e)
+                        await ws.send_text(json.dumps({
+                            "type": "voice_session_error", "voice_session_id": vsid,
+                            "error": "Transcription failed",
+                        }))
+                        continue
+                    logger.info(
+                        "groq whisper transcription: session=%s duration=%.2fs cost=$%.4f",
+                        vsid, stt_result.duration_seconds, stt_result.cost_usd,
+                    )
+                    if not stt_result.text.strip():
+                        await ws.send_text(json.dumps({
+                            "type": "voice_session_error", "voice_session_id": vsid,
+                            "error": "No speech detected",
+                        }))
+                        continue
+                    new_cid = await _process_transcript(vsid, stt_result.text)
+                    conversation_id = new_cid or conversation_id
+                    continue
                 else:
                     logger.warning("received audio frame with no pending voice_session_audio header")
                 continue
@@ -694,23 +734,8 @@ async def websocket_endpoint(ws: WebSocket):
                 transcript = data.get("transcript", "")
                 if not vsid:
                     continue
-                try:
-                    result = await voice_session_manager.handle_transcript(vsid, transcript)
-                except VoiceSessionError as e:
-                    await ws.send_text(json.dumps({
-                        "type": "voice_session_error", "voice_session_id": vsid, "error": str(e),
-                    }))
-                    continue
-                conversation_id = result.get("conversation_id") or conversation_id
-                await ws.send_text(json.dumps({
-                    "type": "voice_session_response",
-                    "voice_session_id": vsid,
-                    "response": result.get("response", ""),
-                    "conversation_id": result.get("conversation_id"),
-                    "attention_request_id": result.get("attention_request_id"),
-                    "voice_session_state": result.get("voice_session_state"),
-                    "trace_id": result.get("trace_id"),
-                }))
+                new_cid = await _process_transcript(vsid, transcript)
+                conversation_id = new_cid or conversation_id
                 continue
 
             if data.get("type") == "voice_session_close":
