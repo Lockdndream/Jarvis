@@ -32,8 +32,15 @@ internal class AndroidAudioCaptureEngine(
     private var isCapturing = false
     private var captureThread: Thread? = null
 
+    @Volatile
+    private var cancelled = false
+
     private fun postCallback(action: () -> Unit) {
         callbackPoster?.invoke(action) ?: mainHandler.post(action)
+    }
+
+    private fun postCallbackIfNotCancelled(action: () -> Unit) {
+        if (!cancelled) postCallback(action)
     }
 
     override fun isCaptureAvailable(): Boolean = audioSource.isAvailable()
@@ -52,6 +59,7 @@ internal class AndroidAudioCaptureEngine(
         }
 
         isCapturing = true
+        cancelled = false
         captureThread = Thread {
             captureLoop(onAudioCaptured, onError)
         }.apply { start() }
@@ -63,21 +71,27 @@ internal class AndroidAudioCaptureEngine(
         var capturedDurationMs = 0L
         var consecutiveSilenceMs = 0L
         var hadLoud = false
+        var rmsMin = Double.MAX_VALUE
+        var rmsMax = 0.0
+        var rmsSum = 0.0
+        var rmsCount = 0
 
         try {
             while (isCapturing) {
                 val samplesRead = audioSource.read(buffer)
                 if (samplesRead <= 0) {
                     if (pcmStream.size() == 0) {
-                        // Never received any audio — treat as error.
                         break
                     }
-                    // End of audio stream after receiving at least some data.
                     break
                 }
 
                 val durationMs = samplesRead * 1000L / SAMPLE_RATE
                 val chunkRms = computeRms(buffer, samplesRead)
+                rmsMin = minOf(rmsMin, chunkRms)
+                rmsMax = maxOf(rmsMax, chunkRms)
+                rmsSum += chunkRms
+                rmsCount += 1
 
                 for (i in 0 until samplesRead) {
                     val sample = buffer[i].toInt()
@@ -99,24 +113,36 @@ internal class AndroidAudioCaptureEngine(
                 }
             }
 
+            android.util.Log.i(
+                "AudioCaptureEngine",
+                "capture finished: durationMs=$capturedDurationMs hadLoud=$hadLoud " +
+                    "rms min=${"%.1f".format(if (rmsCount > 0) rmsMin else 0.0)} " +
+                    "max=${"%.1f".format(rmsMax)} " +
+                    "mean=${"%.1f".format(if (rmsCount > 0) rmsSum / rmsCount else 0.0)} " +
+                    "threshold=$SILENCE_RMS_THRESHOLD",
+            )
+
             val pcmBytes = pcmStream.toByteArray()
             if (pcmBytes.isEmpty()) {
-                isCapturing = false
-                postCallback { onError("No audio captured") }
+                postCallbackIfNotCancelled { onError("No audio captured") }
                 return
             }
 
             val wavBytes = buildWav(pcmBytes)
-            isCapturing = false
-            postCallback { onAudioCaptured(wavBytes) }
+            postCallbackIfNotCancelled { onAudioCaptured(wavBytes) }
         } catch (e: Exception) {
+            postCallbackIfNotCancelled { onError("Audio capture error: ${e.message}") }
+        } finally {
             isCapturing = false
-            postCallback { onError("Audio capture error: ${e.message}") }
+            audioSource.stop()
+            audioSource.release()
         }
     }
 
     override fun cancel() {
+        cancelled = true
         isCapturing = false
+        audioSource.stop()
         captureThread?.run {
             try {
                 join(500)
@@ -124,8 +150,6 @@ internal class AndroidAudioCaptureEngine(
             }
         }
         captureThread = null
-        audioSource.stop()
-        audioSource.release()
     }
 
     companion object {
@@ -218,7 +242,7 @@ internal class PlatformAudioSource : AudioSource {
         }
         try {
             audioRecord = AudioRecord(
-                MediaRecorder.AudioSource.MIC,
+                MediaRecorder.AudioSource.VOICE_RECOGNITION,
                 AndroidAudioCaptureEngine.SAMPLE_RATE,
                 AudioFormat.CHANNEL_IN_MONO,
                 AudioFormat.ENCODING_PCM_16BIT,

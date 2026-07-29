@@ -287,7 +287,121 @@ class AndroidAudioCaptureEngineTest {
         assertTrue(fakeSource.wasReleased)
     }
 
+    // --- Bug regression tests ---
+
+    @Test
+    fun `audioSource stop and release called on normal completion`() {
+        val chunks = mutableListOf<ShortArray>()
+        repeat(30) {
+            chunks.add(generateLoudChunk())
+        }
+        repeat(30) {
+            chunks.add(generateSilenceChunk())
+        }
+        repeat(5) {
+            chunks.add(generateSilenceChunk())
+        }
+
+        val fakeSource = FakeAudioSource(chunks)
+        val engine = AndroidAudioCaptureEngine(fakeSource) { it() }
+        val latch = CountDownLatch(1)
+        val captured = mutableListOf<ByteArray>()
+
+        engine.startCapture(
+            onAudioCaptured = {
+                captured.add(it)
+                latch.countDown()
+            },
+            onError = {},
+        )
+
+        assertTrue(latch.await(5, TimeUnit.SECONDS))
+        assertEquals(1, captured.size)
+        assertTrue(fakeSource.releasedLatch.await(5, TimeUnit.SECONDS))
+        assertTrue(fakeSource.wasStopped)
+        assertTrue(fakeSource.wasReleased)
+    }
+
+    @Test
+    fun `cancel prevents onAudioCaptured and onError callbacks`() {
+        val chunks = mutableListOf<ShortArray>()
+        repeat(100) {
+            chunks.add(generateLoudChunk())
+        }
+
+        val fakeSource = BlockableFakeAudioSource(chunks)
+        val engine = AndroidAudioCaptureEngine(fakeSource) { it() }
+        val captured = mutableListOf<ByteArray>()
+        val errors = mutableListOf<String>()
+
+        engine.startCapture(
+            onAudioCaptured = { captured.add(it) },
+            onError = { errors.add(it) },
+        )
+
+        Thread.sleep(100)
+        engine.cancel()
+
+        assertTrue(captured.isEmpty())
+        assertTrue(errors.isEmpty())
+    }
+
     // --- helpers ---
+
+    private class BlockableFakeAudioSource(
+        private val chunks: List<ShortArray>,
+    ) : AudioSource {
+
+        var available = true
+        var startRecordingResult = true
+        var wasStarted = false
+        var wasStopped = false
+        var wasReleased = false
+        var lastReadThreadId: Long? = null
+
+        private val readLatch = CountDownLatch(1)
+        private var chunkIndex = 0
+        private var sampleOffset = 0
+
+        override fun isAvailable(): Boolean = available
+
+        override fun startRecording(): Boolean {
+            wasStarted = true
+            return startRecordingResult
+        }
+
+        override fun read(buffer: ShortArray): Int {
+            lastReadThreadId = Thread.currentThread().id
+            try {
+                readLatch.await()
+            } catch (_: InterruptedException) {
+            }
+            if (chunkIndex >= chunks.size) return -1
+            var destOffset = 0
+            while (destOffset < buffer.size && chunkIndex < chunks.size) {
+                val chunk = chunks[chunkIndex]
+                val remaining = chunk.size - sampleOffset
+                val toCopy = minOf(remaining, buffer.size - destOffset)
+                System.arraycopy(chunk, sampleOffset, buffer, destOffset, toCopy)
+                destOffset += toCopy
+                sampleOffset += toCopy
+                if (sampleOffset >= chunk.size) {
+                    chunkIndex++
+                    sampleOffset = 0
+                }
+            }
+            return destOffset
+        }
+
+        override fun stop() {
+            wasStopped = true
+            readLatch.countDown()
+        }
+
+        override fun release() {
+            wasReleased = true
+        }
+    }
 
     private fun generateLoudChunk(): ShortArray {
         return ShortArray(AndroidAudioCaptureEngine.READ_BUFFER_SIZE_SAMPLES) {
@@ -310,6 +424,16 @@ class AndroidAudioCaptureEngineTest {
         var wasStopped = false
         var wasReleased = false
         var lastReadThreadId: Long? = null
+
+        // stop()/release() run on the capture thread, inside captureLoop()'s
+        // finally block, which executes AFTER the onAudioCaptured/onError
+        // callback (a CountDownLatch.countDown() in that callback only
+        // establishes happens-before for actions BEFORE it in program order
+        // — not for the finally block that runs after). A test thread that
+        // only awaits the callback's latch can observe wasStopped/wasReleased
+        // as still false, since nothing guarantees the finally block has run
+        // yet. This latch gives release() its own happens-before edge.
+        val releasedLatch = java.util.concurrent.CountDownLatch(1)
 
         private var chunkIndex = 0
         private var sampleOffset = 0
@@ -346,6 +470,7 @@ class AndroidAudioCaptureEngineTest {
 
         override fun release() {
             wasReleased = true
+            releasedLatch.countDown()
         }
     }
 }

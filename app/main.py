@@ -591,6 +591,7 @@ async def websocket_endpoint(ws: WebSocket):
                         "groq whisper transcription: session=%s duration=%.2fs cost=$%.4f",
                         vsid, stt_result.duration_seconds, stt_result.cost_usd,
                     )
+                    logger.info("groq whisper transcript preview: session=%s text=%r", vsid, stt_result.text[:60])
                     if not stt_result.text.strip():
                         await ws.send_text(json.dumps({
                             "type": "voice_session_error", "voice_session_id": vsid,

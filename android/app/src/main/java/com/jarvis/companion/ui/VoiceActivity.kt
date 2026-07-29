@@ -455,7 +455,7 @@ class VoiceActivity : AppCompatActivity() {
         // production behavior). Flipped to true for Step 4's end-to-end
         // validation. Local only — no settings-sync or server-pushed
         // config for this milestone step.
-        private val useRawAudioCapture = false
+        private val useRawAudioCapture = true
 
         // In-process only (this app has no other process), read access for
         // the Diagnostics screen — same rationale as
