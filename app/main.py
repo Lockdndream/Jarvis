@@ -468,6 +468,13 @@ async def websocket_endpoint(ws: WebSocket):
     # disconnect can release its AttentionRequest lease instead of leaving
     # it permanently held (see the `finally` block below).
     open_voice_session_id: str | None = None
+    # Groq Whisper STT upgrade (Milestone 9B.7): pending audio header for
+    # the incoming binary frame. The client sends a text
+    # "voice_session_audio" header immediately followed by a binary frame
+    # containing the raw audio bytes for that session; this variable holds
+    # the session id between the two frames. Observability-only in this
+    # task — transcription wiring is a later change.
+    pending_audio_voice_session_id: str | None = None
 
     events = get_recent_events(100)
     await ws.send_text(json.dumps({"type": "history", "events": events}))
@@ -541,7 +548,22 @@ async def websocket_endpoint(ws: WebSocket):
 
     try:
         while True:
-            raw = await ws.receive_text()
+            message = await ws.receive()
+            if message["type"] == "websocket.disconnect":
+                raise WebSocketDisconnect(message.get("code", 1000))
+            if "bytes" in message:
+                audio_bytes = message["bytes"]
+                if pending_audio_voice_session_id is not None:
+                    logger.info(
+                        "received voice session audio: session=%s bytes=%d",
+                        pending_audio_voice_session_id,
+                        len(audio_bytes),
+                    )
+                    pending_audio_voice_session_id = None
+                else:
+                    logger.warning("received audio frame with no pending voice_session_audio header")
+                continue
+            raw = message["text"]
             data = json.loads(raw)
 
             if data.get("type") == "conversation_init":
@@ -658,6 +680,13 @@ async def websocket_endpoint(ws: WebSocket):
                     "greeting": session.get("greeting"),
                     "client_request_id": client_request_id,
                 }))
+                continue
+
+            if data.get("type") == "voice_session_audio":
+                vsid = data.get("voice_session_id")
+                if not vsid:
+                    continue
+                pending_audio_voice_session_id = vsid
                 continue
 
             if data.get("type") == "voice_session_transcript":
