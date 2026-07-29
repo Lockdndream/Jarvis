@@ -10,6 +10,12 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
+interface AudioCaptureEngine {
+    fun isCaptureAvailable(): Boolean
+    fun startCapture(onAudioCaptured: (ByteArray) -> Unit, onError: (String) -> Unit)
+    fun cancel()
+}
+
 /**
  * Foreground, user-initiated speech recognition wrapper mirroring the PWA's
  * interaction model: one tap = one recognition attempt = it ends. Uses
@@ -22,9 +28,15 @@ import kotlinx.coroutines.flow.asStateFlow
  */
 class SpeechInputController internal constructor(
     private val recognizerEngine: SpeechRecognizerEngine,
+    private val audioCaptureEngine: AudioCaptureEngine? = null,
 ) {
     constructor(context: Context) : this(
         recognizerEngine = AndroidSpeechRecognizerEngine(context),
+    )
+
+    constructor(context: Context, audioCaptureEngine: AudioCaptureEngine) : this(
+        recognizerEngine = AndroidSpeechRecognizerEngine(context),
+        audioCaptureEngine = audioCaptureEngine,
     )
 
     enum class State { IDLE, LISTENING, PROCESSING, ERROR }
@@ -57,9 +69,43 @@ class SpeechInputController internal constructor(
         )
     }
 
+    fun startListeningRaw(onAudioCaptured: (ByteArray) -> Unit, onError: (String) -> Unit) {
+        if (_state.value != State.IDLE) return
+
+        val engine = audioCaptureEngine
+        if (engine == null) {
+            _state.value = State.ERROR
+            onError("Raw audio capture is not available on this device")
+            _state.value = State.IDLE
+            return
+        }
+
+        if (!engine.isCaptureAvailable()) {
+            _state.value = State.ERROR
+            onError("Raw audio capture is not available on this device")
+            _state.value = State.IDLE
+            return
+        }
+
+        _state.value = State.LISTENING
+        engine.startCapture(
+            onAudioCaptured = { audioBytes ->
+                _state.value = State.PROCESSING
+                onAudioCaptured(audioBytes)
+                _state.value = State.IDLE
+            },
+            onError = { message ->
+                _state.value = State.ERROR
+                onError(message)
+                _state.value = State.IDLE
+            },
+        )
+    }
+
     fun cancel() {
         if (_state.value == State.LISTENING || _state.value == State.PROCESSING) {
             recognizerEngine.cancel()
+            audioCaptureEngine?.cancel()
         }
         _state.value = State.IDLE
     }

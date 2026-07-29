@@ -24,6 +24,7 @@ import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
+import okio.ByteString
 import org.json.JSONObject
 import java.security.SecureRandom
 import java.util.concurrent.TimeUnit
@@ -197,6 +198,16 @@ class CompanionWebSocketClient(
             put("transcript", transcript)
         }
         return webSocket?.send(payload.toString()) ?: false
+    }
+
+    fun sendVoiceSessionAudio(voiceSessionId: String, audioBytes: ByteArray): Boolean {
+        val header = JSONObject().apply {
+            put("type", "voice_session_audio")
+            put("voice_session_id", voiceSessionId)
+        }
+        val headerSent = webSocket?.send(header.toString()) ?: false
+        val bytesSent = webSocket?.send(ByteString.of(*audioBytes)) ?: false
+        return headerSent && bytesSent
     }
 
     fun sendVoiceSessionClose(voiceSessionId: String): Boolean {

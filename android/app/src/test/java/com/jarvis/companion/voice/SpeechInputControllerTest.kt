@@ -11,6 +11,7 @@ import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertNull
 import org.junit.Before
 import org.junit.Test
@@ -198,6 +199,134 @@ class SpeechInputControllerTest {
 
         assert(fakeEngine.wasDestroyedAfterUse)
     }
+
+    // --- startListeningRaw state transitions ---
+
+    @Test
+    fun `startListeningRaw transitions from IDLE to LISTENING`() {
+        val fakeAudio = FakeAudioCaptureEngine()
+        val controller = SpeechInputController(
+            recognizerEngine = fakeEngine,
+            audioCaptureEngine = fakeAudio,
+        )
+        assertEquals(SpeechInputController.State.IDLE, controller.state.value)
+
+        controller.startListeningRaw(onAudioCaptured = {}, onError = {})
+        assertEquals(SpeechInputController.State.LISTENING, controller.state.value)
+    }
+
+    @Test
+    fun `startListeningRaw when engine is null calls onError and returns to IDLE`() {
+        val controller = SpeechInputController(
+            recognizerEngine = fakeEngine,
+            audioCaptureEngine = null,
+        )
+        val errors = mutableListOf<String>()
+
+        controller.startListeningRaw(onAudioCaptured = {}, onError = { errors.add(it) })
+
+        assertEquals(SpeechInputController.State.IDLE, controller.state.value)
+        assertEquals(1, errors.size)
+        assertEquals("Raw audio capture is not available on this device", errors[0])
+    }
+
+    @Test
+    fun `startListeningRaw when capture not available calls onError and returns to IDLE`() {
+        val fakeAudio = FakeAudioCaptureEngine().apply { captureAvailable = false }
+        val controller = SpeechInputController(
+            recognizerEngine = fakeEngine,
+            audioCaptureEngine = fakeAudio,
+        )
+        val errors = mutableListOf<String>()
+
+        controller.startListeningRaw(onAudioCaptured = {}, onError = { errors.add(it) })
+
+        assertEquals(SpeechInputController.State.IDLE, controller.state.value)
+        assertEquals(1, errors.size)
+        assertEquals("Raw audio capture is not available on this device", errors[0])
+    }
+
+    @Test
+    fun `startListeningRaw when not IDLE is a no-op`() {
+        val fakeAudio = FakeAudioCaptureEngine()
+        val controller = SpeechInputController(
+            recognizerEngine = fakeEngine,
+            audioCaptureEngine = fakeAudio,
+        )
+        controller.startListeningRaw(onAudioCaptured = {}, onError = {})
+        assertEquals(SpeechInputController.State.LISTENING, controller.state.value)
+
+        val captured = mutableListOf<ByteArray>()
+        controller.startListeningRaw(onAudioCaptured = { captured.add(it) }, onError = {})
+
+        assertEquals(SpeechInputController.State.LISTENING, controller.state.value)
+        assertEquals(0, captured.size)
+    }
+
+    @Test
+    fun `startListeningRaw onAudioCaptured triggers PROCESSING then IDLE state`() {
+        val fakeAudio = FakeAudioCaptureEngine().apply {
+            triggerAudioOnNextStart = byteArrayOf(1, 2, 3)
+        }
+        val controller = SpeechInputController(
+            recognizerEngine = fakeEngine,
+            audioCaptureEngine = fakeAudio,
+        )
+        val captured = mutableListOf<ByteArray>()
+
+        controller.startListeningRaw(onAudioCaptured = { captured.add(it) }, onError = {})
+
+        assertEquals(1, captured.size)
+        assertArrayEquals(byteArrayOf(1, 2, 3), captured[0])
+        assertEquals(SpeechInputController.State.IDLE, controller.state.value)
+    }
+
+    @Test
+    fun `startListeningRaw onError triggers ERROR then IDLE state`() {
+        val fakeAudio = FakeAudioCaptureEngine().apply {
+            triggerErrorOnNextStart = "capture error"
+        }
+        val controller = SpeechInputController(
+            recognizerEngine = fakeEngine,
+            audioCaptureEngine = fakeAudio,
+        )
+        val errors = mutableListOf<String>()
+
+        controller.startListeningRaw(onAudioCaptured = {}, onError = { errors.add(it) })
+
+        assertEquals(1, errors.size)
+        assertEquals("capture error", errors[0])
+        assertEquals(SpeechInputController.State.IDLE, controller.state.value)
+    }
+
+    @Test
+    fun `cancel while raw capture in progress calls audio engine cancel`() {
+        val fakeAudio = FakeAudioCaptureEngine()
+        val controller = SpeechInputController(
+            recognizerEngine = fakeEngine,
+            audioCaptureEngine = fakeAudio,
+        )
+        controller.startListeningRaw(onAudioCaptured = {}, onError = {})
+
+        controller.cancel()
+
+        assert(fakeAudio.wasCancelled)
+        assertEquals(SpeechInputController.State.IDLE, controller.state.value)
+    }
+
+    @Test
+    fun `cancel when IDLE with audio engine does not call cancel`() {
+        val fakeAudio = FakeAudioCaptureEngine()
+        val controller = SpeechInputController(
+            recognizerEngine = fakeEngine,
+            audioCaptureEngine = fakeAudio,
+        )
+
+        controller.cancel()
+
+        assert(!fakeAudio.wasCancelled)
+        assertEquals(SpeechInputController.State.IDLE, controller.state.value)
+    }
 }
 
 private class FakeSpeechRecognizerEngine : SpeechInputController.SpeechRecognizerEngine {
@@ -222,6 +351,31 @@ private class FakeSpeechRecognizerEngine : SpeechInputController.SpeechRecognize
             wasDestroyedAfterUse = true
         }
         // If neither is set, the engine "listens" indefinitely until cancelled
+    }
+
+    override fun cancel() {
+        wasCancelled = true
+    }
+}
+
+private class FakeAudioCaptureEngine : AudioCaptureEngine {
+
+    var captureAvailable = true
+    var triggerAudioOnNextStart: ByteArray? = null
+    var triggerErrorOnNextStart: String? = null
+    var wasCancelled = false
+
+    override fun isCaptureAvailable(): Boolean = captureAvailable
+
+    override fun startCapture(onAudioCaptured: (ByteArray) -> Unit, onError: (String) -> Unit) {
+        val audio = triggerAudioOnNextStart
+        val error = triggerErrorOnNextStart
+
+        if (audio != null) {
+            onAudioCaptured(audio)
+        } else if (error != null) {
+            onError(error)
+        }
     }
 
     override fun cancel() {

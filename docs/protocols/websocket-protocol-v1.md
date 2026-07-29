@@ -106,7 +106,9 @@ design (e.g. the app-level heartbeat frame below), not an error.
 | `user_message` | `content`, `conversation_id`, `bound_attention_request_id` (optional) | A typed/spoken message to the Supervisor. |
 | `voice_session_open` | `conversation_id` (optional), `attention_request_id` (optional) | Begin a voice session (Milestone 8). |
 | `voice_session_transcript` | `voice_session_id`, `transcript` | A recognized utterance within an open voice session. |
+| `voice_session_audio` | `voice_session_id` | **Text frame** (header only). Signals the client is about to send the raw audio bytes for [voice_session_id] as the immediate next binary frame on this same connection. Audio format is WAV (RIFF/WAVE), 16kHz mono 16-bit PCM. |
 | `voice_session_close` | `voice_session_id` | End a voice session. |
+| `*(binary frame)*` | *(n/a — raw bytes)* | **Binary frame** immediately following a `voice_session_audio` text frame. Contains the full utterance's audio as a WAV file (44-byte RIFF/WAVE header + PCM data). No JSON framing — the preceding `voice_session_audio` header carries the session association. |
 | `device_status` | `device_id`, `capabilities`, `pairing_state`, `battery_optimization_exempt`, `notification_permission_granted`, `connection_generation` | Capability advertisement / state sync (ADR-012). Fire-and-forget, no reply. Sent once per successful (re)connect by the Android companion. In-memory only server-side, not yet read by anything (groundwork for future multi-device routing). |
 | `heartbeat` | *(none)* | App-level liveness signal from the Android companion (`{"type":"heartbeat"}`), sent every 30s while connected. The server does not act on it — it exists for the *client's* own telemetry (proving the send queued successfully) and is otherwise a no-op frame, matching this protocol's "don't invent server-side handling without a demonstrated need" discipline (Milestone 9B.0). |
 

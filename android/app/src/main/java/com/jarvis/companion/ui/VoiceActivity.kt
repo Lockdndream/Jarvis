@@ -13,6 +13,7 @@ import com.jarvis.companion.core.ConnectionState
 import com.jarvis.companion.databinding.ActivityVoiceBinding
 import com.jarvis.companion.service.PresenceService
 import com.jarvis.companion.settings.PermissionsHelper
+import com.jarvis.companion.voice.AndroidAudioCaptureEngine
 import com.jarvis.companion.voice.AudioFocusOwner
 import com.jarvis.companion.voice.PlaybackManager
 import com.jarvis.companion.voice.SpeechInputController
@@ -95,6 +96,7 @@ class VoiceActivity : AppCompatActivity() {
     private lateinit var speechInputController: SpeechInputController
 
     private var pendingTranscript: String? = null
+    private var pendingAudioBytes: ByteArray? = null
     private var lastSpokenText: String? = null
     private var lastSpokenSessionId: String? = null
     private var userFacingError: String? = null
@@ -138,7 +140,7 @@ class VoiceActivity : AppCompatActivity() {
         playbackManager = PlaybackManager(this, AudioFocusOwnerAdapter(audioFocusManager))
         playbackManager.init()
 
-        speechInputController = SpeechInputController(this)
+        speechInputController = SpeechInputController(this, AndroidAudioCaptureEngine())
 
         // Same-process-only static exposure for the Diagnostics screen,
         // mirroring PresenceService.activeClient's doc-commented rationale:
@@ -187,6 +189,13 @@ class VoiceActivity : AppCompatActivity() {
                         pendingTranscript = null
                         PresenceService.activeClient?.sendVoiceSessionTranscript(
                             session.voiceSessionId, pending,
+                        )
+                    }
+                    val pendingAudio = pendingAudioBytes
+                    if (pendingAudio != null && session != null) {
+                        pendingAudioBytes = null
+                        PresenceService.activeClient?.sendVoiceSessionAudio(
+                            session.voiceSessionId, pendingAudio,
                         )
                     }
                     render(session, response, connectionState)
@@ -295,30 +304,55 @@ class VoiceActivity : AppCompatActivity() {
 
     private fun startListening() {
         userFacingError = null
-        speechInputController.startListening(
-            onResult = { transcript ->
-                val session = app.voiceSessionRepository.current.value
-                if (session != null) {
-                    PresenceService.activeClient?.sendVoiceSessionTranscript(
-                        session.voiceSessionId, transcript,
-                    )
-                    isAwaitingResponse = true
-                    render(
-                        app.voiceSessionRepository.current.value,
-                        app.voiceSessionRepository.lastResponse.value,
-                        app.connectionState.value,
-                    )
-                } else {
-                    val attentionRequestId = intent.getStringExtra(EXTRA_ATTENTION_REQUEST_ID)
-                    pendingTranscript = transcript
-                    PresenceService.activeClient?.sendVoiceSessionOpen(
-                        conversationId = null,
-                        attentionRequestId = attentionRequestId,
-                    )
-                }
-            },
-            onError = { message -> showError(message) },
-        )
+        if (useRawAudioCapture) {
+            speechInputController.startListeningRaw(
+                onAudioCaptured = { audioBytes ->
+                    val session = app.voiceSessionRepository.current.value
+                    if (session != null) {
+                        PresenceService.activeClient?.sendVoiceSessionAudio(session.voiceSessionId, audioBytes)
+                        isAwaitingResponse = true
+                        render(
+                            app.voiceSessionRepository.current.value,
+                            app.voiceSessionRepository.lastResponse.value,
+                            app.connectionState.value,
+                        )
+                    } else {
+                        val attentionRequestId = intent.getStringExtra(EXTRA_ATTENTION_REQUEST_ID)
+                        pendingAudioBytes = audioBytes
+                        PresenceService.activeClient?.sendVoiceSessionOpen(
+                            conversationId = null,
+                            attentionRequestId = attentionRequestId,
+                        )
+                    }
+                },
+                onError = { message -> showError(message) },
+            )
+        } else {
+            speechInputController.startListening(
+                onResult = { transcript ->
+                    val session = app.voiceSessionRepository.current.value
+                    if (session != null) {
+                        PresenceService.activeClient?.sendVoiceSessionTranscript(
+                            session.voiceSessionId, transcript,
+                        )
+                        isAwaitingResponse = true
+                        render(
+                            app.voiceSessionRepository.current.value,
+                            app.voiceSessionRepository.lastResponse.value,
+                            app.connectionState.value,
+                        )
+                    } else {
+                        val attentionRequestId = intent.getStringExtra(EXTRA_ATTENTION_REQUEST_ID)
+                        pendingTranscript = transcript
+                        PresenceService.activeClient?.sendVoiceSessionOpen(
+                            conversationId = null,
+                            attentionRequestId = attentionRequestId,
+                        )
+                    }
+                },
+                onError = { message -> showError(message) },
+            )
+        }
     }
 
     /** render() otherwise only runs from the session/response/connection
@@ -341,6 +375,7 @@ class VoiceActivity : AppCompatActivity() {
         }
         playbackManager.cancel()
         pendingTranscript = null
+        pendingAudioBytes = null
         finish()
     }
 
@@ -414,6 +449,13 @@ class VoiceActivity : AppCompatActivity() {
         // so unlike EXTRA_ATTENTION_REQUEST_ID this extra never triggers a
         // sendVoiceSessionOpen() call here; it only triggers auto-listening.
         const val EXTRA_LAUNCHED_BY_WAKEWORD = "com.jarvis.companion.EXTRA_VOICE_LAUNCHED_BY_WAKEWORD"
+
+        // Raw audio capture (Groq Whisper STT upgrade) feature flag.
+        // false = existing on-device SpeechRecognizer path (default
+        // production behavior). Flipped to true for Step 4's end-to-end
+        // validation. Local only — no settings-sync or server-pushed
+        // config for this milestone step.
+        private val useRawAudioCapture = false
 
         // In-process only (this app has no other process), read access for
         // the Diagnostics screen — same rationale as
