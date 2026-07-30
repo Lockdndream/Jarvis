@@ -82,6 +82,7 @@ class PlanExecutor:
                 if step["status"] == "failed":
                     if step["on_failure"] == "stop":
                         await adb.update_plan_status(plan_id, "failed")
+                        await self._write_plan_completion_memory(plan_id, "failed")
                         logger.info(
                             "plan failed (stop on failure): plan_id=%s step_id=%s",
                             plan_id, step["step_id"],
@@ -106,12 +107,14 @@ class PlanExecutor:
                             plan_id, step["step_id"],
                         )
                         await adb.update_plan_status(plan_id, "failed")
+                        await self._write_plan_completion_memory(plan_id, "failed")
                         self._running_plans.pop(plan_id, None)
                         return
                     step = refreshed
                     if step["status"] == "failed":
                         if step["on_failure"] == "stop":
                             await adb.update_plan_status(plan_id, "failed")
+                            await self._write_plan_completion_memory(plan_id, "failed")
                             logger.info(
                                 "plan failed (stop on failure): plan_id=%s step_id=%s",
                                 plan_id, step["step_id"],
@@ -132,6 +135,7 @@ class PlanExecutor:
                     current_step_index=step["step_index"] + 1,
                 )
             await adb.update_plan_status(plan_id, "completed")
+            await self._write_plan_completion_memory(plan_id, "completed")
             logger.info("plan completed: plan_id=%s", plan_id)
         finally:
             self._running_plans.pop(plan_id, None)
@@ -262,6 +266,36 @@ class PlanExecutor:
             step_id, status="succeeded",
             result=output, completed_at=_utcnow(),
         )
+
+    # ── Memory write ────────────────────────────────────────────────────
+
+    async def _write_plan_completion_memory(self, plan_id: str, final_status: str) -> None:
+        try:
+            plan = await adb.get_plan(plan_id)
+            if not plan:
+                return
+            steps = await adb.get_plan_steps(plan_id)
+            succeeded = sum(1 for s in steps if s["status"] == "succeeded")
+            failed = sum(1 for s in steps if s["status"] == "failed")
+            skipped = sum(1 for s in steps if s["status"] == "skipped")
+            lines = [
+                f"Plan '{plan['title']}' {final_status}.",
+                f"Total steps: {len(steps)}, succeeded: {succeeded}, failed: {failed}, skipped: {skipped}.",
+            ]
+            for s in steps:
+                if s["status"] == "failed":
+                    err = (s.get("error") or "")[:300]
+                    lines.append(f"  Failed step: {s['description'][:200]}" + (f" — {err}" if err else ""))
+            summary = "\n".join(lines)
+            await adb.store_memory(
+                category="episodic",
+                content=summary,
+                project=None,
+                source="plan_completion",
+                source_id=plan_id,
+            )
+        except Exception:
+            logger.warning("Failed to write plan-completion memory for plan_id=%s", plan_id, exc_info=True)
 
     # ── Escalation ──────────────────────────────────────────────────────
 

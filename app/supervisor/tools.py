@@ -13,7 +13,7 @@ import uuid as _uuid
 
 from app import db_async as adb
 from app.supervisor.projects import resolve_project, get_projects
-from app.supervisor.context import build_context
+from app.supervisor.context import build_context, format_memory_sections
 from app.workers.opencode_worker import OpenCodeWorker
 from app.workers.base import WorkerResultStatus
 
@@ -370,12 +370,24 @@ class ToolRegistry:
         worker = self._worker_registry.get_by_name("strategist")
         if not worker:
             return "Error: strategist not available"
-        context = await asyncio.to_thread(build_context)
+        context = await asyncio.to_thread(build_context, None, question)
         prompt = (
             f"{_format_context_for_strategist(context)}\n\n"
             f"Question for the strategist: {question}"
         )
         result = await worker.invoke(prompt)
+        try:
+            advice = result.output if result.status != WorkerResultStatus.FAILED else result.error
+            advice_text = (advice or "")[:500]
+            content = f"Strategist advised on '{question}': {advice_text}"
+            await adb.store_memory(
+                category="episodic",
+                content=content,
+                source="strategist",
+                source_id=None,
+            )
+        except Exception:
+            logger.warning("Failed to write strategist consultation memory", exc_info=True)
         if result.status == WorkerResultStatus.FAILED:
             return f"Error consulting strategist: {result.error}"
         return result.output or "(strategist returned no output)"
@@ -458,6 +470,96 @@ class ToolRegistry:
             lines.append(f"  - [{p['plan_id']}] {p['title']} ({p['status']})")
         return "\n".join(lines)
 
+    async def _remember_this(self, content: str, project: str | None = None) -> str:
+        try:
+            await adb.store_memory(
+                category="explicit",
+                content=content,
+                project=project,
+                source="user_explicit",
+                source_id=None,
+            )
+            return "Got it, I'll remember that."
+        except Exception:
+            logger.warning("Failed to remember explicit memory", exc_info=True)
+            return "I couldn't save that — please try again."
+
+    async def _forget_this(self, query: str | None = None, memory_id: str | None = None) -> str:
+        if memory_id is not None:
+            try:
+                await adb.delete_memory(memory_id)
+            except Exception:
+                logger.warning("Failed to delete memory by id", exc_info=True)
+                return "I couldn't delete that — please try again."
+            return "Forgotten."
+
+        if query is None:
+            return "Please provide either a query or a memory_id."
+
+        try:
+            matches = await adb.retrieve_memories(query, limit=10)
+        except Exception:
+            logger.warning("Failed to retrieve memories for forget", exc_info=True)
+            return "I couldn't look that up — please try again."
+
+        if not matches:
+            return f"I couldn't find a memory matching '{query}'."
+
+        if len(matches) == 1:
+            mem = matches[0]
+            try:
+                await adb.delete_memory(mem["id"])
+            except Exception:
+                logger.warning("Failed to delete matched memory", exc_info=True)
+                return "I couldn't delete that — please try again."
+            excerpt = mem["content"][:80]
+            if len(mem["content"]) > 80:
+                excerpt = excerpt + "..."
+            return f"Forgotten: {excerpt}"
+
+        lines = [
+            f"I found {len(matches)} memories matching '{query}'. "
+            "Please be more specific or use what_do_you_remember to find the exact id, "
+            "then call forget_this with memory_id:"
+        ]
+        for mem in matches:
+            excerpt = mem["content"][:80]
+            if len(mem["content"]) > 80:
+                excerpt = excerpt + "..."
+            project_note = f" (project: {mem['project']})" if mem.get("project") else ""
+            lines.append(f"  - [{mem['id']}] {mem['category']}{project_note}: {excerpt}")
+        return "\n".join(lines)
+
+    async def _what_do_you_remember(self, project: str | None = None, count: int = 10) -> str:
+        if count < 1:
+            count = 10
+        if count > 50:
+            count = 50
+        try:
+            memories = await adb.get_recent_memories(project=project, limit=count)
+        except Exception:
+            logger.warning("Failed to retrieve recent memories", exc_info=True)
+            return "I couldn't retrieve memories — please try again."
+
+        if not memories:
+            if project:
+                return f"I don't have any memories stored for project '{project}'."
+            return "I don't have any memories stored."
+
+        lines = []
+        if project:
+            lines.append(f"Recent memories for project '{project}':")
+        else:
+            lines.append("Recent memories:")
+        for mem in memories:
+            content = mem["content"]
+            excerpt = content[:150]
+            if len(content) > 150:
+                excerpt = excerpt + "..."
+            project_part = f" project={mem['project']}," if mem.get("project") else ""
+            lines.append(f"  - [{mem['id']}] {mem['category']},{project_part} {excerpt}")
+        return "\n".join(lines)
+
     def _register_all(self) -> None:
         self._register("get_attention", "Get summary of everything needing user attention", {"type": "object", "properties": {}, "required": []}, self._get_attention)
         self._register("list_tasks", "List all active, waiting, and recent tasks", {"type": "object", "properties": {}, "required": []}, self._list_tasks)
@@ -533,10 +635,58 @@ class ToolRegistry:
             self._resume_plan,
         )
         self._register("list_plans", "List recent plans", {"type": "object", "properties": {"count": {"type": "integer", "description": "Number of plans (default 10)", "default": 10}}, "required": []}, self._list_plans)
+        self._register(
+            "remember_this",
+            "Store a fact the user explicitly asked you to remember (e.g. 'remember that...', "
+            "'keep in mind that...'). Rephrase what they said as a clear standalone statement "
+            "for `content`. If the fact relates to a specific project, set `project` to that "
+            "project's alias (see get_projects); otherwise omit it.",
+            {
+                "type": "object",
+                "properties": {
+                    "content": {"type": "string", "description": "The standalone fact to remember"},
+                    "project": {"type": "string", "description": "Optional project alias if the fact is project-scoped"},
+                },
+                "required": ["content"],
+            },
+            self._remember_this,
+        )
+        self._register(
+            "forget_this",
+            "Remove a memory the user explicitly asked you to forget. Provide either the exact "
+            "memory_id from what_do_you_remember, or a query describing the memory (e.g. 'JWT tokens').",
+            {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Keyword/phrase describing the memory to remove"},
+                    "memory_id": {"type": "string", "description": "Exact memory id to remove"},
+                },
+                "required": [],
+            },
+            self._forget_this,
+        )
+        self._register(
+            "what_do_you_remember",
+            "List recent memories. Optionally filter to a specific project.",
+            {
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "Optional project alias filter"},
+                    "count": {"type": "integer", "description": "Number of memories to return (default 10, max 50)", "default": 10},
+                },
+                "required": [],
+            },
+            self._what_do_you_remember,
+        )
 
 
 def _format_context_for_strategist(context: dict) -> str:
     parts = []
+
+    memory_block = format_memory_sections(context)
+    if memory_block:
+        parts.append(memory_block)
+
     projects = context.get("projects", [])
     if projects:
         parts.append("Safe projects: " + ", ".join(f"{p['alias']} ({p['display_name']})" for p in projects))

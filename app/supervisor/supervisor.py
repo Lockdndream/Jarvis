@@ -15,7 +15,7 @@ from app import db_async as adb
 from app import config
 from app.supervisor.tools import ToolRegistry
 from app.supervisor.llm import LLMProvider, FakeLLMProvider
-from app.supervisor.context import build_context
+from app.supervisor.context import build_context, format_memory_sections
 from app import deferral
 from app import attention_manager
 from app import trace
@@ -230,7 +230,7 @@ class Supervisor:
         fast = await asyncio.to_thread(_fast_path, user_message)
         if fast:
             await asyncio.to_thread(_persist_conversation, conversation_id, "user", user_message)
-            await asyncio.to_thread(_persist_conversation, conversation_id, "assistant", fast)
+            await self._persist_conversation_turn(conversation_id, fast)
             return await _emit_turn(fast)
 
         # Milestone 8 Phase 18: deterministic deferral phrases ("Come back
@@ -241,7 +241,7 @@ class Supervisor:
         deferred = await _resolve_defer_command(user_message, bound_attention_request_id)
         if deferred:
             await asyncio.to_thread(_persist_conversation, conversation_id, "user", user_message)
-            await asyncio.to_thread(_persist_conversation, conversation_id, "assistant", deferred)
+            await self._persist_conversation_turn(conversation_id, deferred)
             return await _emit_turn(deferred)
 
         # Milestone 8 Phase 12: when this turn came from a voice session
@@ -253,7 +253,7 @@ class Supervisor:
             bound = await _resolve_bound_command(user_message, self.tools, bound_attention_request_id)
             if bound:
                 await asyncio.to_thread(_persist_conversation, conversation_id, "user", user_message)
-                await asyncio.to_thread(_persist_conversation, conversation_id, "assistant", bound)
+                await self._persist_conversation_turn(conversation_id, bound)
                 return await _emit_turn(bound)
 
         # Milestone 7 Phase 10: deterministic voice/text command resolution
@@ -264,14 +264,14 @@ class Supervisor:
         deterministic = await _resolve_deterministic_command(user_message, self.tools)
         if deterministic:
             await asyncio.to_thread(_persist_conversation, conversation_id, "user", user_message)
-            await asyncio.to_thread(_persist_conversation, conversation_id, "assistant", deterministic)
+            await self._persist_conversation_turn(conversation_id, deterministic)
             return await _emit_turn(deterministic)
 
         # Load conversation history
         history = await asyncio.to_thread(_load_conversation, conversation_id, max_turns=10)
 
         # Build context
-        context = await asyncio.to_thread(build_context, history)
+        context = await asyncio.to_thread(build_context, history, user_message)
 
         # Build LLM messages: system -> history -> context -> current turn.
         # TD-028 / MILESTONE_F1 F1.6: the current message used to be embedded in the
@@ -359,7 +359,7 @@ class Supervisor:
             final_content = "I've reached the maximum number of actions I can take in one response. Please let me know what you'd like to do next."
 
         await asyncio.to_thread(_persist_conversation, conversation_id, "user", user_message)
-        await asyncio.to_thread(_persist_conversation, conversation_id, "assistant", final_content)
+        await self._persist_conversation_turn(conversation_id, final_content)
 
         turn_result = await _emit_turn(final_content, tool_call_count=tool_call_count)
         if pending_confirmation:
@@ -398,16 +398,16 @@ class Supervisor:
                 "result_summary": result[:300] if isinstance(result, str) else str(result)[:300],
             })
             response = result if isinstance(result, str) else str(result)
-            await asyncio.to_thread(_persist_conversation, conversation_id, "assistant", response)
+            await self._persist_conversation_turn(conversation_id, response)
             return {"response": response, "conversation_id": conversation_id}
 
         if decision == "no":
             response = "Okay, I won't do that. What would you like instead?"
-            await asyncio.to_thread(_persist_conversation, conversation_id, "assistant", response)
+            await self._persist_conversation_turn(conversation_id, response)
             return {"response": response, "conversation_id": conversation_id}
 
         response = "Sorry, was that a yes or a no?"
-        await asyncio.to_thread(_persist_conversation, conversation_id, "assistant", response)
+        await self._persist_conversation_turn(conversation_id, response)
         return {"response": response, "conversation_id": conversation_id, "pending_tool_call": pending_tool_call}
 
     def _build_tool_definitions(self) -> list[dict]:
@@ -423,6 +423,44 @@ class Supervisor:
                 },
             })
         return result
+
+    async def _persist_conversation_turn(self, conversation_id: str, content: str) -> None:
+        await asyncio.to_thread(_persist_conversation, conversation_id, "assistant", content)
+        # get_conversation_messages defaults to limit=100 (oldest-first) --
+        # an explicit high limit is required here so the assistant-turn
+        # count keeps growing instead of plateauing once a conversation
+        # exceeds 100 total messages (which would silently stop the
+        # every-10-turns summarization trigger forever for exactly the
+        # long conversations that most need it).
+        messages = await asyncio.to_thread(db.get_conversation_messages, conversation_id, 100_000)
+        assistant_count = sum(1 for m in messages if m["role"] == "assistant")
+        if assistant_count > 0 and assistant_count % 10 == 0:
+            asyncio.create_task(self._summarize_and_store(conversation_id))
+
+    async def _summarize_and_store(self, conversation_id: str) -> None:
+        try:
+            history = await asyncio.to_thread(_load_conversation, conversation_id, max_turns=10)
+            prompt_lines = [
+                "Summarize the following conversation between a user and Jarvis in 2-4 sentences. "
+                "Focus on what was discussed and decided:"
+            ]
+            for msg in history:
+                prompt_lines.append(f"{msg['role']}: {msg['content']}")
+            prompt = "\n".join(prompt_lines)
+            response = await self._llm.chat_completion(  # type: ignore[union-attr]  # _llm is set by _configure_llm() on all branches in __init__
+                [{"role": "user", "content": prompt}],
+                tools=None,
+            )
+            summary = response.get("content", "") if response else ""
+            if summary:
+                await adb.store_memory(
+                    category="episodic",
+                    content=summary,
+                    source="conversation",
+                    source_id=conversation_id,
+                )
+        except Exception:
+            logger.warning("Summarization failed for conversation %s", conversation_id, exc_info=True)
 
 
 # ── Fast path ─────────────────────────────────────────────────────
@@ -783,6 +821,10 @@ def _load_conversation(conversation_id: str, max_turns: int = 10) -> list[dict]:
 def _format_context(context: dict) -> str:
     """Format the context dict into a readable string for the LLM."""
     parts = [f"Current time: {context.get('current_time', 'unknown')}"]
+
+    memory_block = format_memory_sections(context)
+    if memory_block:
+        parts.append(memory_block)
 
     projects = context.get("projects", [])
     if projects:

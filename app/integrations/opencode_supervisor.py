@@ -392,6 +392,19 @@ class OpenCodeSupervisor:
             text = await self.fetch_task_result_text(task_id)
             if text:
                 await adb.update_opencode_task_result(task_id, text[:4000])
+            oc_task = await adb.get_opencode_task(task_id)
+            if oc_task:
+                task = await adb.get_task(task_id)
+                final_status = oc_task.get("status", "unknown")
+                description = task["name"] if task else "Unknown task"
+                result_summary = (text or oc_task.get("result_summary", "") or "")[:300]
+                content = f"OpenCode task {final_status}: {description}. Result: {result_summary}"
+                await adb.store_memory(
+                    category="episodic",
+                    content=content,
+                    source="task_completion",
+                    source_id=task_id,
+                )
         except Exception:
             logger.warning("Failed to capture result for task_id=%s", task_id, exc_info=True)
 

@@ -15,6 +15,7 @@ functions already do. Never hold a connection across an await.
 """
 import asyncio
 from app import database as db
+from app import memory
 
 
 async def get_task(task_id: str) -> dict | None:
@@ -285,3 +286,42 @@ async def update_plan_step(
 
 async def get_plan_step(step_id: str) -> dict | None:
     return await asyncio.to_thread(db.get_plan_step, step_id)
+
+
+# ── Memory wrappers ─────────────────────────────────────────────────
+
+
+async def store_memory(
+    category: str,
+    content: str,
+    project: str | None = None,
+    source: str = "conversation",
+    source_id: str | None = None,
+    metadata: str | None = None,
+    expires_at: str | None = None,
+) -> str:
+    return await asyncio.to_thread(memory.store_memory, category, content, project, source, source_id, metadata, expires_at)
+
+
+async def retrieve_memories(query: str, project: str | None = None, limit: int = 5) -> list[dict]:
+    return await asyncio.to_thread(memory.retrieve_memories, query, project, limit)
+
+
+async def get_core_facts() -> list[dict]:
+    return await asyncio.to_thread(memory.get_core_facts)
+
+
+async def update_memory(id: str, content: str) -> None:
+    return await asyncio.to_thread(memory.update_memory, id, content)
+
+
+async def delete_memory(id: str) -> None:
+    return await asyncio.to_thread(memory.delete_memory, id)
+
+
+async def get_memories_by_source(source: str, source_id: str | None) -> list[dict]:
+    return await asyncio.to_thread(memory.get_memories_by_source, source, source_id)
+
+
+async def get_recent_memories(project: str | None = None, limit: int = 10) -> list[dict]:
+    return await asyncio.to_thread(memory.get_recent_memories, project, limit)

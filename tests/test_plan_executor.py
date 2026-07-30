@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import app.database as db
 from app.workers.base import WorkerResult, WorkerResultStatus, WorkerStatus
 from app.plan_executor import PlanExecutor
+import app.memory as memory
 
 
 @pytest.fixture(autouse=True)
@@ -761,3 +762,108 @@ async def test_stop_cancels_running_tasks():
     assert plan_id in pe._running_plans
     await pe.stop()
     assert plan_id not in pe._running_plans
+
+
+# ── Plan-completion memory write (Step 2: F1 memory wiring) ────────────
+
+
+@pytest.mark.asyncio
+async def test_plan_completed_writes_completion_memory():
+    w = _make_worker("opencode", _async_return(WorkerResult(
+        status=WorkerResultStatus.COMPLETED, output="done")))
+    reg = MagicMock()
+    reg.get_by_name = MagicMock(return_value=w)
+    oc = MagicMock()
+    oc.wait_for_completion = _async_return(True)
+    oc.fetch_task_result_text = _async_return(None)
+
+    pe = PlanExecutor(worker_registry=reg, opencode_supervisor=oc,
+                      conn_manager=MagicMock(), step_timeout=5.0)
+    plan_id = seed_plan("Memory write test")
+    seed_step(plan_id, 0, "Step 1", "opencode")
+
+    assert await pe.start_plan(plan_id)
+    await _wait_plan_done(pe, plan_id)
+
+    assert db.get_plan(plan_id)["status"] == "completed"
+    memories = memory.get_memories_by_source("plan_completion", plan_id)
+    assert len(memories) == 1
+    assert "completed" in memories[0]["content"].lower()
+    assert "Memory write test" in memories[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_plan_failed_writes_completion_memory():
+    w = _make_worker("opencode", _async_return(WorkerResult(
+        status=WorkerResultStatus.FAILED, error="something broke")))
+    reg = MagicMock()
+    reg.get_by_name = MagicMock(return_value=w)
+
+    pe = PlanExecutor(worker_registry=reg, opencode_supervisor=MagicMock(),
+                      conn_manager=MagicMock(), step_timeout=5.0)
+    plan_id = seed_plan("Failed plan memory")
+    seed_step(plan_id, 0, "Doomed step", "opencode", on_failure="stop")
+
+    assert await pe.start_plan(plan_id)
+    await _wait_plan_done(pe, plan_id)
+
+    assert db.get_plan(plan_id)["status"] == "failed"
+    memories = memory.get_memories_by_source("plan_completion", plan_id)
+    assert len(memories) == 1
+    content = memories[0]["content"]
+    assert "failed" in content.lower()
+    assert "Doomed step" in content
+    assert "something broke" in content
+
+
+@pytest.mark.asyncio
+async def test_plan_paused_writes_no_completion_memory():
+    w = _make_worker("opencode", _async_return(WorkerResult(
+        status=WorkerResultStatus.FAILED, error="needs human")))
+    reg = MagicMock()
+    reg.get_by_name = MagicMock(return_value=w)
+    cm = MagicMock()
+
+    pe = PlanExecutor(worker_registry=reg, opencode_supervisor=MagicMock(),
+                      conn_manager=cm, step_timeout=5.0)
+    plan_id = seed_plan("Paused no memory")
+    seed_step(plan_id, 0, "Needs human", "opencode", on_failure="escalate")
+
+    assert await pe.start_plan(plan_id)
+    await _wait_plan_done(pe, plan_id)
+
+    assert db.get_plan(plan_id)["status"] == "paused"
+    memories = memory.get_memories_by_source("plan_completion", plan_id)
+    assert len(memories) == 0
+
+
+@pytest.mark.asyncio
+async def test_plan_completion_memory_failure_does_not_block_plan():
+    w = _make_worker("opencode", _async_return(WorkerResult(
+        status=WorkerResultStatus.COMPLETED, output="done")))
+    reg = MagicMock()
+    reg.get_by_name = MagicMock(return_value=w)
+    oc = MagicMock()
+    oc.wait_for_completion = _async_return(True)
+    oc.fetch_task_result_text = _async_return(None)
+
+    pe = PlanExecutor(worker_registry=reg, opencode_supervisor=oc,
+                      conn_manager=MagicMock(), step_timeout=5.0)
+    plan_id = seed_plan("Memory should fail silently")
+
+    original_store = memory.store_memory
+    called = [False]
+
+    def failing_store(*args, **kwargs):
+        called[0] = True
+        raise RuntimeError("simulated DB failure")
+
+    memory.store_memory = failing_store
+    try:
+        seed_step(plan_id, 0, "Step 1", "opencode")
+        assert await pe.start_plan(plan_id)
+        await _wait_plan_done(pe, plan_id)
+        assert called[0]
+        assert db.get_plan(plan_id)["status"] == "completed"
+    finally:
+        memory.store_memory = original_store

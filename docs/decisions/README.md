@@ -126,3 +126,4 @@ Every ADR uses the same section structure, in this order:
 | [ADR-025](ADR-025-groq-whisper-stt.md) | Groq Whisper for Speech-to-Text | Accepted |
 | [ADR-026](ADR-026-worker-registry-and-strategist-consultation.md) | Worker Registry and Strategist Consultation | Accepted |
 | [ADR-027](ADR-027-plan-executor-pattern.md) | Plan Executor Pattern | Accepted |
+| [ADR-028](ADR-028-memory-v1-three-tier-model.md) | Memory v1 — Three-Tier Model on SQLite FTS5 | Accepted |

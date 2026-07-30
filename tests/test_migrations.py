@@ -29,8 +29,8 @@ def conn():
 
 def test_fresh_db_applies_all_migrations(conn):
     applied = migrations.migrate(conn)
-    assert applied == [1, 2]
-    assert migrations.current_version(conn) == 2
+    assert applied == [1, 2, 3]
+    assert migrations.current_version(conn) == 3
     row = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='tasks'"
     ).fetchone()
@@ -39,6 +39,10 @@ def test_fresh_db_applies_all_migrations(conn):
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='plans'"
     ).fetchone()
     assert row_plans is not None
+    row_memories = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memories'"
+    ).fetchone()
+    assert row_memories is not None
 
 
 def test_migrate_twice_applies_nothing_the_second_time(conn):
@@ -55,8 +59,8 @@ def test_baseline_adoption_records_version_1_and_applies_later_migrations(conn):
     conn.execute("CREATE TABLE tasks (task_id TEXT)")
     conn.commit()
     applied = migrations.migrate(conn)
-    assert applied == [1, 2]
-    assert migrations.current_version(conn) == 2
+    assert applied == [1, 2, 3]
+    assert migrations.current_version(conn) == 3
 
 
 def test_a_db_already_at_version_2_still_receives_later_migrations(conn, monkeypatch):
@@ -64,46 +68,61 @@ def test_a_db_already_at_version_2_still_receives_later_migrations(conn, monkeyp
     executor): migrate() used to `return []` unconditionally for any DB
     already at version >= 1, silently skipping every later migration.
     This is the case that matters most in production -- the real
-    jarvis.db, and every baseline-adopted DB, is always at version 2
-    after its first migrate() call (migrations 1 + 2)."""
+    jarvis.db, and every baseline-adopted DB, is always at version 2+
+    after its first migrate() call.
+
+    The synthetic next-version migration is derived from
+    max(existing versions) + 1 rather than hardcoded, so this test never
+    collides with a real migration added later (this exact collision --
+    `UNIQUE constraint failed: schema_version.version` -- happened once
+    already when a hardcoded version=2 here collided with the real
+    migration 2 added in the plan executor task)."""
     migrations.migrate(conn)
-    assert migrations.current_version(conn) == 2
+    starting_version = migrations.current_version(conn)
+    assert starting_version >= 2
 
     applied_marker = []
+    next_version = starting_version + 1
 
-    def _migration_003(c: sqlite3.Connection) -> None:
-        c.execute("CREATE TABLE synthetic_v3_table (id INTEGER PRIMARY KEY)")
+    def _synthetic_migration(c: sqlite3.Connection) -> None:
+        c.execute("CREATE TABLE synthetic_next_table (id INTEGER PRIMARY KEY)")
         applied_marker.append(True)
 
     monkeypatch.setattr(
         migrations, "MIGRATIONS",
-        migrations.MIGRATIONS + [(3, "synthetic_test_migration", _migration_003)],
+        migrations.MIGRATIONS + [(next_version, "synthetic_test_migration", _synthetic_migration)],
     )
 
     applied = migrations.migrate(conn)
-    assert applied == [3]
+    assert applied == [next_version]
     assert applied_marker == [True]
-    assert migrations.current_version(conn) == 3
+    assert migrations.current_version(conn) == next_version
     row = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='synthetic_v3_table'"
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='synthetic_next_table'"
     ).fetchone()
     assert row is not None
 
 
 def test_baseline_adopted_db_also_receives_later_migrations(conn, monkeypatch):
     """The other broken path: baseline adoption used to `return [1]`
-    immediately, never falling through to check for version 2+."""
+    immediately, never falling through to check for version 2+.
+
+    Synthetic version derived dynamically -- see the comment on
+    test_a_db_already_at_version_2_still_receives_later_migrations for why."""
     conn.execute("CREATE TABLE tasks (task_id TEXT)")
     conn.commit()
 
-    def _migration_003(c: sqlite3.Connection) -> None:
-        c.execute("CREATE TABLE synthetic_v3_table (id INTEGER PRIMARY KEY)")
+    existing_versions = [v for v, _, _ in migrations.MIGRATIONS]
+    next_version = max(existing_versions) + 1
+
+    def _synthetic_migration(c: sqlite3.Connection) -> None:
+        c.execute("CREATE TABLE synthetic_next_table_2 (id INTEGER PRIMARY KEY)")
 
     monkeypatch.setattr(
         migrations, "MIGRATIONS",
-        migrations.MIGRATIONS + [(3, "synthetic_test_migration", _migration_003)],
+        migrations.MIGRATIONS + [(next_version, "synthetic_test_migration", _synthetic_migration)],
     )
 
     applied = migrations.migrate(conn)
-    assert applied == [1, 2, 3]
-    assert migrations.current_version(conn) == 3
+    assert applied == existing_versions + [next_version]
+    assert migrations.current_version(conn) == next_version

@@ -230,6 +230,13 @@ def test_mode() -> bool:
     return os.environ.get("JARVIS_TEST_MODE") == "1"
 
 
+def user_name() -> str | None:
+    """JARVIS_USER_NAME — the user's name, used in seeded core-fact
+    memories. Default: None (fact is skipped if unset).
+    """
+    return _str("JARVIS_USER_NAME")
+
+
 # ---------------------------------------------------------------------------
 # OpenCode integration
 # ---------------------------------------------------------------------------
@@ -327,6 +334,21 @@ def strategist_model() -> str:
     consultations. Default: opencode-go/deepseek-v4-pro.
     """
     return _str("JARVIS_STRATEGIST_MODEL") or "opencode-go/deepseek-v4-pro"
+
+
+def memory_retrieval_top_k() -> int:
+    """JARVIS_MEMORY_RETRIEVAL_TOP_K — max number of relevant memories
+    retrieved per turn via FTS5 search. Default: 5.
+    """
+    return _int("JARVIS_MEMORY_RETRIEVAL_TOP_K", 5, fallback_on_invalid=True)
+
+
+def memory_context_token_budget() -> int:
+    """JARVIS_MEMORY_CONTEXT_TOKEN_BUDGET — approximate max token budget
+    (chars // 4 heuristic) for the combined core-facts + relevant-memories
+    context block injected per turn. Default: 2000.
+    """
+    return _int("JARVIS_MEMORY_CONTEXT_TOKEN_BUDGET", 2000, fallback_on_invalid=True)
 
 
 def strategist_timeout_seconds() -> int:

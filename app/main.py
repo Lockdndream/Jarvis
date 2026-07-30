@@ -16,6 +16,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import config
+from . import memory
 from . import stt
 from .stt import GroqTranscriptionError
 import httpx
@@ -106,6 +107,10 @@ _SERVER_START_TIME = datetime.now(timezone.utc)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    try:
+        memory.seed_core_facts()
+    except Exception:
+        logger.warning("Core-fact seeding failed; continuing startup", exc_info=True)
     interrupted_task_ids = mark_running_tasks_interrupted()
     mark_running_opencode_tasks_interrupted()
     # Milestone 8.1 real-phone finding: a local task's question/task rows

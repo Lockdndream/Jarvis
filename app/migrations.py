@@ -255,9 +255,36 @@ def _migration_002(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX idx_plans_status ON plans(status)")
 
 
+def _migration_003(conn: sqlite3.Connection) -> None:
+    """Create memories table and FTS5 index for the v1 memory system."""
+
+    conn.execute("""
+        CREATE TABLE memories (
+            id TEXT PRIMARY KEY,
+            category TEXT NOT NULL,
+            project TEXT,
+            content TEXT NOT NULL,
+            source TEXT NOT NULL,
+            source_id TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            expires_at TEXT,
+            metadata TEXT
+        )
+    """)
+    conn.execute("CREATE INDEX idx_memories_category ON memories(category)")
+    conn.execute("CREATE INDEX idx_memories_project ON memories(project)")
+    conn.execute("CREATE INDEX idx_memories_source ON memories(source, source_id)")
+
+    conn.execute("""
+        CREATE VIRTUAL TABLE memories_fts USING fts5(id UNINDEXED, content)
+    """)
+
+
 MIGRATIONS = [
     (1, "current_schema", _migration_001),
     (2, "plans_and_steps", _migration_002),
+    (3, "memories", _migration_003),
 ]
 
 
