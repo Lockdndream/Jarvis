@@ -48,6 +48,7 @@ from .integrations.opencode_supervisor import OpenCodeSupervisor
 from .workers.base import WorkerRegistry
 from .workers.opencode_worker import OpenCodeWorker
 from .workers.strategist_worker import StrategistWorker
+from .plan_executor import PlanExecutor
 from .supervisor.supervisor import Supervisor
 from .supervisor import supervisor as supervisor_module
 from . import push as push_module
@@ -76,7 +77,8 @@ executor = Executor(task_manager, opencode_supervisor)
 worker_registry = WorkerRegistry()
 worker_registry.register(OpenCodeWorker(opencode_supervisor))
 worker_registry.register(StrategistWorker())
-supervisor = Supervisor(task_manager, opencode_supervisor, conn_manager, worker_registry)
+plan_executor = PlanExecutor(worker_registry, opencode_supervisor, conn_manager)
+supervisor = Supervisor(task_manager, opencode_supervisor, conn_manager, worker_registry, plan_executor)
 attention_scheduler = AttentionScheduler(conn_manager)
 voice_session_manager = VoiceSessionManager(supervisor)
 supervisor.set_voice_session_manager(voice_session_manager)
@@ -115,12 +117,14 @@ async def lifespan(app: FastAPI):
     for task_id in interrupted_task_ids:
         await attention_manager.cancel_for_task(task_id)
     await opencode_supervisor.start()
+    await plan_executor.start()
     await attention_scheduler.start()
     await voice_session_reaper.start()
     logger.info("Jarvis server started")
     yield
     await voice_session_reaper.stop()
     await attention_scheduler.stop()
+    await plan_executor.stop()
     await opencode_supervisor.stop()
     await task_manager.shutdown()
     logger.info("Jarvis server shut down")

@@ -336,6 +336,15 @@ def strategist_timeout_seconds() -> int:
     return _int("JARVIS_STRATEGIST_TIMEOUT_SECONDS", 120, fallback_on_invalid=True)
 
 
+def plan_step_timeout_seconds() -> int:
+    """JARVIS_PLAN_STEP_TIMEOUT_SECONDS — max time to wait for a single
+    DISPATCHED plan step (an OpenCode task) to complete before treating
+    it as failed. Default: 1800 (30 minutes — OpenCode coding tasks can
+    run long; this is a much larger bound than the strategist's 120s).
+    """
+    return _int("JARVIS_PLAN_STEP_TIMEOUT_SECONDS", 1800, fallback_on_invalid=True)
+
+
 def strategist_runtime_dir() -> str:
     """JARVIS_STRATEGIST_RUNTIME_DIR — isolated runtime directory for
     strategist `opencode run` invocations, separate from the OpenCode server's

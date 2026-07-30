@@ -9,6 +9,8 @@ import json
 import logging
 from typing import Any
 
+import uuid as _uuid
+
 from app import db_async as adb
 from app.supervisor.projects import resolve_project, get_projects
 from app.supervisor.context import build_context
@@ -16,6 +18,8 @@ from app.workers.opencode_worker import OpenCodeWorker
 from app.workers.base import WorkerResultStatus
 
 logger = logging.getLogger(__name__)
+
+_VALID_ON_FAILURE = {"continue", "stop", "escalate"}
 
 
 class ToolRegistry:
@@ -27,11 +31,13 @@ class ToolRegistry:
         opencode_supervisor: Any = None,
         connection_manager: Any = None,
         worker_registry: Any = None,
+        plan_executor: Any = None,
     ) -> None:
         self._tm = task_manager
         self._oc = opencode_supervisor
         self._cm = connection_manager
         self._worker_registry = worker_registry
+        self._plan_executor = plan_executor
         self._oc_worker = OpenCodeWorker(opencode_supervisor) if opencode_supervisor else None
         self._vsm: Any = None
         self._tools: dict[str, dict] = {}
@@ -374,6 +380,84 @@ class ToolRegistry:
             return f"Error consulting strategist: {result.error}"
         return result.output or "(strategist returned no output)"
 
+    async def _create_plan(self, title: str, steps: list[dict]) -> str:
+        if not self._plan_executor:
+            return "Error: plan executor not available"
+        for i, step in enumerate(steps):
+            on_failure = step.get("on_failure", "stop")
+            if on_failure not in _VALID_ON_FAILURE:
+                return (
+                    f"Error: step {i} has invalid on_failure '{on_failure}'. "
+                    f"Must be one of: {', '.join(sorted(_VALID_ON_FAILURE))}"
+                )
+        plan_id = f"plan_{_uuid.uuid4().hex[:12]}"
+        await adb.create_plan_record(plan_id, title)
+        for i, step in enumerate(steps):
+            step_id = f"step_{_uuid.uuid4().hex[:12]}"
+            await adb.create_plan_step_record(
+                step_id, plan_id, i,
+                description=step.get("description", ""),
+                worker_name=step.get("worker_name", ""),
+                on_failure=step.get("on_failure", "stop"),
+                verification=step.get("verification"),
+            )
+        return f"Plan '{plan_id}' created with {len(steps)} steps."
+
+    async def _start_plan(self, plan_id: str) -> str:
+        if not self._plan_executor:
+            return "Error: plan executor not available"
+        ok = await self._plan_executor.start_plan(plan_id)
+        if not ok:
+            return f"Could not start plan '{plan_id}' — it may already be running or no longer pending."
+        return f"Plan '{plan_id}' is now running in the background."
+
+    async def _plan_status(self, plan_id: str) -> str:
+        if not self._plan_executor:
+            return "Error: plan executor not available"
+        plan = await adb.get_plan(plan_id)
+        if not plan:
+            return f"Plan '{plan_id}' not found."
+        steps = await adb.get_plan_steps(plan_id)
+        lines = [
+            f"Plan '{plan_id}': {plan['title']}",
+            f"Status: {plan['status']}",
+            f"Current step: {plan['current_step_index']} of {len(steps)}",
+            "Steps:",
+        ]
+        for s in steps:
+            extra = ""
+            if s["status"] == "failed" and s.get("error"):
+                extra = f" — {s['error']}"
+            lines.append(
+                f"  [{s['step_index']}] {s['description'][:80]} "
+                f"(worker={s['worker_name']}, status={s['status']}){extra}"
+            )
+        return "\n".join(lines)
+
+    async def _resume_plan(self, plan_id: str, instruction: str) -> str:
+        if not self._plan_executor:
+            return "Error: plan executor not available"
+        try:
+            await self._plan_executor.resume_plan(plan_id, instruction)
+        except ValueError as e:
+            return str(e)
+        return f"Plan '{plan_id}' resumed with instruction '{instruction}'."
+
+    async def _list_plans(self, count: int = 10) -> str:
+        if not self._plan_executor:
+            return "Error: plan executor not available"
+        if count < 1:
+            count = 10
+        if count > 50:
+            count = 50
+        plans = await adb.get_recent_plans(count)
+        if not plans:
+            return "No plans found."
+        lines = [f"Recent plans ({len(plans)}):"]
+        for p in plans:
+            lines.append(f"  - [{p['plan_id']}] {p['title']} ({p['status']})")
+        return "\n".join(lines)
+
     def _register_all(self) -> None:
         self._register("get_attention", "Get summary of everything needing user attention", {"type": "object", "properties": {}, "required": []}, self._get_attention)
         self._register("list_tasks", "List all active, waiting, and recent tasks", {"type": "object", "properties": {}, "required": []}, self._list_tasks)
@@ -407,6 +491,48 @@ class ToolRegistry:
             },
             self._consult_strategist,
         )
+        self._register(
+            "create_plan",
+            "Create a new sequential plan with the given title and steps. Each step needs a description and worker_name; optional on_failure (stop/continue/escalate, default stop) and verification.",
+            {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Plan title"},
+                    "steps": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "description": {"type": "string", "description": "What this step should do"},
+                                "worker_name": {"type": "string", "description": "Worker to execute this step"},
+                                "on_failure": {"type": "string", "enum": ["continue", "stop", "escalate"], "description": "What to do if this step fails (default: stop)"},
+                                "verification": {"type": "string", "description": "Optional verification instruction"},
+                            },
+                            "required": ["description", "worker_name"],
+                        },
+                        "description": "Ordered list of steps",
+                    },
+                },
+                "required": ["title", "steps"],
+            },
+            self._create_plan,
+        )
+        self._register("start_plan", "Start executing a plan that is currently pending", {"type": "object", "properties": {"plan_id": {"type": "string", "description": "Plan ID to start"}}, "required": ["plan_id"]}, self._start_plan)
+        self._register("plan_status", "Get the detailed status of a plan and all its steps", {"type": "object", "properties": {"plan_id": {"type": "string", "description": "Plan ID to inspect"}}, "required": ["plan_id"]}, self._plan_status)
+        self._register(
+            "resume_plan",
+            "Resume a paused plan with one of: retry (re-run the failed step), skip (skip it and continue), or abort (mark plan as failed).",
+            {
+                "type": "object",
+                "properties": {
+                    "plan_id": {"type": "string", "description": "Plan ID to resume"},
+                    "instruction": {"type": "string", "enum": ["retry", "skip", "abort"], "description": "Resume instruction"},
+                },
+                "required": ["plan_id", "instruction"],
+            },
+            self._resume_plan,
+        )
+        self._register("list_plans", "List recent plans", {"type": "object", "properties": {"count": {"type": "integer", "description": "Number of plans (default 10)", "default": 10}}, "required": []}, self._list_plans)
 
 
 def _format_context_for_strategist(context: dict) -> str:

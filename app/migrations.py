@@ -213,8 +213,51 @@ def _migration_001(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX idx_voice_sessions_conversation_id ON voice_sessions(conversation_id)")
 
 
+def _migration_002(conn: sqlite3.Connection) -> None:
+    """Create plans and plan_steps tables for the plan executor."""
+
+    conn.execute("""
+        CREATE TABLE plans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            plan_id TEXT UNIQUE NOT NULL,
+            title TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            current_step_index INTEGER NOT NULL DEFAULT 0,
+            context_json TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE plan_steps (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            step_id TEXT UNIQUE NOT NULL,
+            plan_id TEXT NOT NULL,
+            step_index INTEGER NOT NULL,
+            description TEXT NOT NULL,
+            worker_name TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            worker_task_id TEXT,
+            result TEXT,
+            error TEXT,
+            started_at TEXT,
+            completed_at TEXT,
+            depends_on_json TEXT,
+            on_failure TEXT NOT NULL DEFAULT 'stop',
+            verification TEXT,
+            verification_task_id TEXT,
+            verification_result TEXT,
+            verification_error TEXT
+        )
+    """)
+
+    conn.execute("CREATE INDEX idx_plan_steps_plan_id ON plan_steps(plan_id)")
+    conn.execute("CREATE INDEX idx_plans_status ON plans(status)")
+
+
 MIGRATIONS = [
     (1, "current_schema", _migration_001),
+    (2, "plans_and_steps", _migration_002),
 ]
 
 
@@ -243,6 +286,7 @@ def migrate(conn: sqlite3.Connection) -> list[int]:
     """)
 
     ver = current_version(conn)
+    applied: list[int] = []
 
     if ver == 0:
         # Check for baseline adoption
@@ -254,13 +298,16 @@ def migrate(conn: sqlite3.Connection) -> list[int]:
                 "INSERT INTO schema_version (version, applied_at) VALUES (1, ?)",
                 (_utcnow(),),
             )
-            conn.commit()
-            return [1]
+            applied.append(1)
+            ver = 1
 
-    if ver >= 1:
-        return []
-
-    applied: list[int] = []
+    # Deliberately no "if ver >= N: return" short-circuit here — the loop's
+    # own "if version > ver" check is what makes this idempotent, for both
+    # a freshly-versioned DB and a baseline-adopted one. A short-circuit on
+    # ver was previously here and silently skipped every migration after
+    # the first for any DB already at version 1 (which includes every
+    # baseline-adopted DB and the real jarvis.db) — found while adding the
+    # plans/plan_steps migration, which would otherwise never have applied.
     for version, name, fn in sorted(MIGRATIONS, key=lambda m: m[0]):
         if version > ver:
             fn(conn)

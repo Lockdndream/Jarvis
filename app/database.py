@@ -1246,3 +1246,158 @@ def release_voice_session_lease(attention_request_id: str, voice_session_id: str
     )
     conn.commit()
     conn.close()
+
+
+# ── Plans and plan steps ─────────────────────────────────────────────
+
+
+def create_plan_record(plan_id: str, title: str, context_json: str | None = None) -> None:
+    conn = get_conn()
+    now = utcnow()
+    conn.execute(
+        "INSERT INTO plans (plan_id, title, status, created_at, updated_at, current_step_index, context_json) "
+        "VALUES (?, ?, 'pending', ?, ?, 0, ?)",
+        (plan_id, title, now, now, context_json),
+    )
+    conn.commit()
+    conn.close()
+
+
+def create_plan_step_record(
+    step_id: str,
+    plan_id: str,
+    step_index: int,
+    description: str,
+    worker_name: str,
+    on_failure: str = "stop",
+    verification: str | None = None,
+    depends_on_json: str | None = None,
+) -> None:
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO plan_steps (step_id, plan_id, step_index, description, worker_name, "
+        "status, on_failure, verification, depends_on_json) "
+        "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
+        (step_id, plan_id, step_index, description, worker_name,
+         on_failure, verification, depends_on_json),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_plan(plan_id: str) -> dict | None:
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT * FROM plans WHERE plan_id=?", (plan_id,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_plan_steps(plan_id: str) -> list[dict]:
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM plan_steps WHERE plan_id=? ORDER BY step_index ASC",
+        (plan_id,),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_recent_plans(limit: int = 20) -> list[dict]:
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM plans ORDER BY created_at DESC LIMIT ?", (limit,)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_plans_by_status(status: str) -> list[dict]:
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM plans WHERE status=? ORDER BY created_at ASC",
+        (status,),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def claim_plan_start(plan_id: str) -> bool:
+    conn = get_conn()
+    now = utcnow()
+    cur = conn.execute(
+        "UPDATE plans SET status='running', updated_at=? WHERE plan_id=? AND status='pending'",
+        (now, plan_id),
+    )
+    conn.commit()
+    conn.close()
+    return cur.rowcount == 1
+
+
+def update_plan_status(plan_id: str, status: str, current_step_index: int | None = None) -> None:
+    conn = get_conn()
+    now = utcnow()
+    if current_step_index is not None:
+        conn.execute(
+            "UPDATE plans SET status=?, current_step_index=?, updated_at=? WHERE plan_id=?",
+            (status, current_step_index, now, plan_id),
+        )
+    else:
+        conn.execute(
+            "UPDATE plans SET status=?, updated_at=? WHERE plan_id=?",
+            (status, now, plan_id),
+        )
+    conn.commit()
+    conn.close()
+
+
+def update_plan_step(
+    step_id: str,
+    *,
+    status: str | None = None,
+    worker_task_id: str | None = None,
+    result: str | None = None,
+    error: str | None = None,
+    started_at: str | None = None,
+    completed_at: str | None = None,
+    verification_task_id: str | None = None,
+    verification_result: str | None = None,
+    verification_error: str | None = None,
+) -> None:
+    field_map = {
+        "status": status,
+        "worker_task_id": worker_task_id,
+        "result": result,
+        "error": error,
+        "started_at": started_at,
+        "completed_at": completed_at,
+        "verification_task_id": verification_task_id,
+        "verification_result": verification_result,
+        "verification_error": verification_error,
+    }
+    set_parts: list[str] = []
+    params: list = []
+    for col, val in field_map.items():
+        if val is not None:
+            set_parts.append(f"{col}=?")
+            params.append(val)
+    if not set_parts:
+        return
+    params.append(step_id)
+    conn = get_conn()
+    conn.execute(
+        f"UPDATE plan_steps SET {', '.join(set_parts)} WHERE step_id=?",
+        params,
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_plan_step(step_id: str) -> dict | None:
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT * FROM plan_steps WHERE step_id=?", (step_id,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None

@@ -125,3 +125,4 @@ Every ADR uses the same section structure, in this order:
 | [ADR-024](ADR-024-sqlite-write-concurrency-model.md) | SQLite Write-Concurrency Model | Accepted |
 | [ADR-025](ADR-025-groq-whisper-stt.md) | Groq Whisper for Speech-to-Text | Accepted |
 | [ADR-026](ADR-026-worker-registry-and-strategist-consultation.md) | Worker Registry and Strategist Consultation | Accepted |
+| [ADR-027](ADR-027-plan-executor-pattern.md) | Plan Executor Pattern | Accepted |
