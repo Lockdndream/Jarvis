@@ -1,14 +1,32 @@
 import os
 import sys
+import tempfile
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import app.database as db
 from app.supervisor.tools import ToolRegistry
 from app.supervisor.supervisor import Supervisor
 from app.workers.base import WorkerRegistry, WorkerResult, WorkerResultStatus, WorkerStatus, Worker
+
+
+@pytest.fixture(autouse=True)
+def test_db():
+    # consult_strategist calls the real build_context(), which reads
+    # actual tables via app.database -- needs real schema, unlike this
+    # file's other tests which mock everything else.
+    old_path = db.DB_PATH
+    f, path = tempfile.mkstemp(suffix=".db")
+    os.close(f)
+    db.DB_PATH = path
+    db.init_db()
+    yield
+    db.DB_PATH = old_path
+    if os.path.exists(path):
+        os.unlink(path)
 
 
 class FakeStrategistWorker(Worker):
