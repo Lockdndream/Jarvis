@@ -617,7 +617,7 @@ class _FakeOpenCodeSupervisor:
         self.sent = []
         self.adapter = _FakeAdapter(self.sent)
 
-    async def start_session(self, project_dir, instruction):
+    async def start_session(self, project_dir, instruction, provider_id=None, model_id=None):
         import uuid
         task_id = f"oc_{uuid.uuid4().hex[:12]}"
         session_id = f"ses_{uuid.uuid4().hex[:8]}"

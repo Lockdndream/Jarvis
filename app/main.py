@@ -45,6 +45,9 @@ from .database import (
 from .executor import Executor
 from .task_manager import TaskManager
 from .integrations.opencode_supervisor import OpenCodeSupervisor
+from .workers.base import WorkerRegistry
+from .workers.opencode_worker import OpenCodeWorker
+from .workers.strategist_worker import StrategistWorker
 from .supervisor.supervisor import Supervisor
 from .supervisor import supervisor as supervisor_module
 from . import push as push_module
@@ -70,7 +73,10 @@ conn_manager = ConnectionManager()
 task_manager = TaskManager(conn_manager)
 opencode_supervisor = OpenCodeSupervisor(conn_manager, task_manager)
 executor = Executor(task_manager, opencode_supervisor)
-supervisor = Supervisor(task_manager, opencode_supervisor, conn_manager)
+worker_registry = WorkerRegistry()
+worker_registry.register(OpenCodeWorker(opencode_supervisor))
+worker_registry.register(StrategistWorker())
+supervisor = Supervisor(task_manager, opencode_supervisor, conn_manager, worker_registry)
 attention_scheduler = AttentionScheduler(conn_manager)
 voice_session_manager = VoiceSessionManager(supervisor)
 supervisor.set_voice_session_manager(voice_session_manager)

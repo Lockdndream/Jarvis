@@ -118,16 +118,25 @@ def ensure_isolated_runtime_provisioned(runtime_dir: str) -> None:
 
     auth_path = os.path.join(runtime_dir, "data", "opencode", "auth.json")
     if not os.path.exists(auth_path):
-        key = config.opencode_openrouter_key() or config.llm_api_key()
-        if key:
+        auth_data: dict = {}
+
+        openrouter_key = config.opencode_openrouter_key() or config.llm_api_key()
+        if openrouter_key:
+            auth_data["openrouter"] = {"type": "api", "key": openrouter_key}
+
+        opencode_go_key = config.opencode_go_key()
+        if opencode_go_key:
+            auth_data["opencode-go"] = {"type": "api", "key": opencode_go_key}
+
+        if auth_data:
             os.makedirs(os.path.dirname(auth_path), exist_ok=True)
             with open(auth_path, "w", encoding="utf-8") as f:
-                json.dump({"openrouter": {"type": "api", "key": key}}, f)
-            logger.info("Provisioned isolated OpenCode runtime provider auth from environment (key not logged)")
+                json.dump(auth_data, f)
+            logger.info("Provisioned isolated OpenCode runtime provider auth from environment (key(s) not logged)")
         else:
             logger.warning(
-                "No JARVIS_OPENCODE_OPENROUTER_KEY or JARVIS_LLM_API_KEY set — isolated OpenCode "
-                "runtime will have no provider credentials until one is configured"
+                "No JARVIS_OPENCODE_OPENROUTER_KEY, JARVIS_LLM_API_KEY, or JARVIS_OPENCODE_GO_KEY "
+                "set — isolated OpenCode runtime will have no provider credentials until one is configured"
             )
 
 

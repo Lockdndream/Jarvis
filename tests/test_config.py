@@ -96,3 +96,39 @@ class TestSubprocessEnv:
         env = config.subprocess_env({"EXTRA": "value"})
         assert env["EXTRA"] == "value"
         assert "PATH" in env
+
+
+class TestStrategistConfig:
+    def test_strategist_model_default(self, monkeypatch):
+        monkeypatch.delenv("JARVIS_STRATEGIST_MODEL", raising=False)
+        assert config.strategist_model() == "opencode-go/deepseek-v4-pro"
+
+    def test_strategist_model_override(self, monkeypatch):
+        monkeypatch.setenv("JARVIS_STRATEGIST_MODEL", "opencode-go/kimi-k3")
+        assert config.strategist_model() == "opencode-go/kimi-k3"
+
+    def test_strategist_timeout_seconds_default(self, monkeypatch):
+        monkeypatch.delenv("JARVIS_STRATEGIST_TIMEOUT_SECONDS", raising=False)
+        assert config.strategist_timeout_seconds() == 120
+
+    def test_strategist_timeout_seconds_override(self, monkeypatch):
+        monkeypatch.setenv("JARVIS_STRATEGIST_TIMEOUT_SECONDS", "300")
+        assert config.strategist_timeout_seconds() == 300
+
+    def test_strategist_timeout_seconds_invalid_fallback(self, monkeypatch):
+        monkeypatch.setenv("JARVIS_STRATEGIST_TIMEOUT_SECONDS", "not-a-number")
+        assert config.strategist_timeout_seconds() == 120
+
+    def test_strategist_runtime_dir_default_is_sibling_of_opencode_runtime_dir(self, monkeypatch):
+        monkeypatch.delenv("JARVIS_STRATEGIST_RUNTIME_DIR", raising=False)
+        monkeypatch.delenv("JARVIS_OPENCODE_RUNTIME_DIR", raising=False)
+        strategist = config.strategist_runtime_dir()
+        opencode = config.opencode_runtime_dir()
+        assert strategist != opencode
+        assert strategist.endswith("JarvisOpenCodeRuntime_strategist")
+        assert os.path.dirname(strategist) == os.path.dirname(opencode)
+
+    def test_strategist_runtime_dir_override(self, monkeypatch, tmp_path):
+        custom = str(tmp_path / "strategist-runtime")
+        monkeypatch.setenv("JARVIS_STRATEGIST_RUNTIME_DIR", custom)
+        assert config.strategist_runtime_dir() == custom

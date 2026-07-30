@@ -155,9 +155,31 @@ def test_provisioning_prefers_dedicated_opencode_key_over_llm_key(tmp_path, monk
 def test_provisioning_without_any_key_does_not_write_auth(tmp_path, monkeypatch):
     monkeypatch.delenv("JARVIS_LLM_API_KEY", raising=False)
     monkeypatch.delenv("JARVIS_OPENCODE_OPENROUTER_KEY", raising=False)
+    monkeypatch.delenv("JARVIS_OPENCODE_GO_KEY", raising=False)
     ensure_isolated_runtime_provisioned(str(tmp_path))
     auth_path = tmp_path / "data" / "opencode" / "auth.json"
     assert not auth_path.exists()
+
+
+def test_provisioning_writes_opencode_go_key_when_present(tmp_path, monkeypatch):
+    monkeypatch.delenv("JARVIS_LLM_API_KEY", raising=False)
+    monkeypatch.delenv("JARVIS_OPENCODE_OPENROUTER_KEY", raising=False)
+    monkeypatch.setenv("JARVIS_OPENCODE_GO_KEY", "sk-go-test-fake-key-not-real")
+    ensure_isolated_runtime_provisioned(str(tmp_path))
+    auth_path = tmp_path / "data" / "opencode" / "auth.json"
+    assert auth_path.exists()
+    data = json.loads(auth_path.read_text())
+    assert data == {"opencode-go": {"type": "api", "key": "sk-go-test-fake-key-not-real"}}
+
+
+def test_provisioning_writes_both_keys_when_both_present(tmp_path, monkeypatch):
+    monkeypatch.setenv("JARVIS_OPENCODE_OPENROUTER_KEY", "sk-or-v1-test")
+    monkeypatch.setenv("JARVIS_OPENCODE_GO_KEY", "sk-go-test")
+    ensure_isolated_runtime_provisioned(str(tmp_path))
+    auth_path = tmp_path / "data" / "opencode" / "auth.json"
+    data = json.loads(auth_path.read_text())
+    assert data["openrouter"]["key"] == "sk-or-v1-test"
+    assert data["opencode-go"]["key"] == "sk-go-test"
 
 
 def test_provisioning_never_overwrites_existing_isolated_auth(tmp_path, monkeypatch):

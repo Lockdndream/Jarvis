@@ -110,10 +110,11 @@ Use the provided function definitions to interact with Jarvis services.
 class Supervisor:
     """Main supervisor orchestrator."""
 
-    def __init__(self, task_manager: Any = None, opencode_supervisor: Any = None, connection_manager: Any = None) -> None:
+    def __init__(self, task_manager: Any = None, opencode_supervisor: Any = None, connection_manager: Any = None, worker_registry: Any = None) -> None:
         self.tm = task_manager
         self.oc = opencode_supervisor
-        self.tools = ToolRegistry(task_manager, opencode_supervisor, connection_manager)
+        self.worker_registry = worker_registry
+        self.tools = ToolRegistry(task_manager, opencode_supervisor, connection_manager, worker_registry)
         self._llm: LLMProvider | FakeLLMProvider | None = None
         self._configure_llm()
 

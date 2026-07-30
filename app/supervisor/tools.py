@@ -11,6 +11,9 @@ from typing import Any
 
 from app import db_async as adb
 from app.supervisor.projects import resolve_project, get_projects
+from app.supervisor.context import build_context
+from app.workers.opencode_worker import OpenCodeWorker
+from app.workers.base import WorkerResultStatus
 
 logger = logging.getLogger(__name__)
 
@@ -23,10 +26,13 @@ class ToolRegistry:
         task_manager: Any = None,
         opencode_supervisor: Any = None,
         connection_manager: Any = None,
+        worker_registry: Any = None,
     ) -> None:
         self._tm = task_manager
         self._oc = opencode_supervisor
         self._cm = connection_manager
+        self._worker_registry = worker_registry
+        self._oc_worker = OpenCodeWorker(opencode_supervisor) if opencode_supervisor else None
         self._vsm: Any = None
         self._tools: dict[str, dict] = {}
         self._register_all()
@@ -136,16 +142,16 @@ class ToolRegistry:
         return "\n".join(lines)
 
     async def _start_opencode_task(self, project_alias: str, instruction: str) -> str:
-        if not self._oc:
+        if not self._oc_worker:
             return "Error: OpenCode supervisor not available"
         alias, path = resolve_project(project_alias)
         if not alias:
             return f"Cannot start task: {path}"
-        try:
-            result = await self._oc.start_session(path, instruction)
-            return f"Task started: {result['task_id']} (session {result['session_id'][:20]}). Instruction: {instruction[:100]}"
-        except Exception as e:
-            return f"Error starting task: {e}"
+        result = await self._oc_worker.invoke(instruction, project_dir=path)
+        if result.status == WorkerResultStatus.FAILED:
+            return f"Error starting task: {result.error}"
+        session_id = result.metadata.get("session_id") or ""
+        return f"Task started: {result.task_id} (session {session_id[:20]}). Instruction: {instruction[:100]}"
 
     async def _send_opencode_instruction(self, task_id: str, instruction: str) -> str:
         if not self._oc:
@@ -352,6 +358,22 @@ class ToolRegistry:
             return f"Voice session '{voice_session_id}' not found"
         return f"Voice session {voice_session_id} closed"
 
+    async def _consult_strategist(self, question: str) -> str:
+        if not self._worker_registry:
+            return "Error: strategist not available"
+        worker = self._worker_registry.get_by_name("strategist")
+        if not worker:
+            return "Error: strategist not available"
+        context = await asyncio.to_thread(build_context)
+        prompt = (
+            f"{_format_context_for_strategist(context)}\n\n"
+            f"Question for the strategist: {question}"
+        )
+        result = await worker.invoke(prompt)
+        if result.status == WorkerResultStatus.FAILED:
+            return f"Error consulting strategist: {result.error}"
+        return result.output or "(strategist returned no output)"
+
     def _register_all(self) -> None:
         self._register("get_attention", "Get summary of everything needing user attention", {"type": "object", "properties": {}, "required": []}, self._get_attention)
         self._register("list_tasks", "List all active, waiting, and recent tasks", {"type": "object", "properties": {}, "required": []}, self._list_tasks)
@@ -370,3 +392,36 @@ class ToolRegistry:
         self._register("resume_attention", "Mark a deferred AttentionRequest as due now, re-evaluating contact policy immediately", {"type": "object", "properties": {"attention_request_id": {"type": "string", "description": "Attention request ID"}}, "required": ["attention_request_id"]}, self._resume_attention)
         self._register("open_voice_session", "Open a voice session, optionally bound to a specific AttentionRequest for scoped answer resolution", {"type": "object", "properties": {"conversation_id": {"type": "string", "description": "Conversation ID"}, "attention_request_id": {"type": "string", "description": "Optional AttentionRequest ID to bind"}}, "required": ["conversation_id"]}, self._open_voice_session)
         self._register("close_voice_session", "Close an open voice session", {"type": "object", "properties": {"voice_session_id": {"type": "string", "description": "Voice session ID"}}, "required": ["voice_session_id"]}, self._close_voice_session)
+        self._register(
+            "consult_strategist",
+            "Consult the strategist — an AI planning/review advisor — about a "
+            "complex question, plan, or decision. Use this when you want a "
+            "second opinion before proceeding with something significant, or "
+            "need help thinking through a plan.",
+            {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "The question or topic to consult the strategist about"}
+                },
+                "required": ["question"],
+            },
+            self._consult_strategist,
+        )
+
+
+def _format_context_for_strategist(context: dict) -> str:
+    parts = []
+    projects = context.get("projects", [])
+    if projects:
+        parts.append("Safe projects: " + ", ".join(f"{p['alias']} ({p['display_name']})" for p in projects))
+    active = context.get("active_tasks", [])
+    if active:
+        parts.append("Active tasks:")
+        for t in active:
+            parts.append(f"  - {t['id']}: {t['name']} [{t['status']}] ({t['type']})")
+    pending = context.get("pending_questions", [])
+    if pending:
+        parts.append("Pending questions:")
+        for q in pending:
+            parts.append(f"  - task={q['task_id']}: {q['question']}")
+    return "\n".join(parts) if parts else "No active project context."

@@ -283,6 +283,14 @@ def opencode_openrouter_key() -> str | None:
     return _str("JARVIS_OPENCODE_OPENROUTER_KEY")
 
 
+def opencode_go_key() -> str | None:
+    """JARVIS_OPENCODE_GO_KEY — API key for the "opencode-go" provider,
+    used to provision isolated OpenCode auth for opencode-go/* CLI models
+    (e.g. the strategist worker). Default: unset.
+    """
+    return _str("JARVIS_OPENCODE_GO_KEY")
+
+
 def opencode_model_provider_id_default() -> str:
     """JARVIS_OPENCODE_MODEL_PROVIDER_ID — provider id for OpenCode delegation.
 
@@ -312,6 +320,35 @@ def opencode_credit_threshold_usd() -> float:
     before paid delegation. Default: 1.0
     """
     return _float("JARVIS_OPENCODE_CREDIT_THRESHOLD_USD", 1.0)
+
+
+def strategist_model() -> str:
+    """JARVIS_STRATEGIST_MODEL — OpenCode Go model used for strategist
+    consultations. Default: opencode-go/deepseek-v4-pro.
+    """
+    return _str("JARVIS_STRATEGIST_MODEL") or "opencode-go/deepseek-v4-pro"
+
+
+def strategist_timeout_seconds() -> int:
+    """JARVIS_STRATEGIST_TIMEOUT_SECONDS — timeout for a strategist
+    consultation subprocess call. Default: 120.
+    """
+    return _int("JARVIS_STRATEGIST_TIMEOUT_SECONDS", 120, fallback_on_invalid=True)
+
+
+def strategist_runtime_dir() -> str:
+    """JARVIS_STRATEGIST_RUNTIME_DIR — isolated runtime directory for
+    strategist `opencode run` invocations, separate from the OpenCode server's
+    own runtime dir to avoid concurrent access to the same storage.
+
+    Default: %LOCALAPPDATA%\\JarvisOpenCodeRuntime_strategist, falling back
+    to %TEMP% or the user's home directory.
+    """
+    configured = _path("JARVIS_STRATEGIST_RUNTIME_DIR")
+    if configured:
+        return configured
+    base = localappdata() or temp_dir() or os.path.expanduser("~")
+    return os.path.join(base, "JarvisOpenCodeRuntime_strategist")
 
 
 # ---------------------------------------------------------------------------
