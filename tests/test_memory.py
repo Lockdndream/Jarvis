@@ -211,3 +211,130 @@ def test_update_memory_missing_id_is_noop():
 def test_delete_memory_missing_id_is_noop():
     memory.delete_memory("mem_doesnotexist")
     assert memory.get_memories_by_source("conversation", None) == []
+
+
+# ── get_recent_activity ────────────────────────────────────────────────
+
+
+def test_get_recent_activity_only_episodic():
+    memory.store_memory(category="episodic", content="episodic 1")
+    memory.store_memory(category="core_fact", content="core fact")
+    memory.store_memory(category="explicit", content="explicit preference")
+    results = memory.get_recent_activity()
+    assert len(results) == 1
+    assert results[0]["category"] == "episodic"
+    assert results[0]["content"] == "episodic 1"
+
+
+def test_get_recent_activity_respects_since():
+    import time
+    memory.store_memory(category="episodic", content="old memory")
+    time.sleep(0.1)
+    since = memory.utcnow()
+    memory.store_memory(category="episodic", content="new memory")
+    results = memory.get_recent_activity(since=since)
+    assert len(results) == 1
+    assert results[0]["content"] == "new memory"
+
+
+def test_get_recent_activity_respects_project():
+    memory.store_memory(category="episodic", content="jarvis episodic", project="jarvis")
+    memory.store_memory(category="episodic", content="other episodic", project="other")
+    results = memory.get_recent_activity(project="jarvis")
+    assert len(results) == 1
+    assert results[0]["project"] == "jarvis"
+
+
+def test_get_recent_activity_excludes_expired():
+    memory.store_memory(
+        category="episodic", content="expired episodic",
+        expires_at="2000-01-01T00:00:00Z",
+    )
+    memory.store_memory(category="episodic", content="valid episodic")
+    results = memory.get_recent_activity()
+    assert len(results) == 1
+    assert results[0]["content"] == "valid episodic"
+
+
+def test_get_recent_activity_ordered_desc():
+    for i in range(5):
+        memory.store_memory(category="episodic", content=f"episodic {i}")
+    results = memory.get_recent_activity(limit=3)
+    assert len(results) == 3
+    assert results[0]["content"] == "episodic 4"
+    assert results[1]["content"] == "episodic 3"
+    assert results[2]["content"] == "episodic 2"
+
+
+# ── get_activity_summary ────────────────────────────────────────────────
+
+
+def test_get_activity_summary_empty_db():
+    result = memory.get_activity_summary()
+    assert result == "No recent activity recorded."
+
+
+def test_get_activity_summary_empty_with_since():
+    since = memory.utcnow()
+    result = memory.get_activity_summary(since=since)
+    assert result == f"Nothing happened since {since}."
+
+
+def test_get_activity_summary_groups_by_source():
+    memory.store_memory(
+        category="episodic", content="Plan 'Deploy staging' completed.",
+        source="plan_completion",
+    )
+    memory.store_memory(
+        category="episodic", content="OpenCode task completed: run pytest.",
+        source="task_completion",
+    )
+    result = memory.get_activity_summary()
+    assert "plan completion" in result.lower()
+    assert "task completion" in result.lower()
+    assert "Deploy staging" in result
+    assert "run pytest" in result
+
+
+def test_get_activity_summary_respects_since():
+    import time
+    memory.store_memory(category="episodic", content="old episodic", source="conversation")
+    time.sleep(0.1)
+    since = memory.utcnow()
+    memory.store_memory(category="episodic", content="new episodic", source="conversation")
+    result = memory.get_activity_summary(since=since)
+    assert "new episodic" in result
+    assert "old episodic" not in result
+
+
+def test_get_activity_summary_respects_project():
+    memory.store_memory(
+        category="episodic", content="jarvis conversation", source="conversation",
+        project="jarvis",
+    )
+    memory.store_memory(
+        category="episodic", content="other conversation", source="conversation",
+        project="other",
+    )
+    result = memory.get_activity_summary(project="jarvis")
+    assert "jarvis conversation" in result
+    assert "other conversation" not in result
+
+
+# ── Async wrappers for new functions ─────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_async_wrapper_get_recent_activity():
+    memory.store_memory(category="episodic", content="async episodic test", project="jarvis")
+    results = await db_async.get_recent_activity(project="jarvis")
+    assert len(results) == 1
+    assert results[0]["content"] == "async episodic test"
+
+
+@pytest.mark.asyncio
+async def test_async_wrapper_get_activity_summary():
+    memory.store_memory(category="episodic", content="async summary test", source="conversation")
+    result = await db_async.get_activity_summary()
+    assert "async summary test" in result
+    assert "conversations" in result.lower()

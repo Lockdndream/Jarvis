@@ -204,6 +204,121 @@ def get_recent_memories(project: str | None = None, limit: int = 10) -> list[dic
     return [_row_to_dict(r) for r in rows]
 
 
+def get_recent_activity(
+    since: str | None = None,
+    project: str | None = None,
+    limit: int = 20,
+) -> list[dict]:
+    """Return episodic memories (category='episodic') ordered by
+    created_at DESC, optionally filtered to created_at >= since (an ISO
+    datetime string, same format as utcnow()) and/or a project.
+
+    Plain chronological query — NOT an FTS5 MATCH. This is deliberately
+    a different mechanism from retrieve_memories(): that one ranks by
+    keyword relevance, this one ranks by time. Do not route this
+    through _sanitize_fts_query or memories_fts at all.
+    """
+    now = utcnow()
+    conn = get_conn()
+
+    where_parts = [
+        "category='episodic'",
+        "(expires_at IS NULL OR expires_at >= ?)",
+    ]
+    params: list = [now]
+
+    if since is not None:
+        where_parts.append("created_at >= ?")
+        params.append(since)
+
+    if project is not None:
+        where_parts.append("project = ?")
+        params.append(project)
+
+    params.append(limit)
+
+    where = " AND ".join(where_parts)
+    sql = f"SELECT * FROM memories WHERE {where} ORDER BY created_at DESC LIMIT ?"
+
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+    return [_row_to_dict(r) for r in rows]
+
+
+def get_activity_summary(since: str | None = None, project: str | None = None) -> str:
+    """Human-readable summary of episodic memories since `since` (or all
+    episodic memories if since=None), grouped by their `source` field
+    (plan_completion / task_completion / conversation / strategist).
+
+    Format (example):
+        "Since 2026-07-30 14:00: 2 plans completed (1 failed), 1
+        OpenCode task finished, 1 conversation summarized. Details:
+        - Plan 'Deploy staging' completed. Total steps: 3, succeeded: 2,
+          failed: 1...
+        - OpenCode task completed: run pytest. Result: 859 passed...
+
+    Call get_recent_activity(since, project, limit=50) internally, then
+    group and format. If there is nothing, return a clear, honest string
+    ("Nothing happened since <time>." or "No recent activity recorded.")
+    — never an empty string and never a fabricated "everything is fine."
+    """
+    memories = get_recent_activity(since=since, project=project, limit=50)
+
+    if not memories:
+        if since:
+            return f"Nothing happened since {since}."
+        return "No recent activity recorded."
+
+    grouped: dict[str, list[dict]] = {}
+    for mem in memories:
+        source = mem.get("source", "conversation")
+        grouped.setdefault(source, []).append(mem)
+
+    source_labels = {
+        "plan_completion": "plan completions",
+        "task_completion": "OpenCode task completions",
+        "conversation": "conversations summarized",
+        "strategist": "strategist consultations",
+    }
+
+    summary_parts: list[str] = []
+    detail_parts: list[str] = []
+
+    if since:
+        header = f"Since {since}: "
+    else:
+        header = ""
+
+    counts: list[str] = []
+    for source, label in source_labels.items():
+        mems = grouped.get(source, [])
+        if mems:
+            counts.append(f"{len(mems)} {label}")
+
+    if counts:
+        header += ", ".join(counts) + ". Details:"
+    summary_parts.append(header)
+
+    for mem in memories:
+        source = mem.get("source", "conversation")
+        content = mem.get("content", "")
+        created = mem.get("created_at", "")
+        readable_time = created[:19] if created else "unknown"
+
+        if source == "plan_completion":
+            detail_parts.append(f"  - [{readable_time}] {content}")
+        elif source == "task_completion":
+            detail_parts.append(f"  - [{readable_time}] {content}")
+        elif source == "conversation":
+            detail_parts.append(f"  - [{readable_time}] {content}")
+        elif source == "strategist":
+            detail_parts.append(f"  - [{readable_time}] {content}")
+        else:
+            detail_parts.append(f"  - [{readable_time}] [{source}] {content}")
+
+    return "\n".join(summary_parts + detail_parts)
+
+
 def seed_core_facts() -> int:
     """Seed immutable doctrine and configured identity into core facts.
 

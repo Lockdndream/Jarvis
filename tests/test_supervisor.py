@@ -953,7 +953,7 @@ async def test_without_confirm_before_tools_the_tool_executes_normally(superviso
     immediately, unchanged from before Goal 5 existed."""
     called = []
 
-    async def fake_call(name, args):
+    async def fake_call(name, args, conversation_id=None):
         called.append((name, args))
         return "executed"
     monkeypatch.setattr(supervisor.tools, "call", fake_call)
@@ -982,7 +982,7 @@ async def test_without_confirm_before_tools_the_tool_executes_normally(superviso
 async def test_resolve_pending_tool_confirmation_yes_executes_the_stored_call(supervisor, monkeypatch):
     called = []
 
-    async def fake_call(name, args):
+    async def fake_call(name, args, conversation_id=None):
         called.append((name, args))
         return "File created."
     monkeypatch.setattr(supervisor.tools, "call", fake_call)
@@ -1596,3 +1596,50 @@ def _async_return(value):
     async def _f(*args, **kwargs):
         return value
     return _f
+
+
+# ── Recency-first retrieval (F1 Walk-away Step 1) ──────────────────
+
+
+def test_build_context_temporal_query_uses_get_recent_activity(monkeypatch):
+    """A temporal query ('what happened while I was gone') triggers
+    get_recent_activity instead of retrieve_memories."""
+    from unittest.mock import MagicMock
+
+    memory.store_memory(category="episodic", content="Built a new feature", source="task_completion")
+    memory.store_memory(category="core_fact", content="Core fact A")
+
+    fake_retrieve = MagicMock(return_value=[])
+    monkeypatch.setattr(memory, "retrieve_memories", fake_retrieve)
+
+    ctx = build_context(query="what happened while I was gone")
+    fake_retrieve.assert_not_called()
+
+    assert "relevant_memories" in ctx
+    assert len(ctx["relevant_memories"]) >= 1
+    assert any("Built a new feature" in m["content"] for m in ctx["relevant_memories"])
+
+
+def test_build_context_nontemporal_query_uses_retrieve_memories(monkeypatch):
+    """A non-temporal query ('PostgreSQL deployment') still uses
+    retrieve_memories as before."""
+    memory.store_memory(category="episodic", content="Discussed PostgreSQL deployment strategy")
+    ctx = build_context(query="PostgreSQL deployment")
+    assert "relevant_memories" in ctx
+    assert any("PostgreSQL deployment" in m["content"] for m in ctx["relevant_memories"])
+
+
+def test_build_context_temporal_query_zero_results_does_not_add_key():
+    """A temporal query with zero recent activity does not crash and does
+    not add a 'relevant_memories' key with junk in it."""
+    ctx = build_context(query="what happened while I was out")
+    assert "relevant_memories" not in ctx
+
+
+def test_build_context_temporal_query_retrieval_failure_does_not_propagate(monkeypatch):
+    """A get_recent_activity failure for a temporal query is caught,
+    context build still succeeds."""
+    monkeypatch.setattr(memory, "get_recent_activity", MagicMock(side_effect=RuntimeError("simulated DB failure")))
+    ctx = build_context(query="what happened while I was gone")
+    assert "core_facts" in ctx
+    assert ctx.get("relevant_memories", []) == []

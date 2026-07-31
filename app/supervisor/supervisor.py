@@ -101,6 +101,24 @@ You have access to a set of bounded tools. Use them to answer the user's questio
 10. When the user provides a follow-up instruction about an active task, use send_opencode_instruction.
 11. Your responses are spoken aloud by text-to-speech, never displayed as formatted text. Never use markdown (no **bold**, no #headings, no bullet lists, no code fences) — plain spoken sentences only.
 12. When the user asks what a completed or failed task found, did, or reported (e.g. "what did it find", "list the modified files", "what changed"), use get_task_result — never start a new task to re-answer a question about one that already finished.
+13. When the user says things like "what happened", "catch me up", "what did I miss", "status update", or "while I was gone/away", use catch_me_up — not recent_activity or list_tasks, which only show current state, not a summary of what occurred.
+
+## Single Action vs. Multi-Step Plan
+
+Most requests are a single action — call the one relevant tool directly (e.g. start_opencode_task) and do not create a plan. Only use create_plan when the user asks for multiple actions that must happen in a specific order.
+
+Decomposing a plan: each step becomes one item in create_plan's `steps` list, with `worker_name` set to the worker that should run it ("opencode" for anything involving code, tests, git, or the filesystem; "strategist" for advice/review). `on_failure` controls what happens when a step technically fails (crashes, errors, times out) — it does NOT let you branch on what a step's result *says*. Default `on_failure` is "stop": if the step fails, the whole plan stops there and later steps never run. Use "escalate" only for steps whose failure needs the user's decision before anything later can proceed; use "continue" only when a step's failure genuinely shouldn't block the rest.
+
+- **Sequential, no conditions** ("run the tests, then lint it"): a plan with one step per action, default on_failure=stop is correct — if a step errors, later steps shouldn't run anyway.
+- **Sequential with a real precondition** ("run the tests, then lint it, then push if everything passes"): a 3-step plan. Leave on_failure=stop (the default) on every step — "push if clean" IS "stop the plan if an earlier step fails," which is exactly what on_failure=stop already does. Do not invent a different mechanism for this.
+- **Branching on content, not on failure** ("check the CI status, and if it's red, run the tests locally to see what's failing"): this is NOT expressible as a create_plan with on_failure, because checking CI status succeeds (technically) whether CI is red or green — a technical-failure gate will never trigger just because the reported status is bad. Do not build a plan for this. Instead, either fold the condition into a single worker instruction (e.g. one start_opencode_task instruction: "check CI status for the develop branch; if it's red, also run the tests locally and report what's failing"), or make the first tool call yourself, look at its actual result, and decide the next tool call as an ordinary follow-up in the same turn.
+
+**Every step's `description` must be imperative and self-contained — never phrase it as a condition on an earlier step** (e.g. never write "if all tests and linting passed, commit and push changes" for a step whose worker will run in isolation). By the time a later step runs, `on_failure=stop` has already guaranteed every earlier step succeeded — the worker executing this step has no visibility into earlier steps' results and cannot evaluate a condition referring to them, so embedding one just wastes the worker's time re-checking something already guaranteed, or worse, lets it decide the condition itself. Write "commit and push the changes," not "if everything passed, commit and push the changes" — the gate belongs in `on_failure`, never repeated in the step text.
+
+Examples:
+- "Run the tests on Jarvis" → single action. Call start_opencode_task directly. No plan.
+- "Run the tests, then lint it, then push if everything passes" → create_plan with 3 steps (worker_name="opencode" for all three; on_failure left at the default "stop" for each), then start_plan.
+- "Check the CI status, and if it's red, run the tests locally" → not a plan. Either one start_opencode_task instruction covering both parts, or check first and decide the next tool call yourself based on the actual result.
 
 ## Available Tools
 Use the provided function definitions to interact with Jarvis services.
@@ -323,7 +341,7 @@ class Supervisor:
                             break
 
                         logger.info("Tool call #%d: %s(%s)", tool_call_count, name, func["arguments"][:100], extra={"conversation_id": conversation_id, "tool": name})
-                        result = await self.tools.call(name, args)
+                        result = await self.tools.call(name, args, conversation_id=conversation_id)
                         await asyncio.to_thread(_persist_tool_call, conversation_id, name, args, result)
                         await _broadcast("supervisor_tool_call", {
                             "conversation_id": conversation_id,
@@ -388,7 +406,7 @@ class Supervisor:
                 "Confirmed tool call: %s(%s)", name, json.dumps(args)[:100],
                 extra={"conversation_id": conversation_id, "tool": name},
             )
-            result = await self.tools.call(name, args)
+            result = await self.tools.call(name, args, conversation_id=conversation_id)
             await asyncio.to_thread(_persist_tool_call, conversation_id, name, args, result)
             await _broadcast("supervisor_tool_call", {
                 "conversation_id": conversation_id,

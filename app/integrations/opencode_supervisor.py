@@ -842,12 +842,15 @@ class OpenCodeSupervisor:
             "source": "opencode",
         })
         task_name = task["name"] if task else "A task"
+        oc_task = await adb.get_opencode_task(task_id)
+        result_summary = (oc_task.get("result_summary") or "")[:80] if oc_task else ""
+        body = f"{task_name} completed" + (f": {result_summary}" if result_summary else ".")
         await notifications.notify(
             self.cm, attention_policy.KIND_TASK_COMPLETED,
             conversation_id=None, task_id=task_id,
             source_type="opencode_task", source_id=task_id,
             title="Jarvis task completed",
-            body=f"{task_name} completed.",
+            body=body,
         )
 
     async def _handle_activity(self, event: dict) -> None:

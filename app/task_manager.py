@@ -223,7 +223,7 @@ class TaskManager:
                     conversation_id=None, task_id=task_id,
                     source_type="local_task", source_id=task_id,
                     title="Jarvis task completed",
-                    body=f"{name} completed.",
+                    body=f"{name} completed (exit code {exit_code}).",
                 )
         except Exception as e:
             logger.error("Monitor error for task %s: %s", task_id, e)

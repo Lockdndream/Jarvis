@@ -7,6 +7,8 @@ import logging
 from app import config
 from app import db_async as adb
 from app import attention_manager
+from app import notifications
+from app import attention_policy
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +85,16 @@ class PlanExecutor:
                     if step["on_failure"] == "stop":
                         await adb.update_plan_status(plan_id, "failed")
                         await self._write_plan_completion_memory(plan_id, "failed")
+                        try:
+                            await notifications.notify(
+                                self._cm, attention_policy.KIND_TASK_COMPLETED,
+                                conversation_id=None, task_id=plan_id,
+                                source_type="plan", source_id=plan_id,
+                                title="Jarvis plan failed",
+                                body=f"Plan '{plan['title']}' failed at step {step['step_index']}: {step['description'][:60]}",
+                            )
+                        except Exception:
+                            logger.warning("Failed to send plan-failure notification for plan_id=%s", plan_id, exc_info=True)
                         logger.info(
                             "plan failed (stop on failure): plan_id=%s step_id=%s",
                             plan_id, step["step_id"],
@@ -108,6 +120,16 @@ class PlanExecutor:
                         )
                         await adb.update_plan_status(plan_id, "failed")
                         await self._write_plan_completion_memory(plan_id, "failed")
+                        try:
+                            await notifications.notify(
+                                self._cm, attention_policy.KIND_TASK_COMPLETED,
+                                conversation_id=None, task_id=plan_id,
+                                source_type="plan", source_id=plan_id,
+                                title="Jarvis plan failed",
+                                body=f"Plan '{plan['title']}' failed at step {step['step_index']}: {step['description'][:60]}",
+                            )
+                        except Exception:
+                            logger.warning("Failed to send plan-failure notification for plan_id=%s", plan_id, exc_info=True)
                         self._running_plans.pop(plan_id, None)
                         return
                     step = refreshed
@@ -115,6 +137,16 @@ class PlanExecutor:
                         if step["on_failure"] == "stop":
                             await adb.update_plan_status(plan_id, "failed")
                             await self._write_plan_completion_memory(plan_id, "failed")
+                            try:
+                                await notifications.notify(
+                                    self._cm, attention_policy.KIND_TASK_COMPLETED,
+                                    conversation_id=None, task_id=plan_id,
+                                    source_type="plan", source_id=plan_id,
+                                    title="Jarvis plan failed",
+                                    body=f"Plan '{plan['title']}' failed at step {step['step_index']}: {step['description'][:60]}",
+                                )
+                            except Exception:
+                                logger.warning("Failed to send plan-failure notification for plan_id=%s", plan_id, exc_info=True)
                             logger.info(
                                 "plan failed (stop on failure): plan_id=%s step_id=%s",
                                 plan_id, step["step_id"],
@@ -136,6 +168,18 @@ class PlanExecutor:
                 )
             await adb.update_plan_status(plan_id, "completed")
             await self._write_plan_completion_memory(plan_id, "completed")
+            steps = await adb.get_plan_steps(plan_id)
+            succeeded = sum(1 for s in steps if s["status"] == "succeeded")
+            try:
+                await notifications.notify(
+                    self._cm, attention_policy.KIND_TASK_COMPLETED,
+                    conversation_id=None, task_id=plan_id,
+                    source_type="plan", source_id=plan_id,
+                    title="Jarvis plan completed",
+                    body=f"Plan '{plan['title']}' completed: {succeeded}/{len(steps)} steps passed.",
+                )
+            except Exception:
+                logger.warning("Failed to send plan-completion notification for plan_id=%s", plan_id, exc_info=True)
             logger.info("plan completed: plan_id=%s", plan_id)
         finally:
             self._running_plans.pop(plan_id, None)
@@ -300,6 +344,13 @@ class PlanExecutor:
     # ── Escalation ──────────────────────────────────────────────────────
 
     async def _escalate(self, plan_id: str, step: dict) -> None:
+        plan = await adb.get_plan(plan_id)
+        plan_title = (plan.get("title") or "")[:30] if plan else ""
+        error_detail = (step.get("error") or "")[:40]
+        summary = (
+            f"Plan '{plan_title}' step failed: {error_detail}. "
+            "Reply retry, skip, or abort."
+        )
         await attention_manager.get_or_create(
             self._cm,
             conversation_id=None,
@@ -308,7 +359,7 @@ class PlanExecutor:
             source_id=step["step_id"],
             attention_type="SUPERVISOR_ESCALATION",
             urgency="HIGH",
-            summary=f"Plan step failed: {step['description'][:100]}",
+            summary=summary,
             context_json=json.dumps({
                 "plan_id": plan_id,
                 "step_id": step["step_id"],

@@ -221,6 +221,84 @@ not urgently), **Low** (cosmetic or very low probability of mattering).
 - **Recommended milestone**: Small, low-risk fix; unscheduled.
 - **Status**: Open, disclosed (Known Limitation #43)
 
+### TD-026 — `project_dir` provides no real containment; OpenCode can escape its assigned sandbox with zero permission gate
+
+- **Description**: Discovered live during Month 2 Weeks 7-8 (walk-away
+  mode) real-device testing, not hypothesized. A voice command ("run
+  the tests on Jarvis") resolved to the `jarvis-test` safe-project alias
+  (a near-empty 9-file sandbox, `tests/test_projects/safe-test/`,
+  containing no real test suite). The dispatched OpenCode task ran for
+  ~31 minutes and, per its own self-reported result summary on
+  cancellation, actually executed real tests from this repository's
+  *actual* `tests/test_plan_executor.py` (confirmed: the reported
+  in-progress test name, `test_reconcile_completed_opencode_task_succeeds_step`,
+  is a real, verified test in that file) — meaning the agent navigated
+  out of its assigned `project_dir` into the live repository root and
+  ran the real 859-test pytest suite against real source, with `.env`,
+  `certs/`, `jarvis.db` (the live production database), and
+  `projects.json` all reachable from that location. Checked directly:
+  zero rows exist in the `questions` table for this task, and zero
+  `/permission` grants were logged for it anywhere in the server log —
+  confirming this happened with **no permission escalation at all**,
+  not a permission that was silently auto-approved. `project_dir` is
+  implemented purely as the `opencode serve` subprocess's working
+  directory (`app/integrations/opencode_server.py`, `cwd=self.project_dir`)
+  with no OS-level jail, chroot, container boundary, or filesystem ACL
+  enforcing it — confirmed by reading the code, not inferred. The
+  project-scoping model this codebase (and `ARCHITECTURE.md`/ADR-004)
+  has consistently described as a safety boundary does not actually
+  contain simple shell navigation (e.g. `cd ../..` followed by a normal
+  command) for at least this class of action.
+- **Severity**: **Critical.** Not a hypothetical — a live, unattended
+  delegation reached the production database, secrets, and TLS private
+  key files with zero gate. Accepted as non-blocking for walk-away
+  mode's initial ship under the current usage model (single user,
+  WiFi-only, the user present and watching or nearby, per explicit
+  scope decisions this same milestone made) — but this severity
+  escalates sharply the moment any future milestone removes the
+  "user present" assumption further (fully autonomous overnight plan
+  runs, remote/non-LAN access per TD-003, or multi-user access), since
+  those are exactly the scenarios where nothing else would catch an
+  OpenCode agent quietly reading or exfiltrating `.env`/`certs/`/
+  `jarvis.db` contents mid-delegation.
+- **Owner**: `app/integrations/opencode_server.py` (subprocess `cwd`
+  wiring), `app/integrations/opencode_supervisor.py` (project_dir
+  plumbing), OpenCode's own permission-request model (external
+  dependency — whether *any* class of action can be made to require a
+  permission grant when it touches a path outside project_dir is an
+  OpenCode-side capability question, not something this codebase alone
+  controls).
+- **Origin milestone**: Milestone 9A (`jarvis-app-src`'s own
+  description already asserts "excludes .env, projects.json, certs/,
+  jarvis.db... any write must be explicitly denied" — the isolation
+  model has been described as a safety boundary since that milestone,
+  never verified against an actual escape attempt until now); discovered
+  Month 2 Weeks 7-8 (walk-away mode real-device test).
+- **Risk**: Every existing safe-project description in `projects.json`
+  (`jarvis-app-src`, `jarvis-repo-tests` newly added this milestone) that
+  asserts scoping/read-only guarantees is currently only as strong as
+  the calling LLM's own default behavior — there is no enforced fallback
+  if the agent (deliberately, confusedly, or via a future model that
+  behaves differently) decides to look outside its assigned directory.
+  `jarvis-repo-tests` (added this milestone specifically to let
+  walk-away mode run the real test suite) was deliberately scoped to
+  the full repo root on this exact understood tradeoff — see its
+  `projects.json` description, which states this risk explicitly and
+  relies on this same unresolved gap.
+- **Recommended milestone**: Unscheduled — needs real investigation into
+  what OpenCode-side permission configuration (if any) can be made to
+  gate filesystem access outside a session's working directory, and/or
+  whether an OS-level containment mechanism (a restricted user account,
+  a container, a filesystem-level ACL) is warranted before any milestone
+  removes the "user present and able to notice something wrong" safety
+  net walk-away mode currently still leaves partially intact. Must be
+  resolved before any future milestone considers remote/non-LAN access
+  (TD-003) or fully unattended overnight autonomous operation.
+- **Status**: Open, newly discovered and documented this milestone — not
+  fixed. Explicit user decision: does not block shipping walk-away mode
+  for personal, WiFi-only, user-present-or-nearby use; must be addressed
+  before broadening that usage model.
+
 ### TD-024 — Control Center event-shape handling relies on an unenforced naming convention
 
 - **Description**: `dashboard.js`'s `handleNamedEvent`/`routeWsMessage`
@@ -661,6 +739,7 @@ not urgently), **Low** (cosmetic or very low probability of mattering).
 | TD-023 | Active VoiceSession recovery under real-device failure injection unproven | Testing | Medium |
 | TD-024 | Control Center event-shape handling relies on an unenforced naming convention | Implementation | Low |
 | TD-025 | Control Center's `currentTurn` cannot represent two concurrent turns | Architecture | Low |
+| TD-026 | `project_dir` provides no real containment; zero permission gate for sandbox escape | Operational | **Critical** |
 
 No duplicate entries exist between this register and `SESSION.md`'s own
 "Known Bugs, Limitations, and Technical Debt" section — this register is

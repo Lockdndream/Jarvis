@@ -127,3 +127,4 @@ Every ADR uses the same section structure, in this order:
 | [ADR-026](ADR-026-worker-registry-and-strategist-consultation.md) | Worker Registry and Strategist Consultation | Accepted |
 | [ADR-027](ADR-027-plan-executor-pattern.md) | Plan Executor Pattern | Accepted |
 | [ADR-028](ADR-028-memory-v1-three-tier-model.md) | Memory v1 — Three-Tier Model on SQLite FTS5 | Accepted |
+| [ADR-029](ADR-029-walk-away-mode.md) | Walk-Away Mode — Delegate, Notify, Recall | Accepted |

@@ -18,6 +18,17 @@ MAX_TEXT_LENGTH = 2000
 
 logger = logging.getLogger(__name__)
 
+_TEMPORAL_PATTERNS = (
+    "what happened", "what did i miss", "catch me up", "catch up",
+    "while i was", "while i'm", "status update", "what's new",
+    "anything new", "what's the status", "fill me in",
+)
+
+
+def _is_temporal_query(query: str) -> bool:
+    q = query.lower()
+    return any(p in q for p in _TEMPORAL_PATTERNS)
+
 
 def build_context(conversation_history: list | None = None, query: str | None = None) -> dict:
     """Build compact context for the supervisor."""
@@ -115,7 +126,10 @@ def build_context(conversation_history: list | None = None, query: str | None = 
 
         top_k = config.memory_retrieval_top_k()
         try:
-            memories = db_memory.retrieve_memories(query, limit=top_k)
+            if _is_temporal_query(query):
+                memories = db_memory.get_recent_activity(limit=top_k)
+            else:
+                memories = db_memory.retrieve_memories(query, limit=top_k)
             # Core facts are already rendered unconditionally under "What I
             # know:" -- if a core fact also keyword-matches the query, it
             # must not additionally render under "Relevant recalled

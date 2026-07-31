@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import app.database as db
 from app.workers.base import WorkerResult, WorkerResultStatus, WorkerStatus
 from app.plan_executor import PlanExecutor
+import app.plan_executor
 import app.memory as memory
 
 
@@ -867,3 +868,137 @@ async def test_plan_completion_memory_failure_does_not_block_plan():
         assert db.get_plan(plan_id)["status"] == "completed"
     finally:
         memory.store_memory = original_store
+
+
+# ── Plan-completion notifications (Step 4: notification enrichment) ───────
+
+
+@pytest.mark.asyncio
+async def test_plan_completed_sends_notification():
+    w = _make_worker("opencode", _async_return(WorkerResult(
+        status=WorkerResultStatus.COMPLETED, output="done")))
+    reg = MagicMock()
+    reg.get_by_name = MagicMock(return_value=w)
+    oc = MagicMock()
+    oc.wait_for_completion = _async_return(True)
+    oc.fetch_task_result_text = _async_return(None)
+
+    pe = PlanExecutor(worker_registry=reg, opencode_supervisor=oc,
+                      conn_manager=MagicMock(), step_timeout=5.0)
+    plan_id = seed_plan("Notify completed test")
+    seed_step(plan_id, 0, "Step 1", "opencode")
+    seed_step(plan_id, 1, "Step 2", "opencode")
+
+    assert await pe.start_plan(plan_id)
+    await _wait_plan_done(pe, plan_id)
+
+    assert db.get_plan(plan_id)["status"] == "completed"
+    notifs = [n for n in db.get_recent_notifications(50)
+              if n["task_id"] == plan_id and n["source_type"] == "plan"]
+    assert len(notifs) == 1
+    assert notifs[0]["notification_type"] == "TASK_COMPLETED"
+    assert notifs[0]["title"] == "Jarvis plan completed"
+    assert "completed" in notifs[0]["body"].lower()
+    assert "2/2" in notifs[0]["body"]
+    assert "Notify completed test" in notifs[0]["body"]
+
+
+@pytest.mark.asyncio
+async def test_plan_failed_stop_sends_notification():
+    w = _make_worker("opencode", _async_return(WorkerResult(
+        status=WorkerResultStatus.FAILED, error="fatal error")))
+    reg = MagicMock()
+    reg.get_by_name = MagicMock(return_value=w)
+
+    pe = PlanExecutor(worker_registry=reg, opencode_supervisor=MagicMock(),
+                      conn_manager=MagicMock(), step_timeout=5.0)
+    plan_id = seed_plan("Notify failed test")
+    seed_step(plan_id, 0, "Fatal step", "opencode", on_failure="stop")
+
+    assert await pe.start_plan(plan_id)
+    await _wait_plan_done(pe, plan_id)
+
+    assert db.get_plan(plan_id)["status"] == "failed"
+    notifs = [n for n in db.get_recent_notifications(50)
+              if n["task_id"] == plan_id and n["source_type"] == "plan"]
+    assert len(notifs) == 1
+    assert notifs[0]["notification_type"] == "TASK_COMPLETED"
+    assert notifs[0]["title"] == "Jarvis plan failed"
+    assert "failed" in notifs[0]["body"].lower()
+    assert "Fatal step" in notifs[0]["body"]
+
+
+@pytest.mark.asyncio
+async def test_plan_paused_does_not_send_task_completed_notification():
+    w = _make_worker("opencode", _async_return(WorkerResult(
+        status=WorkerResultStatus.FAILED, error="needs human")))
+    reg = MagicMock()
+    reg.get_by_name = MagicMock(return_value=w)
+    cm = MagicMock()
+
+    pe = PlanExecutor(worker_registry=reg, opencode_supervisor=MagicMock(),
+                      conn_manager=cm, step_timeout=5.0)
+    plan_id = seed_plan("Paused no completion notification")
+    seed_step(plan_id, 0, "Needs human", "opencode", on_failure="escalate")
+
+    assert await pe.start_plan(plan_id)
+    await _wait_plan_done(pe, plan_id)
+
+    assert db.get_plan(plan_id)["status"] == "paused"
+    notifs = [n for n in db.get_recent_notifications(50)
+              if n["task_id"] == plan_id and n["source_type"] == "plan"]
+    assert len(notifs) == 0
+
+
+@pytest.mark.asyncio
+async def test_plan_completion_notification_failure_does_not_block_plan():
+    w = _make_worker("opencode", _async_return(WorkerResult(
+        status=WorkerResultStatus.COMPLETED, output="done")))
+    reg = MagicMock()
+    reg.get_by_name = MagicMock(return_value=w)
+    oc = MagicMock()
+    oc.wait_for_completion = _async_return(True)
+    oc.fetch_task_result_text = _async_return(None)
+
+    pe = PlanExecutor(worker_registry=reg, opencode_supervisor=oc,
+                      conn_manager=MagicMock(), step_timeout=5.0)
+
+    original_notify = app.plan_executor.notifications.notify
+
+    async def failing_notify(*args, **kwargs):
+        raise RuntimeError("simulated notification failure")
+
+    app.plan_executor.notifications.notify = failing_notify
+    try:
+        plan_id = seed_plan("Notification failure should not block")
+        seed_step(plan_id, 0, "Step 1", "opencode")
+
+        assert await pe.start_plan(plan_id)
+        await _wait_plan_done(pe, plan_id)
+        assert db.get_plan(plan_id)["status"] == "completed"
+    finally:
+        app.plan_executor.notifications.notify = original_notify
+
+
+@pytest.mark.asyncio
+async def test_escalation_summary_contains_plan_title_error_and_instructions():
+    plan_id = seed_plan("Deploy staging")
+    step_id = seed_step(plan_id, 0, "Run linter", "opencode", on_failure="escalate")
+    db.update_plan_step(step_id, status="failed", error="ruff check found 3 errors")
+
+    pe = PlanExecutor(worker_registry=MagicMock(), opencode_supervisor=MagicMock(),
+                      conn_manager=MagicMock(), step_timeout=5.0)
+    step = db.get_plan_step(step_id)
+
+    await pe._escalate(plan_id, step)
+
+    attn = db.get_attention_request_by_source("plan_step", step_id)
+    assert attn is not None
+    assert attn["attention_type"] == "SUPERVISOR_ESCALATION"
+    summary = attn["summary"]
+    assert "Deploy staging" in summary
+    assert "ruff check found 3 errors" in summary
+    assert "retry" in summary
+    assert "skip" in summary
+    assert "abort" in summary
+    assert len(summary) <= 120

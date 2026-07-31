@@ -52,11 +52,19 @@ class ToolRegistry:
         F1.10): the tool layer must not import the composition root."""
         self._vsm = vsm
 
-    def _register(self, name: str, description: str, parameters: dict, handler: Any) -> None:
+    def _register(
+        self,
+        name: str,
+        description: str,
+        parameters: dict,
+        handler: Any,
+        wants_conversation_id: bool = False,
+    ) -> None:
         self._tools[name] = {
             "description": description,
             "parameters": parameters,
             "handler": handler,
+            "wants_conversation_id": wants_conversation_id,
         }
 
     def get(self, name: str) -> dict | None:
@@ -68,11 +76,15 @@ class ToolRegistry:
             for n, t in self._tools.items()
         ]
 
-    async def call(self, name: str, args: dict) -> str:
+    async def call(
+        self, name: str, args: dict, conversation_id: str | None = None,
+    ) -> str:
         tool = self.get(name)
         if not tool:
             return f"Error: unknown tool '{name}'"
         try:
+            if tool.get("wants_conversation_id"):
+                return await tool["handler"](**args, conversation_id=conversation_id)
             return await tool["handler"](**args)
         except TypeError as e:
             return f"Error: invalid arguments for '{name}': {e}"
@@ -560,6 +572,57 @@ class ToolRegistry:
             lines.append(f"  - [{mem['id']}] {mem['category']},{project_part} {excerpt}")
         return "\n".join(lines)
 
+    async def _catch_me_up(
+        self,
+        since: str | None = None,
+        project: str | None = None,
+        conversation_id: str | None = None,
+    ) -> str:
+        window: str | None
+        if since is not None:
+            window = since
+        else:
+            window = await adb.get_previous_conversation_boundary(conversation_id)
+
+        summary = await adb.get_activity_summary(since=window, project=project)
+        lines = [summary]
+
+        if self._plan_executor is None:
+            return "\n".join(lines)
+
+        paused_plans = await adb.get_plans_by_status("paused")
+        failed_plans = await adb.get_plans_by_status("failed")
+        covered_plan_ids: set[str] = set()
+
+        if paused_plans or failed_plans:
+            lines.append("Needs your attention:")
+            for plan in paused_plans:
+                plan_id = plan["plan_id"]
+                title = plan["title"]
+                step_index = plan["current_step_index"]
+                lines.append(
+                    f"  - Plan '{title}' is paused waiting on step {step_index}. "
+                    "Say retry, skip, or abort to resume."
+                )
+                covered_plan_ids.add(plan_id)
+            for plan in failed_plans:
+                title = plan["title"]
+                step_index = plan["current_step_index"]
+                lines.append(
+                    f"  - Plan '{title}' failed at step {step_index}."
+                )
+                covered_plan_ids.add(plan["plan_id"])
+
+        attention_rows = await adb.get_unresolved_attention_requests()
+        for row in attention_rows:
+            if row["attention_type"] != "SUPERVISOR_ESCALATION":
+                continue
+            if row.get("task_id") in covered_plan_ids:
+                continue
+            lines.append(f"  - {row['summary']}")
+
+        return "\n".join(lines)
+
     def _register_all(self) -> None:
         self._register("get_attention", "Get summary of everything needing user attention", {"type": "object", "properties": {}, "required": []}, self._get_attention)
         self._register("list_tasks", "List all active, waiting, and recent tasks", {"type": "object", "properties": {}, "required": []}, self._list_tasks)
@@ -606,7 +669,7 @@ class ToolRegistry:
                             "type": "object",
                             "properties": {
                                 "description": {"type": "string", "description": "What this step should do"},
-                                "worker_name": {"type": "string", "description": "Worker to execute this step"},
+                                "worker_name": {"type": "string", "enum": ["opencode", "strategist"], "description": "Worker to execute this step"},
                                 "on_failure": {"type": "string", "enum": ["continue", "stop", "escalate"], "description": "What to do if this step fails (default: stop)"},
                                 "verification": {"type": "string", "description": "Optional verification instruction"},
                             },
@@ -677,6 +740,29 @@ class ToolRegistry:
                 "required": [],
             },
             self._what_do_you_remember,
+        )
+        self._register(
+            "catch_me_up",
+            "Summarize what happened recently — completed/failed plans, "
+            "finished tasks, and anything needing the user's attention. Use "
+            "this when the user says things like 'what happened', 'catch me "
+            "up', 'what did I miss', 'status update', or similar. If the user "
+            "specifies a time reference (e.g. 'since yesterday', 'while I was "
+            "at lunch', 'in the last hour'), resolve it yourself to an ISO "
+            "8601 UTC datetime string and pass it as `since`. If you cannot "
+            "confidently resolve a time reference, omit `since` entirely — the "
+            "tool will default to summarizing since the user's last "
+            "conversation.",
+            {
+                "type": "object",
+                "properties": {
+                    "since": {"type": "string", "description": "ISO 8601 UTC datetime to summarize activity from. Omit if the user gave no clear time reference."},
+                    "project": {"type": "string", "description": "Optional project alias to scope the summary to."},
+                },
+                "required": [],
+            },
+            self._catch_me_up,
+            wants_conversation_id=True,
         )
 
 

@@ -220,3 +220,24 @@ async def test_cancel_running_from_task_manager():
 
     running = tm.get_running_tasks_info()
     assert len(running) == 0
+
+
+@pytest.mark.asyncio
+async def test_demo_task_completion_notification_includes_exit_code():
+    cm = ConnectionManager()
+    tm = TaskManager(cm)
+    result = await tm.start_demo(steps=2)
+    tid = result["task_id"]
+
+    await _wait_until(lambda: db.get_task(tid)["status"] == "completed")
+
+    def _has_completion_notification():
+        notifs = [n for n in db.get_recent_notifications(50)
+                  if n["task_id"] == tid and n["source_type"] == "local_task"]
+        return notifs if len(notifs) == 1 else None
+
+    notifs = await _wait_until(_has_completion_notification)
+    assert len(notifs) == 1
+    assert notifs[0]["title"] == "Jarvis task completed"
+    assert "exit code 0" in notifs[0]["body"]
+

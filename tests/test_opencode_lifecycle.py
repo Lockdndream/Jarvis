@@ -6,6 +6,7 @@ Every state transition here is driven by feeding a real-shaped SSE frame
 into OpenCodeSupervisor._handle_sse_event and asserting DB state — never by
 calling internal handlers directly with invented shapes.
 """
+import json
 import os
 import sys
 import tempfile
@@ -484,3 +485,29 @@ async def test_session_idle_completes_normally_even_when_capture_fails():
     assert oc_task["status"] == "completed"
     assert oc_task["result_summary"] is None
     await sv.reconcile_on_startup()  # must return immediately, no adapter call
+
+
+@pytest.mark.asyncio
+async def test_session_idle_completion_notification_body_includes_result_summary():
+    sv = make_supervisor()
+    ws = RecordingWebSocket()
+    await sv.cm.connect(ws)
+    sv.adapter = FakeMessagesAdapter()
+    task_id, session_id = make_task(task_id="oc_enrich1")
+
+    await sv._handle_sse_event(frame(None, "session.idle", {"sessionID": session_id}))
+
+    oc_task = db.get_opencode_task(task_id)
+    assert oc_task["status"] == "completed"
+    expected_summary = "This directory is not a Git repository — there is no .git directory present."
+
+    notifs = [n for n in db.get_recent_notifications(50)
+              if n["task_id"] == task_id and n["source_type"] == "opencode_task"]
+    assert len(notifs) == 1
+    assert notifs[0]["title"] == "Jarvis task completed"
+    assert expected_summary in notifs[0]["body"]
+
+    broadcast_notifs = [json.loads(m) for m in ws.sent if m.startswith("{")]
+    broadcast_notifs = [m for m in broadcast_notifs if m.get("type") == "notification"]
+    assert len(broadcast_notifs) == 1
+    assert expected_summary in broadcast_notifs[0]["body"]

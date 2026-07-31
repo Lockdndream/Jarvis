@@ -379,6 +379,29 @@ def conversation_exists(conversation_id: str) -> bool:
     return row is not None
 
 
+def get_previous_conversation_boundary(current_conversation_id: str | None) -> str | None:
+    """Return the created_at timestamp of the most recent conversation
+    message NOT belonging to current_conversation_id — i.e. "when did
+    the user's last, different conversation last have activity."
+    Returns None if there is no such message (first-ever conversation,
+    or no conversation_id supplied and there's only ever been one).
+    """
+    conn = get_conn()
+    try:
+        if current_conversation_id is None:
+            row = conn.execute(
+                "SELECT MAX(created_at) FROM conversations"
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT MAX(created_at) FROM conversations WHERE conversation_id != ?",
+                (current_conversation_id,),
+            ).fetchone()
+        return row[0] if row and row[0] is not None else None
+    finally:
+        conn.close()
+
+
 # NOTE: _ensure_column is retained for backward compatibility.
 # New schema changes must be migrations, not _ensure_column calls.
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, coltype: str) -> None:

@@ -154,6 +154,10 @@ async def get_recent_events(limit: int = 100) -> list[dict]:
     return await asyncio.to_thread(db.get_recent_events, limit)
 
 
+async def get_previous_conversation_boundary(current_conversation_id: str | None) -> str | None:
+    return await asyncio.to_thread(db.get_previous_conversation_boundary, current_conversation_id)
+
+
 async def create_task_record(task_id: str, name: str, command: str, trace_id: str | None = None) -> None:
     return await asyncio.to_thread(db.create_task_record, task_id, name, command, trace_id)
 
@@ -321,6 +325,14 @@ async def delete_memory(id: str) -> None:
 
 async def get_memories_by_source(source: str, source_id: str | None) -> list[dict]:
     return await asyncio.to_thread(memory.get_memories_by_source, source, source_id)
+
+
+async def get_recent_activity(since: str | None = None, project: str | None = None, limit: int = 20) -> list[dict]:
+    return await asyncio.to_thread(memory.get_recent_activity, since, project, limit)
+
+
+async def get_activity_summary(since: str | None = None, project: str | None = None) -> str:
+    return await asyncio.to_thread(memory.get_activity_summary, since, project)
 
 
 async def get_recent_memories(project: str | None = None, limit: int = 10) -> list[dict]:
