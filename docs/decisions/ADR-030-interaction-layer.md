@@ -146,8 +146,10 @@ width, unlike relying on alignment or fill color alone); all chat and
 system-row text was made `textIsSelectable="true"` per explicit
 request.
 
-### Documented, not fixed (explicit user decision, matching ADR-029's
-TD-026 precedent — found live, fully reproduced, not patched mid-step)
+### Documented, not fixed
+
+Each found live, fully reproduced, and not patched mid-step — explicit
+user decision, matching the precedent ADR-029 set for TD-026.
 
 - **TD-027** (High) — the Supervisor's tool-calling loop repeated
   identical tool calls (each of 6 tools called twice) hitting
@@ -200,7 +202,7 @@ represented as a fully isolated device-confirmed button tap.
 **Routing `thinking_update` through the existing `supervisor_tool_call`
 dashboard broadcast instead of a new phone-facing fan-out.** Rejected —
 that channel is DB-backed and observer-gated (ADR-018/019); making it
-also respsonsible for phone-visible real-time transparency would couple
+also responsible for phone-visible real-time transparency would couple
 a read-only audit mechanism to interactive UX it wasn't designed for.
 `_broadcast_phone()` is a separate, best-effort, no-persistence path.
 
