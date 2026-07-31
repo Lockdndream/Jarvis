@@ -315,6 +315,7 @@ class OpenCodeSupervisor:
             "task_id": task_id,
             "session_id": session_id,
             "instruction": instruction,
+            "trace_id": trace_id,
         })
 
         self._completion_events[task_id] = asyncio.Event()
@@ -355,6 +356,7 @@ class OpenCodeSupervisor:
         await self._notify_broadcast({
             "type": "opencode_task_cancelled",
             "task_id": task_id,
+            "trace_id": oc_task.get("trace_id") if oc_task else None,
         })
         # Milestone 8 Phase 20: invalidate any still-unresolved
         # AttentionRequests tied to this task — never keep contacting
@@ -785,6 +787,7 @@ class OpenCodeSupervisor:
             "task_id": task_id,
             "status": "failed",
             "source": "opencode",
+            "trace_id": terminal_trace_id,
         })
         task_name = task["name"] if task else "A task"
         await worker_events.create_attention(
@@ -840,6 +843,7 @@ class OpenCodeSupervisor:
             "task_id": task_id,
             "status": "completed",
             "source": "opencode",
+            "trace_id": terminal_trace_id,
         })
         task_name = task["name"] if task else "A task"
         oc_task = await adb.get_opencode_task(task_id)

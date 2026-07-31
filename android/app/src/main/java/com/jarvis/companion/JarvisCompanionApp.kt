@@ -5,6 +5,7 @@ import com.jarvis.companion.attention.AttentionRepository
 import com.jarvis.companion.core.ConnectionState
 import com.jarvis.companion.core.DeviceIdentity
 import com.jarvis.companion.core.SecureConfigStore
+import com.jarvis.companion.conversation.ConversationRepository
 import com.jarvis.companion.opencode.OpenCodeTaskRepository
 import com.jarvis.companion.pairing.PairingClient
 import com.jarvis.companion.pairing.PairingRepository
@@ -54,6 +55,13 @@ class JarvisCompanionApp : Application() {
     // (writer, via CompanionWebSocketClient) and VoiceActivity/notifications
     // (readers) observe the same instance.
     lateinit var openCodeTaskRepository: OpenCodeTaskRepository
+        private set
+
+    // Interaction Layer Step 2: client-side in-memory mirror of the
+    // conversation view. Same sharing rationale as the other repositories
+    // above — PresenceService (writer, via CompanionWebSocketClient) and the
+    // future conversation UI (reader) observe the same instance.
+    lateinit var conversationRepository: ConversationRepository
         private set
 
     // Milestone 9B.7: wake-word settings (opt-in enabled flag, confidence
@@ -134,6 +142,7 @@ class JarvisCompanionApp : Application() {
         attentionRepository = AttentionRepository()
         voiceSessionRepository = VoiceSessionRepository()
         openCodeTaskRepository = OpenCodeTaskRepository()
+        conversationRepository = ConversationRepository()
         wakeWordConfigRepository = WakeWordConfigRepository(secureConfigStore)
         operationalSettingsRepository = OperationalSettingsRepository(secureConfigStore)
         _connectivityMode.value = operationalSettingsRepository.connectivityMode()

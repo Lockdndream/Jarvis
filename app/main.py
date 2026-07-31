@@ -613,6 +613,14 @@ async def websocket_endpoint(ws: WebSocket):
                             "error": "No speech detected",
                         }))
                         continue
+                    await ws.send_text(json.dumps({
+                        "type": "conversation_turn",
+                        "role": "user",
+                        "content": stt_result.text,
+                        "voice_session_id": vsid,
+                        "conversation_id": conversation_id,
+                        "timestamp": _now(),
+                    }))
                     new_cid = await _process_transcript(vsid, stt_result.text)
                     conversation_id = new_cid or conversation_id
                     continue
@@ -640,6 +648,28 @@ async def websocket_endpoint(ws: WebSocket):
                         "history": history,
                     })
                 )
+                continue
+
+            if data.get("type") == "permission_response":
+                decision = data.get("decision", "")
+                bound_id = data.get("attention_request_id")
+                if not bound_id or decision not in ("approve", "reject"):
+                    await ws.send_text(json.dumps({
+                        "type": "permission_response_ack",
+                        "attention_request_id": bound_id,
+                        "response": "Invalid permission_response: missing attention_request_id or decision",
+                        "conversation_id": conversation_id,
+                    }))
+                    continue
+                result = await supervisor.process_message(
+                    decision, conversation_id, bound_attention_request_id=bound_id,
+                )
+                await ws.send_text(json.dumps({
+                    "type": "permission_response_ack",
+                    "attention_request_id": bound_id,
+                    "response": result.get("response", ""),
+                    "conversation_id": result.get("conversation_id", conversation_id),
+                }))
                 continue
 
             if data.get("type") == "device_status":

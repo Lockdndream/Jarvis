@@ -45,6 +45,7 @@ class FakeOpenCodeServer:
         self.sessions: dict[str, dict] = {}
         self.questions: list[dict] = []
         self.permissions: list[dict] = []
+        self.permission_replies: list[dict] = []
         self.messages: dict[str, list] = {}
         self.last_prompt_model: dict | None = None
         self._app = self._build_app()
@@ -54,6 +55,7 @@ class FakeOpenCodeServer:
 
     def _build_app(self):
         from fastapi import FastAPI, Request
+        from fastapi.responses import JSONResponse
         app = FastAPI()
         svc = self  # capture reference
 
@@ -142,6 +144,17 @@ class FakeOpenCodeServer:
 
         @app.post("/permission/{request_id}/reply")
         async def reply_permission(request_id: str, request: Request):
+            # Mirrors OpenCode's real schema for this endpoint (GET /doc,
+            # additionalProperties: false, "reply" required, enum
+            # once/always/reject) -- a real-device 400 (Interaction Layer
+            # Step 5) found that app/integrations/opencode_adapter.py used
+            # to send {"approved": bool} instead, which this fake server
+            # previously accepted unconditionally, providing zero coverage
+            # against the real API's actual contract.
+            body = await request.json()
+            if set(body.keys()) - {"reply", "message"} or "reply" not in body or body["reply"] not in ("once", "always", "reject"):
+                return JSONResponse(status_code=400, content={"error": "invalid reply body"})
+            svc.permission_replies.append(body)
             svc.permissions = [p for p in svc.permissions if p.get("requestID") != request_id]
             return "", 204
 
@@ -418,6 +431,24 @@ async def test_adapter_permissions():
         await adapter.reply_permission("p1", "/tmp", True)
         ps = await adapter.get_permissions(directory="/tmp")
         assert len(ps) == 0
+        # Regression: OpenCode's real API rejects {"approved": bool}
+        # (additionalProperties: false, "reply" required) -- confirm the
+        # adapter sends the real shape, not the old one that produced a
+        # live 400 Bad Request (Interaction Layer Step 5).
+        assert fake.permission_replies == [{"reply": "once"}]
+    finally:
+        await fake.stop()
+
+
+@pytest.mark.asyncio
+async def test_adapter_reply_permission_reject_sends_reject():
+    fake = FakeOpenCodeServer()
+    await fake.start()
+    try:
+        adapter = OpenCodeAdapter(base_url=fake.base_url)
+        fake.add_permission("p1", "read", "/foo/bar.txt")
+        await adapter.reply_permission("p1", "/tmp", False)
+        assert fake.permission_replies == [{"reply": "reject"}]
     finally:
         await fake.stop()
 

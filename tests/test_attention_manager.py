@@ -438,6 +438,26 @@ async def test_broadcast_hook_fires_on_transitions_when_set():
 
 
 @pytest.mark.asyncio
+async def test_attention_created_broadcast_includes_status():
+    """Regression test: the explicit `attention_created` broadcast
+    (initiate_contact) must include a `status` field. Android's
+    AttentionParser.parseAttentionEvent requires a non-empty `status` and
+    silently drops the entire frame (returns null, no repository update at
+    all) if it's missing -- found live during Interaction Layer Step 5
+    real-device testing, where a real PERMISSION attention_created event
+    never produced a conversation-view row because of exactly this."""
+    cm = make_conn_manager()
+    ws = await _connect(cm)
+    am.set_broadcast_hook(cm)
+    await am.get_or_create(
+        cm, conversation_id="c1", task_id="t1", source_type="local_question",
+        source_id="q1", attention_type=am.ATTENTION_TYPE_QUESTION, urgency="HIGH", summary="s",
+    )
+    created = next(m for m in ws.sent if m["type"] == "attention_created")
+    assert created.get("status") == "pending"
+
+
+@pytest.mark.asyncio
 async def test_no_broadcast_hook_set_does_not_raise():
     cm = make_conn_manager()
     am.set_broadcast_hook(None)

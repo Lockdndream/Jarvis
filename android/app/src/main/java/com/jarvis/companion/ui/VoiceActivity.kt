@@ -1,14 +1,15 @@
 package com.jarvis.companion.ui
 
 import android.os.Bundle
-import android.view.View
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
+import androidx.recyclerview.widget.LinearLayoutManager
 import com.jarvis.companion.JarvisCompanionApp
 import com.jarvis.companion.audio.AudioFocusManager
+import com.jarvis.companion.conversation.ConversationMessage
 import com.jarvis.companion.core.ConnectionState
 import com.jarvis.companion.databinding.ActivityVoiceBinding
 import com.jarvis.companion.service.PresenceService
@@ -94,6 +95,7 @@ class VoiceActivity : AppCompatActivity() {
     private lateinit var audioFocusManager: AudioFocusManager
     private lateinit var playbackManager: PlaybackManager
     private lateinit var speechInputController: SpeechInputController
+    private lateinit var conversationAdapter: ConversationAdapter
 
     private var pendingTranscript: String? = null
     private var pendingAudioBytes: ByteArray? = null
@@ -141,6 +143,22 @@ class VoiceActivity : AppCompatActivity() {
         playbackManager.init()
 
         speechInputController = SpeechInputController(this, AndroidAudioCaptureEngine())
+
+        conversationAdapter = ConversationAdapter()
+        binding.conversationRecyclerView.layoutManager = LinearLayoutManager(this)
+        binding.conversationRecyclerView.adapter = conversationAdapter
+
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                app.conversationRepository.messages.collect { messages ->
+                    conversationAdapter.submitList(messages) {
+                        if (messages.isNotEmpty()) {
+                            binding.conversationRecyclerView.scrollToPosition(messages.size - 1)
+                        }
+                    }
+                }
+            }
+        }
 
         // Same-process-only static exposure for the Diagnostics screen,
         // mirroring PresenceService.activeClient's doc-commented rationale:
@@ -361,6 +379,14 @@ class VoiceActivity : AppCompatActivity() {
      * would silently never reach the screen. */
     private fun showError(message: String) {
         userFacingError = message
+        app.conversationRepository.addMessage(
+            ConversationMessage(
+                id = java.util.UUID.randomUUID().toString(),
+                type = ConversationMessage.Type.SYSTEM_EVENT,
+                content = message,
+                timestamp = System.currentTimeMillis(),
+            )
+        )
         render(
             app.voiceSessionRepository.current.value,
             app.voiceSessionRepository.lastResponse.value,
@@ -395,8 +421,6 @@ class VoiceActivity : AppCompatActivity() {
         if (userFacingError != null) {
             isAwaitingResponse = false
             binding.statusText.text = "error"
-            binding.responseText.text = userFacingError
-            binding.responseText.visibility = View.VISIBLE
             return
         }
 
@@ -424,17 +448,6 @@ class VoiceActivity : AppCompatActivity() {
         if (response != null && response != lastSpokenText) {
             lastSpokenText = response
             playbackManager.speak(response)
-        }
-
-        // The turn response takes priority once one exists; before that, a
-        // bound session's greeting is the only text the user has been
-        // given yet, so show it rather than nothing.
-        val displayText = response ?: session?.greeting
-        if (displayText != null) {
-            binding.responseText.text = displayText
-            binding.responseText.visibility = View.VISIBLE
-        } else {
-            binding.responseText.visibility = View.GONE
         }
     }
 

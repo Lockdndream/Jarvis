@@ -150,6 +150,110 @@ not urgently), **Low** (cosmetic or very low probability of mattering).
   becomes a real product goal; unscheduled otherwise.
 - **Status**: Open, disclosed (`docs/decisions/ADR-018-jarvis-control-center-observability-architecture.md`)
 
+### TD-028 — Raw audio capture has no speaker isolation; any voice in range is transcribed as the user
+
+- **Description**: Discovered live during Interaction Layer Step 5
+  real-device testing (transcript verification made this visible for
+  the first time — the user could suddenly see, not just hear, what got
+  transcribed). `useRawAudioCapture`'s pipeline
+  (`SpeechInputController.startListeningRaw` → one WAV blob per
+  utterance → Groq Whisper) has no mechanism to identify who is
+  speaking, how close they are to the microphone, or to reject/attenuate
+  a second voice in range. A real session captured a phrase the user
+  did not say ("Can cancel current license") appended to their actual
+  question, most plausibly ambient/second-party speech blended into the
+  same recording window. This is a capture-and-pipeline design property,
+  not a one-off transcription error — there is no diarization,
+  voice-print matching, or proximity gating anywhere between the
+  microphone and Groq.
+- **Severity**: High for any multi-person environment (the user's own
+  words: "almost unusable if I have people around me") — the phone
+  cannot currently distinguish its owner's voice from anyone else's
+  in mic range, and a contaminated transcript is sent to the Supervisor
+  as fact, with no client-side or server-side signal that it might be
+  mixed-speaker input.
+- **Owner**: `android/.../voice/AndroidAudioCaptureEngine.kt` (capture),
+  `app/stt.py` (Groq Whisper call) — no existing module owns
+  speaker/proximity discrimination.
+- **Origin milestone**: STT feature (Month 2, raw-audio-capture rollout)
+  first noted "voice isolation" as an open concern in passing; concretely
+  reproduced with a specific bad transcript during Interaction Layer
+  Step 5 (this milestone) once the new conversation view made the
+  contaminated transcript visible rather than only heard as a slightly
+  odd spoken reply.
+- **Risk**: Any voice command interpreted from contaminated input can
+  trigger a real tool call or task on the user's behalf that they never
+  actually asked for — this is a correctness and, depending on the
+  command, a safety-adjacent risk, not merely an annoyance.
+- **Recommended milestone**: Unscheduled — needs real investigation into
+  what's feasible (on-device voice-print enrollment/matching, a
+  proximity/volume gate before capture even starts, or a lighter-weight
+  mitigation like echoing the transcript back for confirmation before
+  acting on anything non-trivial). A meaningfully different capture
+  architecture, not a small patch.
+- **Status**: Open, newly discovered and documented this milestone.
+
+### TD-029 — Silence detection can fail to trigger end-of-utterance at all, silently losing the entire recording
+
+- **Description**: Discovered live during Interaction Layer Step 5
+  real-device testing, distinct from and more severe than TD-028's
+  cross-talk contamination finding — here nothing was contaminated,
+  nothing was transcribed at all. The user said "cancel it" to a
+  listening session; the server log shows the session opened
+  (`voice session opened: id=vs_63270348a885`) and then sat in
+  `listening` state for roughly a minute with **zero** Groq
+  transcription calls logged, before finally transitioning
+  `listening -> closing -> closed` when the app was backgrounded — the
+  captured audio (if any was ever actually buffered) was never sent to
+  `sendVoiceSessionAudio` at all. `SpeechInputController.startListeningRaw`'s
+  end-of-utterance/silence-detection logic did not fire for this
+  utterance, so the turn was silently and completely lost rather than
+  merely producing a bad transcript. The user separately reported the
+  same underlying symptom conversationally ("he just continues to
+  listen even after I finished talking... I blocked both mics on my
+  phone and it still won't stop listening") before this specific,
+  loggable reproduction. **Reproduced a third time** later in the same
+  Step 5 session under the most ordinary possible condition — a room
+  fan running, no other people talking, no unusual noise — with the
+  user's own assessment: "almost unusable unless I'm in a... silent
+  room with acoustic foam." This is not an edge case requiring unusual
+  input; ordinary ambient noise (a fan, presumably equally an AC unit,
+  street noise, etc.) reproduces it directly.
+- **Severity**: **Critical**, upgraded from the original High rating —
+  the third reproduction shows this triggers under completely ordinary
+  home/office ambient noise, not a rare edge case. A user-issued
+  command (in the second reproduction, a task-cancellation request)
+  can be silently dropped with no error shown, indistinguishable from
+  the app simply ignoring the user until the session eventually times
+  out on its own. As currently observed, voice interaction is
+  effectively unreliable outside a near-silent room, which undermines
+  the core interaction mode this entire Interaction Layer milestone
+  was built to make transparent.
+- **Owner**: `android/.../voice/SpeechInputController.kt`,
+  `AndroidAudioCaptureEngine.kt` (silence/end-of-utterance detection).
+- **Origin milestone**: Silence-detection brittleness was already a
+  named open concern from the STT feature's original rollout (Month 2);
+  concretely reproduced with a specific, timestamped server-log gap
+  during Interaction Layer Step 5 (this milestone).
+- **Risk**: Any command, not just informational questions, can be lost
+  this way — including safety-relevant ones like "cancel it"/"stop it".
+  A user has no on-screen indication that their utterance was never
+  even sent, only that the app eventually gives up and returns to idle.
+- **Recommended milestone**: **The first fix after this sprint closes**
+  (explicit user priority call, given Critical severity) — a focused
+  piece of work, not a research project. Root cause per user direction:
+  the current end-of-utterance logic uses a flat RMS/amplitude
+  threshold, which cannot distinguish speech from steady-state ambient
+  noise (a fan, AC, traffic) — any such noise simply never drops below
+  the threshold, so silence is never detected. Replace with a proper
+  VAD (voice activity detection) that discriminates speech spectral/
+  temporal characteristics from steady-state noise, rather than tuning
+  the existing amplitude threshold further. May share implementation
+  territory with TD-028's speaker-isolation fix, but the VAD swap itself
+  is the well-scoped, immediately actionable piece.
+- **Status**: Open, newly discovered and documented this milestone.
+  Explicit user priority: fix immediately after Interaction Layer closes.
+
 ---
 
 ## Implementation Debt
@@ -298,6 +402,57 @@ not urgently), **Low** (cosmetic or very low probability of mattering).
   fixed. Explicit user decision: does not block shipping walk-away mode
   for personal, WiFi-only, user-present-or-nearby use; must be addressed
   before broadening that usage model.
+
+### TD-027 — Supervisor's tool-calling loop repeats identical tool calls and doesn't recognize a plain conversational decline
+
+- **Description**: Discovered live during Interaction Layer Step 5
+  real-device testing — the new `thinking_update` transparency feature
+  (Step 1/3) made this visible for the first time; the underlying
+  behavior is in `app/supervisor/supervisor.py`'s tool-calling loop, not
+  the Interaction Layer itself. Reproduced with an exact transcript
+  (`conv_ab1319fb10ef`, 2026-07-31): a single informational question
+  ("what's the last thing we did on the calculator-mod project")
+  produced 12 tool calls — `catch_me_up`, `list_tasks`, `list_plans`,
+  `what_do_you_remember`, `recent_activity`, `get_projects`, each called
+  **twice** with identical arguments — before hitting `MAX_TOOL_CALLS`
+  and returning only "I've reached the maximum number of actions I can
+  take in one response," never a real answer. The user's very next turn,
+  a plain conversational close ("No, that's all. Thank you.") with no
+  information content requiring any tool at all, triggered the
+  **identical 6-tool sequence a third time**, hit the same ceiling, and
+  returned the same generic fallback message again.
+- **Severity**: High for usability — a user cannot currently end a
+  conversation with an ordinary decline phrase without the Supervisor
+  launching a full, wasted tool-calling pass; and simple informational
+  questions can fail to produce an answer at all by exhausting
+  `MAX_TOOL_CALLS` on self-duplicated calls. Not a data-safety issue
+  (all calls were read-only informational tools in this reproduction)
+  but a first-class correctness/experience defect now that the
+  transparency feature makes it directly visible rather than only
+  inferred from a slow, unhelpful reply.
+- **Owner**: `app/supervisor/supervisor.py` (`SYSTEM_PROMPT`, the main
+  tool-calling loop, `_resolve_deterministic_command`'s decline/stop
+  grammar).
+- **Origin milestone**: Discovered during Interaction Layer Step 5
+  (real-device validation); the tool-calling loop and `SYSTEM_PROMPT`
+  themselves predate this milestone.
+- **Risk**: Any turn resembling "just tell me X" against a
+  read-only/informational question is at risk of never producing an
+  answer if the model chooses to re-call the same tools rather than
+  synthesize a response from the first pass; a plain decline being
+  misrouted into the full LLM loop wastes a `MAX_TOOL_CALLS` budget on
+  every single "no thanks."
+- **Recommended milestone**: Needs dedicated investigation, not a
+  same-pass patch: (a) whether `SYSTEM_PROMPT` needs an explicit
+  once-per-tool-per-turn instruction or the loop itself needs
+  call-signature deduplication, and (b) whether
+  `_resolve_deterministic_command`'s grammar should recognize a
+  standalone conversational close (no bound pending item, no specific
+  command) as a zero-tool acknowledgment rather than falling through to
+  the full LLM loop. Explicit user decision this milestone: document
+  only, do not fix mid-Step-5.
+- **Status**: Open, newly discovered and documented this milestone — not
+  fixed.
 
 ### TD-024 — Control Center event-shape handling relies on an unenforced naming convention
 
@@ -740,6 +895,9 @@ not urgently), **Low** (cosmetic or very low probability of mattering).
 | TD-024 | Control Center event-shape handling relies on an unenforced naming convention | Implementation | Low |
 | TD-025 | Control Center's `currentTurn` cannot represent two concurrent turns | Architecture | Low |
 | TD-026 | `project_dir` provides no real containment; zero permission gate for sandbox escape | Operational | **Critical** |
+| TD-027 | Supervisor tool-calling loop repeats identical calls; doesn't recognize a plain decline | Implementation | High |
+| TD-028 | Raw audio capture has no speaker isolation; any nearby voice is transcribed as the user | Architecture | High |
+| TD-029 | Silence detection fails under ordinary ambient noise (e.g. a room fan), silently losing the recording | Architecture | **Critical** |
 
 No duplicate entries exist between this register and `SESSION.md`'s own
 "Known Bugs, Limitations, and Technical Debt" section — this register is

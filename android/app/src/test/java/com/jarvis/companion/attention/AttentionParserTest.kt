@@ -171,6 +171,33 @@ class AttentionParserTest {
     }
 
     @Test
+    fun `parseAttentionEvent missing status returns null`() {
+        // Regression: attention_manager.py's initiate_contact() explicit
+        // "attention_created" broadcast omitted "status" until a real-device
+        // finding (Interaction Layer Step 5) showed the frame was silently
+        // dropped by this parser as a result -- Android's own status-based
+        // early-return existed long before that broadcast site did, but no
+        // test here ever exercised the combination.
+        val json = """{"type": "attention_created", "attention_request_id": "ar_1", "attention_type": "PERMISSION", "summary": "s", "task_id": "t1", "urgency": "HIGH"}"""
+        assertNull(AttentionParser.parseAttentionEvent(json))
+    }
+
+    @Test
+    fun `parseAttentionEvent parses the exact attention_created shape initiate_contact sends`() {
+        // Matches app/attention_manager.py's initiate_contact() broadcast
+        // payload field-for-field (post-fix, "status" included) rather than
+        // an idealized/hand-picked field set -- the gap that let the missing
+        // "status" field go unnoticed was every existing test here using its
+        // own hand-crafted JSON instead of the real server shape.
+        val json = """{"type": "attention_created", "attention_request_id": "attn_1", "attention_type": "PERMISSION", "status": "pending", "summary": "Needs your permission to continue.", "task_id": "oc_1", "urgency": "HIGH"}"""
+        val event = AttentionParser.parseAttentionEvent(json)
+        assertNotNull(event)
+        assertEquals("attn_1", event!!.attentionRequestId)
+        assertEquals("PERMISSION", event.attentionType)
+        assertEquals("pending", event.status)
+    }
+
+    @Test
     fun `parsePendingAttention garbage string returns empty list`() {
         assertTrue(AttentionParser.parsePendingAttention("not json").isEmpty())
     }

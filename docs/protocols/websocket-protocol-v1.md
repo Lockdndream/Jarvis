@@ -111,6 +111,7 @@ design (e.g. the app-level heartbeat frame below), not an error.
 | `*(binary frame)*` | *(n/a — raw bytes)* | **Binary frame** immediately following a `voice_session_audio` text frame. Contains the full utterance's audio as a WAV file (44-byte RIFF/WAVE header + PCM data). No JSON framing — the preceding `voice_session_audio` header carries the session association. |
 | `device_status` | `device_id`, `capabilities`, `pairing_state`, `battery_optimization_exempt`, `notification_permission_granted`, `connection_generation` | Capability advertisement / state sync (ADR-012). Fire-and-forget, no reply. Sent once per successful (re)connect by the Android companion. In-memory only server-side, not yet read by anything (groundwork for future multi-device routing). |
 | `heartbeat` | *(none)* | App-level liveness signal from the Android companion (`{"type":"heartbeat"}`), sent every 30s while connected. The server does not act on it — it exists for the *client's* own telemetry (proving the send queued successfully) and is otherwise a no-op frame, matching this protocol's "don't invent server-side handling without a demonstrated need" discipline (Milestone 9B.0). |
+| `permission_response` | `attention_request_id`, `decision` (`"approve"` \| `"reject"`) | **Interaction Layer v1.** Structured phone-to-server permission resolution for a specific AttentionRequest. Reuses the existing `_resolve_bound_command` path — the `decision` string ("approve" or "reject") is routed as `user_message` with `bound_attention_request_id` set, flowing into the same grammar (PERMISSION attention_type) that voice transcripts already use. Server replies with `permission_response_ack`. This is the missing structured response for `attention_created` (PERMISSION), which already broadcasts to the phone with `attention_request_id` — no separate `permission_request` push type is needed.
 
 ### 2.2 Server → Client
 
@@ -125,6 +126,24 @@ Sent in response to client messages or server-side events:
 `attention_*`/`notification`/`opencode_task_*` broadcast events described
 in `ARCHITECTURE.md` (not re-enumerated here — those are business-logic
 events, not part of the connection/auth protocol this document covers).
+
+#### 2.2.2 New Server → Client messages (Interaction Layer v1)
+
+These are additive Interaction Layer message types, documented here
+together rather than spreading across §2.2's existing entries.
+
+| Type | Direction | Fields | Description |
+|---|---|---|---|
+| `conversation_turn` | S → C | `role` (always `"user"` for v1), `content`, `voice_session_id`, `conversation_id`, `timestamp` | Emitted between STT resolution and supervisor invocation for a voice turn, so the phone can show "here's what Jarvis heard" before the answer arrives. The `conversation_id` may be `null` on the first turn of a session before `_process_transcript` assigns one (known v1 limitation). An assistant-role variant is not needed — `voice_session_response` already carries the assistant's text and already reaches the phone. |
+| `thinking_update` | S → C | `action` (`"tool_call"`), `status` (`"started"` \| `"completed"`), `summary`, `detail` (nullable, short human-readable result synopsis on completion), `conversation_id`, `trace_id`, `timestamp` | Emitted for each tool call the supervisor executes, alongside the existing dashboard-only `supervisor_tool_call` broadcast. On `"started"`, `detail` is `null`. On `"completed"`, `detail` is a bounded (≤200 char) human-legible synopsis derived from the tool result — never raw `args` or a full untruncated result. No `thinking_update` is sent for plan-step-level activity (out of scope for v1). |
+| `permission_response_ack` | S → C | `attention_request_id`, `response`, `conversation_id` | Sent in reply to a `permission_response` after the supervisor resolves the permission. Reuses `_resolve_bound_command` — the `response` field carries its result text. |
+
+> **Deliberate omission:** no new `permission_request` push type was added.
+> `attention_created` (ATTENTION_TYPE=PERMISSION) already broadcasts to the
+> phone with `attention_request_id` and a lock-screen-safe `summary` whenever
+> a PERMISSION-type AttentionRequest is created. Adding a second,
+> differently-shaped push for the same event would put two representations
+> of one event on the wire.
 
 #### 2.2.1 `trace_id` (ADR-020, additive)
 

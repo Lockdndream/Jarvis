@@ -229,6 +229,7 @@ async def initiate_contact(conn_manager, attention_row: dict) -> None:
             "type": "attention_created",
             "attention_request_id": attention_row["attention_request_id"],
             "attention_type": attention_row["attention_type"],
+            "status": STATUS_PENDING,
             "summary": attention_row["summary"],
             "task_id": attention_row["task_id"],
             "urgency": attention_row["urgency"],

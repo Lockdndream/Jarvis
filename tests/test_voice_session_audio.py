@@ -105,6 +105,10 @@ def test_binary_frame_with_stt_transcribes_and_feeds_pipeline(client, monkeypatc
         ws.send_json({"type": "voice_session_audio", "voice_session_id": vsid})
         ws.send_bytes(audio)
 
+        conversation_turn = ws.receive_json()
+        assert conversation_turn["type"] == "conversation_turn"
+        assert conversation_turn["content"] == "hello world"
+
         reply = ws.receive_json()
         assert reply["type"] == "voice_session_response"
         assert reply["voice_session_id"] == vsid

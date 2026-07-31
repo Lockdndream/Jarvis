@@ -212,8 +212,16 @@ class OpenCodeAdapter:
             return data if isinstance(data, list) else data.get("value", [])
 
     async def reply_permission(self, request_id: str, directory: str, approved: bool) -> None:
+        # Real-device finding (Interaction Layer Step 5): this previously
+        # sent {"approved": bool}, which OpenCode's actual API rejects with
+        # 400 (additionalProperties: false on this endpoint's schema — see
+        # GET /doc). The real schema requires "reply": "once"|"always"|
+        # "reject". "once" (not "always") is the correct mapping for a
+        # single approved decision -- "always" would silently pre-approve
+        # future requests of this kind without asking again, which is not
+        # what a single Approve tap means here.
         import httpx
-        body = {"approved": approved}
+        body = {"reply": "once" if approved else "reject"}
         async with httpx.AsyncClient() as client:
             r = await client.post(
                 f"{self.base_url}/permission/{request_id}/reply",

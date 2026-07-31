@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:paddingVertical="2dp">
+
+    <TextView
+        android:id="@+id/systemText"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:padding="8dp"
+        android:textSize="14sp"
+        android:textColor="?android:attr/textColorSecondary"
+        android:textIsSelectable="true"
+        tools:text="Jarvis is working…" />
+
+    <!-- Real-device finding (Step 5): this row used to be a FrameLayout
+         sibling of systemText, so a long summary could visually and
+         functionally overlap the buttons; a tap on "Approve" landed on
+         whatever was on top in z-order instead of the button, so the
+         permission_response was silently never sent. Stacking vertically
+         guarantees the buttons always have their own space below the
+         text, however long it is. -->
+    <LinearLayout
+        android:id="@+id/permissionActions"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="end"
+        android:layout_marginTop="4dp"
+        android:orientation="horizontal"
+        android:visibility="gone"
+        tools:visibility="visible">
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/approveButton"
+            style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginEnd="4dp"
+            android:text="Approve"
+            tools:text="Approve" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/rejectButton"
+            style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginEnd="4dp"
+            android:text="Reject"
+            tools:text="Reject" />
+
+    </LinearLayout>
+</LinearLayout>

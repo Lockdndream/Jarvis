@@ -84,6 +84,20 @@ async def _broadcast(event_type: str, payload: dict) -> None:
     except Exception as e:
         logger.warning("%s broadcast failed (state unaffected): %s", event_type, e)
 
+
+async def _broadcast_phone(payload: dict) -> None:
+    """Phone-facing broadcast for thinking_update frames during tool execution.
+
+    No DB write, no observer gating — this sends directly to every connected
+    client via the general broadcast() fan-out, so the phone sees tool-call
+    transparency in real time."""
+    if _broadcast_hook is None:
+        return
+    try:
+        await _broadcast_hook.broadcast(payload)
+    except Exception as e:
+        logger.warning("thinking_update broadcast failed (state unaffected): %s", e)
+
 SYSTEM_PROMPT = """You are Jarvis, a laptop-resident supervisor agent. You help the user supervise tasks running on their laptop.
 
 You have access to a set of bounded tools. Use them to answer the user's questions and execute their requests.
@@ -341,8 +355,37 @@ class Supervisor:
                             break
 
                         logger.info("Tool call #%d: %s(%s)", tool_call_count, name, func["arguments"][:100], extra={"conversation_id": conversation_id, "tool": name})
+
+                        turn_trace_id = trace.current_trace_id()
+                        await _broadcast_phone({
+                            "type": "thinking_update",
+                            "action": "tool_call",
+                            "status": "started",
+                            "summary": f"Calling {name}",
+                            "detail": None,
+                            "conversation_id": conversation_id,
+                            "trace_id": turn_trace_id,
+                            "timestamp": db.utcnow(),
+                        })
+
                         result = await self.tools.call(name, args, conversation_id=conversation_id)
                         await asyncio.to_thread(_persist_tool_call, conversation_id, name, args, result)
+
+                        result_str = result if isinstance(result, str) else str(result)
+                        detail = result_str[:300]
+                        if len(detail) > 200:
+                            detail = detail[:200]
+                        await _broadcast_phone({
+                            "type": "thinking_update",
+                            "action": "tool_call",
+                            "status": "completed",
+                            "summary": f"{name} finished",
+                            "detail": detail,
+                            "conversation_id": conversation_id,
+                            "trace_id": turn_trace_id,
+                            "timestamp": db.utcnow(),
+                        })
+
                         await _broadcast("supervisor_tool_call", {
                             "conversation_id": conversation_id,
                             "sequence": tool_call_count,
@@ -406,8 +449,37 @@ class Supervisor:
                 "Confirmed tool call: %s(%s)", name, json.dumps(args)[:100],
                 extra={"conversation_id": conversation_id, "tool": name},
             )
+
+            turn_trace_id = trace.current_trace_id()
+            await _broadcast_phone({
+                "type": "thinking_update",
+                "action": "tool_call",
+                "status": "started",
+                "summary": f"Calling {name}",
+                "detail": None,
+                "conversation_id": conversation_id,
+                "trace_id": turn_trace_id,
+                "timestamp": db.utcnow(),
+            })
+
             result = await self.tools.call(name, args, conversation_id=conversation_id)
             await asyncio.to_thread(_persist_tool_call, conversation_id, name, args, result)
+
+            result_str = result if isinstance(result, str) else str(result)
+            detail = result_str[:300]
+            if len(detail) > 200:
+                detail = detail[:200]
+            await _broadcast_phone({
+                "type": "thinking_update",
+                "action": "tool_call",
+                "status": "completed",
+                "summary": f"{name} finished",
+                "detail": detail,
+                "conversation_id": conversation_id,
+                "trace_id": turn_trace_id,
+                "timestamp": db.utcnow(),
+            })
+
             await _broadcast("supervisor_tool_call", {
                 "conversation_id": conversation_id,
                 "sequence": 1,

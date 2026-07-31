@@ -2,6 +2,9 @@ package com.jarvis.companion.network
 
 import com.jarvis.companion.attention.AttentionParser
 import com.jarvis.companion.attention.AttentionRepository
+import com.jarvis.companion.conversation.ConversationMessage
+import com.jarvis.companion.conversation.ConversationParser
+import com.jarvis.companion.conversation.ConversationRepository
 import com.jarvis.companion.core.ConnectionState
 import com.jarvis.companion.core.DeviceCapabilities
 import com.jarvis.companion.core.DeviceStatus
@@ -95,6 +98,7 @@ class CompanionWebSocketClient(
     private val attentionRepository: AttentionRepository,
     private val voiceSessionRepository: VoiceSessionRepository,
     private val openCodeTaskRepository: OpenCodeTaskRepository,
+    private val conversationRepository: ConversationRepository,
 ) {
     private val generationTracker = ConnectionGenerationTracker()
     private val backoff = BackoffPolicy()
@@ -163,6 +167,7 @@ class CompanionWebSocketClient(
         connectedSinceMs = null
         attentionRepository.clear()
         voiceSessionRepository.clear()
+        conversationRepository.clear()
         telemetry.record(TelemetryRecorder.WS_DISCONNECTED, "reason=${DisconnectReason.USER_STOPPED}")
         setState(ConnectionState.DISCONNECTED)
     }
@@ -235,6 +240,19 @@ class CompanionWebSocketClient(
             TelemetryRecorder.ATTENTION_COMMAND_SENT,
             "queued=$sent attentionRequestId=$attentionRequestId phrase=$phrase",
         )
+        return sent
+    }
+
+    fun sendPermissionResponse(attentionRequestId: String, decision: String): Boolean {
+        val payload = JSONObject().apply {
+            put("type", "permission_response")
+            put("attention_request_id", attentionRequestId)
+            put("decision", decision)
+        }
+        val sent = webSocket?.send(payload.toString()) ?: false
+        if (sent) {
+            conversationRepository.markPermissionResolved(attentionRequestId)
+        }
         return sent
     }
 
@@ -312,6 +330,7 @@ class CompanionWebSocketClient(
             // mirror is cleared here too rather than left stale forever.
             attentionRepository.clear()
             voiceSessionRepository.clear()
+            conversationRepository.clear()
             telemetry.record(TelemetryRecorder.WS_PERMANENT_FAILURE, "reason=$reason")
             setState(ConnectionState.FAILED_PERMANENT)
             return
@@ -388,6 +407,30 @@ class CompanionWebSocketClient(
             AttentionParser.isAttentionEventType(type) -> {
                 val event = AttentionParser.parseAttentionEvent(text) ?: return
                 attentionRepository.applyAttentionEvent(event)
+                // Interaction Layer Step 2: permission requests are part of
+                // the conversation view too, so mirror them into the
+                // in-memory conversation repository alongside attention state.
+                if (event.attentionType == "PERMISSION" && type == "attention_created") {
+                    conversationRepository.addMessage(
+                        ConversationMessage(
+                            id = java.util.UUID.randomUUID().toString(),
+                            type = ConversationMessage.Type.PERMISSION_REQUEST,
+                            content = event.summary ?: "",
+                            timestamp = System.currentTimeMillis(),
+                            permissionId = event.attentionRequestId,
+                            metadata = event.conversationId?.let { mapOf("conversation_id" to it) },
+                        ),
+                    )
+                }
+                // Interaction Layer Step 4: a permission can be resolved by
+                // voice, another device, or the in-app button — resolve the
+                // corresponding conversation row from every channel, not just
+                // the button path.
+                if (event.attentionType == "PERMISSION" && type in setOf(
+                        "attention_resolved", "attention_cancelled", "attention_expired",
+                    )) {
+                    conversationRepository.markPermissionResolved(event.attentionRequestId)
+                }
                 telemetry.record(
                     TelemetryRecorder.ATTENTION_EVENT_APPLIED,
                     "type=$type attentionRequestId=${event.attentionRequestId} status=${event.status}",
@@ -408,10 +451,47 @@ class CompanionWebSocketClient(
         }
         if (!VoiceSessionParser.isVoiceSessionEventType(type)) return
         when (type) {
-            "voice_session_opened" -> VoiceSessionParser.parseOpened(text)?.let { voiceSessionRepository.applyOpened(it) }
+            "voice_session_opened" -> VoiceSessionParser.parseOpened(text)?.let {
+                voiceSessionRepository.applyOpened(it)
+                // Interaction Layer Step 3 checkpoint fix: a bound session's
+                // greeting used to render via VoiceActivity's now-removed
+                // responseText fallback (`response ?: session?.greeting`).
+                // Since the conversation view is the only surface left, the
+                // greeting needs its own mirror here or it's spoken (TTS)
+                // but never shown.
+                it.greeting?.let { greeting ->
+                    conversationRepository.addMessage(
+                        ConversationMessage(
+                            id = java.util.UUID.randomUUID().toString(),
+                            type = ConversationMessage.Type.ASSISTANT_MESSAGE,
+                            content = greeting,
+                            timestamp = System.currentTimeMillis(),
+                            metadata = buildMap {
+                                put("voice_session_id", it.voiceSessionId)
+                                it.conversationId?.let { cid -> put("conversation_id", cid) }
+                            },
+                        ),
+                    )
+                }
+            }
             "voice_session_response" -> VoiceSessionParser.parseResponse(text)?.let {
                 it.traceId?.let { tid -> lastKnownTraceId = tid }
                 voiceSessionRepository.applyResponse(it)
+                // Interaction Layer Step 2: the assistant's reply is also a
+                // conversation message, so mirror it into the in-memory
+                // conversation repository alongside the voice session state.
+                conversationRepository.addMessage(
+                    ConversationMessage(
+                        id = java.util.UUID.randomUUID().toString(),
+                        type = ConversationMessage.Type.ASSISTANT_MESSAGE,
+                        content = it.response,
+                        timestamp = System.currentTimeMillis(),
+                        metadata = buildMap {
+                            put("voice_session_id", it.voiceSessionId)
+                            it.conversationId?.let { cid -> put("conversation_id", cid) }
+                        },
+                    ),
+                )
             }
             "voice_session_error" -> VoiceSessionParser.parseError(text)?.let {
                 voiceSessionRepository.applyError(it.voiceSessionId)
@@ -443,6 +523,31 @@ class CompanionWebSocketClient(
             "opencode_task_completed" -> OpenCodeTaskParser.parseCompleted(text)?.let {
                 openCodeTaskRepository.applyCompleted(it)
                 telemetry.record(TelemetryRecorder.OPENCODE_TASK_COMPLETED, "taskId=${it.taskId} status=${it.status}")
+            }
+        }
+    }
+
+    /** Interaction Layer Step 2: sniffs conversation_turn / thinking_update /
+     * permission_response_ack and mirrors them into [conversationRepository].
+     * Same one-place-only, never-throws pattern as [applyAttentionFrame]/
+     * [applyVoiceSessionFrame]/[applyOpenCodeTaskFrame]. */
+    private fun applyConversationFrame(text: String) {
+        val type = try {
+            JSONObject(text).optString("type", "")
+        } catch (_: Exception) {
+            return
+        }
+        if (!ConversationParser.isConversationEventType(type)) return
+        when (type) {
+            "conversation_turn" -> ConversationParser.parseConversationTurn(text)?.let {
+                conversationRepository.addMessage(it)
+            }
+            "thinking_update" -> ConversationParser.parseThinkingUpdate(text)?.let {
+                conversationRepository.addMessage(it)
+            }
+            "permission_response_ack" -> ConversationParser.parsePermissionResponseAck(text)?.let {
+                conversationRepository.addMessage(it)
+                it.permissionId?.let { pid -> conversationRepository.markPermissionResolved(pid) }
             }
         }
     }
@@ -515,6 +620,7 @@ class CompanionWebSocketClient(
             applyAttentionFrame(text)
             applyVoiceSessionFrame(text)
             applyOpenCodeTaskFrame(text)
+            applyConversationFrame(text)
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {

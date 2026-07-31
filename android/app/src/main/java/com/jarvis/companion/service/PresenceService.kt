@@ -440,6 +440,7 @@ class PresenceService : Service() {
                 attentionRepository = app.attentionRepository,
                 voiceSessionRepository = app.voiceSessionRepository,
                 openCodeTaskRepository = app.openCodeTaskRepository,
+                conversationRepository = app.conversationRepository,
             )
             client.onStateChange = { state ->
                 app.updateConnectionState(state)
