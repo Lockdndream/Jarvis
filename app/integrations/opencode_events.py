@@ -37,17 +37,29 @@ def normalize_question(oc_question: dict, task_id: str) -> dict | None:
 def normalize_permission(oc_permission: dict, task_id: str) -> dict | None:
     """Convert an OpenCode permission request to a Jarvis permission event.
 
-    Expected OpenCode permission shape:
+    Real OpenCode 1.15.10 PermissionRequest shape (confirmed via the
+    installed version's own OpenAPI spec, GET /doc):
         {
-            "requestID": "...",
-            "action": "read",
-            "path": "/some/file",
-            "sessionID": "..."
+            "id": "per_...",
+            "sessionID": "...",
+            "permission": "read",
+            "patterns": [".env"],
+            "metadata": {},
+            "always": ["*"],
+            "tool": {"messageID": "...", "callID": "..."}
         }
+    `permission` is the action (e.g. "read", "edit", "bash"); `patterns`
+    is a list of glob strings the request applies to, not a single path.
+    Older/alternate shapes using "action"/"path"/"file"/"requestID" are
+    accepted as a fallback for compatibility.
     """
-    request_id = oc_permission.get("requestID") or oc_permission.get("id")
-    action = oc_permission.get("action", "unknown")
-    path = oc_permission.get("path", oc_permission.get("file", ""))
+    request_id = oc_permission.get("id") or oc_permission.get("requestID")
+    action = oc_permission.get("permission") or oc_permission.get("action", "unknown")
+    patterns = oc_permission.get("patterns")
+    if patterns:
+        path = ", ".join(patterns)
+    else:
+        path = oc_permission.get("path", oc_permission.get("file", ""))
     if not request_id:
         logger.warning("Skipping malformed permission: %s", oc_permission)
         return None

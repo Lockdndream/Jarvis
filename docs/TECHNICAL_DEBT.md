@@ -453,10 +453,60 @@ more confidence than the evidence supports.
   net walk-away mode currently still leaves partially intact. Must be
   resolved before any future milestone considers remote/non-LAN access
   (TD-003) or fully unattended overnight autonomous operation.
-- **Status**: Open, newly discovered and documented this milestone — not
-  fixed. Explicit user decision: does not block shipping walk-away mode
-  for personal, WiFi-only, user-present-or-nearby use; must be addressed
-  before broadening that usage model.
+- **Status**: **Downgraded from Critical to High** (2026-08-01, TD-026
+  investigation, see below). Not closed — real residual risk remains,
+  named explicitly.
+
+**Update (2026-08-01)**: A live-server investigation (five containment
+angles tested directly against the running `opencode serve` instance, not
+inferred from documentation — see `docs/decisions/ADR-032-opencode-permission-visibility-not-containment.md`
+for the full evidence trail) found the actual root cause and fixed it,
+while confirming that comprehensive containment is not achievable with
+the installed OpenCode version (1.15.10):
+
+- **Root cause, fixed**: `OpenCodeAdapter.create_session()` never sent
+  OpenCode a `directory` parameter, so every session silently defaulted
+  to the server's own subprocess cwd (the repo root) regardless of the
+  task's assigned `project_dir`. Sessions are now correctly bound to
+  their assigned directory at creation. This is a real correctness fix,
+  confirmed live — not a guess.
+- **A second real bug, fixed**: `normalize_permission()` read a permission
+  shape (`action`/`path`) that never matched OpenCode's real schema
+  (`permission`/`patterns`). Every permission that reached a user before
+  this fix showed a blank action and empty path. Fixed to read the real
+  schema.
+- **Visibility, added**: when OpenCode's own permission system does queue
+  a request, it now also logs at WARNING, creates an episodic memory
+  entry, and broadcasts a `thinking_update` to the conversation UI — not
+  just the PWA's approve/deny buttons as before.
+- **Containment, tested and confirmed NOT achievable in this version**:
+  `external_directory` (OpenCode's own "ask before touching paths outside
+  the project" feature, documented default "ask") did not fire for a read
+  at any distance — inside the repo but outside the sandbox, or entirely
+  outside the repo. Session-level permission overrides have no effect on
+  it (undocumented for session scope, confirmed empirically). Adding
+  explicit sensitive-file permission rules to the global config not only
+  failed to gate anything, it **disabled `.env`'s own working built-in
+  default**, which had gated correctly in three earlier observations —
+  reverting the config and restarting the server did not restore that
+  default. This was not shipped. `bash` remains completely ungated
+  regardless of any configuration tried, and it was the original
+  incident's actual vector (`pytest tests/`, `pip install`,
+  `Get-ChildItem`, all ungated).
+- **Honest residual risk**: Jarvis now correctly scopes sessions and
+  surfaces permissions when OpenCode fires them, but OpenCode's
+  permission system does not comprehensively gate file access or shell
+  commands in the installed version. An agent with shell access can
+  still reach any path the OS-level process can reach, with no prompt
+  and no log. Real containment would require either a newer OpenCode
+  version with working `external_directory` enforcement, or OS-level
+  sandboxing (restricted account, container, filesystem ACLs) — a
+  limitation of the tool, not a gap in Jarvis's own integration.
+- **Recommendation unchanged**: still must be resolved (or the OS-level
+  alternative built) before any milestone removes the "user present and
+  able to notice something wrong" assumption — fully unattended overnight
+  operation or remote/non-LAN access (TD-003) should not proceed on the
+  current containment level.
 
 ### TD-027 — Supervisor's tool-calling loop repeats identical tool calls and doesn't recognize a plain conversational decline
 
@@ -949,7 +999,7 @@ more confidence than the evidence supports.
 | TD-023 | Active VoiceSession recovery under real-device failure injection unproven | Testing | Medium |
 | TD-024 | Control Center event-shape handling relies on an unenforced naming convention | Implementation | Low |
 | TD-025 | Control Center's `currentTurn` cannot represent two concurrent turns | Architecture | Low |
-| TD-026 | `project_dir` provides no real containment; zero permission gate for sandbox escape | Operational | **Critical** |
+| TD-026 | `project_dir` provides no real containment; zero permission gate for sandbox escape | Operational | High (was Critical) |
 | TD-027 | Supervisor tool-calling loop repeats identical calls; doesn't recognize a plain decline | Implementation | High |
 | TD-028 | Raw audio capture has no speaker isolation; any nearby voice is transcribed as the user | Architecture | High |
 | TD-029 | Silence detection fails under ordinary ambient noise (e.g. a room fan), silently losing the recording | Architecture | **Critical** |

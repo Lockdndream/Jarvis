@@ -105,6 +105,7 @@ class OpenCodeAdapter:
         async with httpx.AsyncClient() as client:
             r = await client.post(
                 f"{self.base_url}/session",
+                params={"directory": directory},
                 headers=self._headers(),
                 json={},
                 timeout=10,

@@ -48,6 +48,7 @@ class FakeOpenCodeServer:
         self.permission_replies: list[dict] = []
         self.messages: dict[str, list] = {}
         self.last_prompt_model: dict | None = None
+        self.last_create_session_directory: str | None = None
         self._app = self._build_app()
         self._server = None
 
@@ -64,10 +65,11 @@ class FakeOpenCodeServer:
             return {"healthy": True, "version": "1.15.10"}
 
         @app.post("/session")
-        async def create_session():
+        async def create_session(request: Request):
             import uuid
             sid = f"ses_test_{uuid.uuid4().hex[:8]}"
             svc.sessions[sid] = {"id": sid, "status": "running"}
+            svc.last_create_session_directory = request.query_params.get("directory")
             return {"id": sid}
 
         @app.get("/session/{session_id}")
@@ -513,6 +515,156 @@ async def test_events_normalize_permission():
     assert result["path"] == "/tmp/test.txt"
     assert result["task_id"] == "task-1"
     assert result["source"] == "opencode"
+
+
+@pytest.mark.asyncio
+async def test_events_normalize_permission_real_schema():
+    from app.integrations.opencode_events import normalize_permission
+    oc_p = {
+        "id": "per_abc123",
+        "sessionID": "ses_xyz",
+        "permission": "read",
+        "patterns": [".env"],
+        "metadata": {},
+        "always": ["*"],
+        "tool": {"messageID": "msg_1", "callID": "call_1"},
+    }
+    result = normalize_permission(oc_p, "task-1")
+    assert result is not None
+    assert result["event"] == "permission"
+    assert result["request_id"] == "per_abc123"
+    assert result["action"] == "read"
+    assert result["path"] == ".env"
+
+
+@pytest.mark.asyncio
+async def test_events_normalize_permission_multiple_patterns():
+    from app.integrations.opencode_events import normalize_permission
+    oc_p = {
+        "id": "per_abc123",
+        "sessionID": "ses_xyz",
+        "permission": "read",
+        "patterns": [".env", "certs/foo.pem"],
+        "metadata": {},
+        "always": ["*"],
+        "tool": {"messageID": "msg_1", "callID": "call_1"},
+    }
+    result = normalize_permission(oc_p, "task-1")
+    assert result is not None
+    assert result["path"] == ".env, certs/foo.pem"
+
+
+@pytest.mark.asyncio
+async def test_adapter_create_session_passes_directory():
+    fake = FakeOpenCodeServer()
+    await fake.start()
+    try:
+        adapter = OpenCodeAdapter(base_url=fake.base_url)
+        sid = await adapter.create_session(directory="/tmp/my-project")
+        assert sid.startswith("ses_test_")
+        assert fake.last_create_session_directory == "/tmp/my-project"
+    finally:
+        await fake.stop()
+
+
+@pytest.mark.asyncio
+async def test_emit_permission_warning_log(caplog):
+    import collections
+    import logging
+
+    sv = OpenCodeSupervisor.__new__(OpenCodeSupervisor)
+    sv.cm = ConnectionManager()
+    sv._completion_events = {}
+    sv._error_since_prompt = {}
+    sv._seen_event_ids = collections.deque(maxlen=500)
+    sv._seen_event_ids_set = set()
+
+    task_id = "oc_warn_test"
+    db.create_task_record(task_id, "Warning Test", "test")
+    db.create_opencode_task_record(task_id, "ses_warn", "/tmp/test", "test")
+
+    with caplog.at_level(logging.WARNING, logger="app.integrations.opencode_supervisor"):
+        await sv._emit_permission({
+            "task_id": task_id,
+            "request_id": "per_warn1",
+            "action": "write",
+            "path": "/etc/passwd",
+        })
+
+    warning_records = [r for r in caplog.records if "CONTAINMENT" in r.message]
+    assert len(warning_records) == 1
+    assert "/etc/passwd" in warning_records[0].message
+
+
+@pytest.mark.asyncio
+async def test_emit_permission_episodic_memory():
+    import collections
+
+    sv = OpenCodeSupervisor.__new__(OpenCodeSupervisor)
+    sv.cm = ConnectionManager()
+    sv._completion_events = {}
+    sv._error_since_prompt = {}
+    sv._seen_event_ids = collections.deque(maxlen=500)
+    sv._seen_event_ids_set = set()
+
+    task_id = "oc_mem_test"
+    db.create_task_record(task_id, "Memory Test", "test")
+    db.create_opencode_task_record(task_id, "ses_mem", "/tmp/test", "test")
+
+    await sv._emit_permission({
+        "task_id": task_id,
+        "request_id": "per_mem1",
+        "action": "edit",
+        "path": "src/main.py",
+    })
+
+    from app.memory import get_memories_by_source
+    mems = get_memories_by_source("opencode_permission", "per_mem1")
+    assert len(mems) >= 1
+    assert mems[0]["category"] == "episodic"
+    assert "edit" in mems[0]["content"]
+    assert "src/main.py" in mems[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_emit_permission_thinking_update_broadcast():
+    import collections
+
+    sv = OpenCodeSupervisor.__new__(OpenCodeSupervisor)
+    sv.cm = ConnectionManager()
+    sv._completion_events = {}
+    sv._error_since_prompt = {}
+    sv._seen_event_ids = collections.deque(maxlen=500)
+    sv._seen_event_ids_set = set()
+
+    ws = RecordingWebSocket()
+    await sv.cm.connect(ws)
+
+    task_id = "oc_think_test"
+    db.create_task_record(task_id, "Think Test", "test", trace_id="trace_abc")
+    db.create_opencode_task_record(task_id, "ses_think", "/tmp/test", "test", trace_id="trace_abc")
+
+    await sv._emit_permission({
+        "task_id": task_id,
+        "request_id": "per_think1",
+        "action": "bash",
+        "path": "rm -rf /",
+    })
+
+    thinking_updates = []
+    for raw in ws.sent:
+        parsed = json.loads(raw)
+        if parsed.get("type") == "thinking_update":
+            thinking_updates.append(parsed)
+
+    assert len(thinking_updates) >= 1
+    update = thinking_updates[0]
+    assert update["type"] == "thinking_update"
+    assert update["action"] == "opencode_permission"
+    assert update["status"] == "started"
+    assert "bash" in update["summary"]
+    assert update["trace_id"] == "trace_abc"
+    assert "timestamp" in update
 
 
 def _real_sse_frame(directory, evt_type, properties, evt_id="evt_test1"):

@@ -712,11 +712,34 @@ class OpenCodeSupervisor:
         await self._notify_broadcast(msg)
 
         logger.info("opencode permission received: task_id=%s permission_id=%s", task_id, request_id)
+        logger.warning(
+            "CONTAINMENT: OpenCode task %s requested permission action=%s path=%s — awaiting user approval",
+            task_id, event["action"], event.get("path", ""),
+        )
         await adb.update_task_status(task_id, "waiting_for_user")
         await adb.update_opencode_task_status(task_id, "waiting_for_user")
 
         task = await adb.get_task(task_id)
         task_name = task["name"] if task else "A task"
+        try:
+            await adb.store_memory(
+                category="episodic",
+                content=f"OpenCode requested {event['action']} permission for {event.get('path', '')} during task '{task_name}' ({task_id}).",
+                source="opencode_permission",
+                source_id=request_id,
+            )
+        except Exception:
+            logger.warning("Failed to store episodic memory for permission %s", request_id)
+        await self._notify_broadcast({
+            "type": "thinking_update",
+            "action": "opencode_permission",
+            "status": "started",
+            "summary": f"OpenCode requested {event['action']} permission for {event.get('path', '')}",
+            "detail": None,
+            "conversation_id": None,
+            "trace_id": task.get("trace_id") if task else None,
+            "timestamp": db.utcnow(),
+        })
         # Phase 15: keep this generic — never include the raw path/action
         # detail here. Full context is already visible in the authenticated
         # app's Needs Your Attention panel (the task_permission WS message
