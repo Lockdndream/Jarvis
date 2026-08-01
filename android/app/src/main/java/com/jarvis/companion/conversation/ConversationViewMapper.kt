@@ -41,7 +41,13 @@ fun ConversationMessage.toConversationViewType(): Int = when (type) {
  * - [ConversationMessage.Type.SYSTEM_EVENT]: the raw [ConversationMessage.content].
  */
 fun ConversationMessage.toConversationDisplayText(): String = when (type) {
-    ConversationMessage.Type.USER_MESSAGE,
+    ConversationMessage.Type.USER_MESSAGE -> {
+        if (status == ConversationMessage.Status.STARTED && content.isEmpty()) {
+            "Listening\u2026"
+        } else {
+            content
+        }
+    }
     ConversationMessage.Type.ASSISTANT_MESSAGE,
     ConversationMessage.Type.SYSTEM_EVENT -> content
     ConversationMessage.Type.PERMISSION_REQUEST -> "Permission needed: $content"
@@ -62,6 +68,13 @@ fun ConversationMessage.toConversationDisplayText(): String = when (type) {
  */
 fun ConversationMessage.isUserAlignedEnd(): Boolean =
     type == ConversationMessage.Type.USER_MESSAGE
+
+/**
+ * True for a user message that is currently being transcribed live and has
+ * not yet reached a final result.
+ */
+fun ConversationMessage.isLivePartialTranscript(): Boolean =
+    type == ConversationMessage.Type.USER_MESSAGE && status == ConversationMessage.Status.STARTED
 
 fun ConversationMessage.showsPermissionActions(): Boolean =
     type == ConversationMessage.Type.PERMISSION_REQUEST && status == null

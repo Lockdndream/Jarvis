@@ -12,7 +12,11 @@ import kotlinx.coroutines.flow.asStateFlow
 
 interface AudioCaptureEngine {
     fun isCaptureAvailable(): Boolean
-    fun startCapture(onAudioCaptured: (ByteArray) -> Unit, onError: (String) -> Unit)
+    fun startCapture(
+        onAudioCaptured: (ByteArray) -> Unit,
+        onError: (String) -> Unit,
+        onIdleTimeout: () -> Unit = {},
+    )
     fun cancel()
 }
 
@@ -44,7 +48,15 @@ class SpeechInputController internal constructor(
     private val _state = MutableStateFlow(State.IDLE)
     val state: StateFlow<State> = _state.asStateFlow()
 
-    fun startListening(onResult: (String) -> Unit, onError: (String) -> Unit) {
+    fun isRecognitionAvailable(): Boolean = recognizerEngine.isRecognitionAvailable()
+
+    fun startListening(
+        onResult: (String) -> Unit,
+        onError: (String) -> Unit,
+        onPartialResult: (String) -> Unit = {},
+        onBeginningOfSpeech: () -> Unit = {},
+        onEmptyResult: () -> Unit = {},
+    ) {
         if (_state.value != State.IDLE) return
 
         if (!recognizerEngine.isRecognitionAvailable()) {
@@ -65,6 +77,16 @@ class SpeechInputController internal constructor(
                 _state.value = State.ERROR
                 onError(message)
                 _state.value = State.IDLE
+            },
+            onPartialResultCallback = { partial ->
+                onPartialResult(partial)
+            },
+            onBeginningOfSpeechCallback = {
+                onBeginningOfSpeech()
+            },
+            onEmptyResultCallback = {
+                _state.value = State.IDLE
+                onEmptyResult()
             },
         )
     }
@@ -117,7 +139,13 @@ class SpeechInputController internal constructor(
      */
     interface SpeechRecognizerEngine {
         fun isRecognitionAvailable(): Boolean
-        fun startListening(onResultCallback: (String) -> Unit, onErrorCallback: (String) -> Unit)
+        fun startListening(
+            onResultCallback: (String) -> Unit,
+            onErrorCallback: (String) -> Unit,
+            onPartialResultCallback: (String) -> Unit = {},
+            onBeginningOfSpeechCallback: () -> Unit = {},
+            onEmptyResultCallback: () -> Unit = {},
+        )
         fun cancel()
     }
 }
@@ -159,13 +187,22 @@ internal class AndroidSpeechRecognizerEngine(
     override fun isRecognitionAvailable(): Boolean =
         SpeechRecognizer.isRecognitionAvailable(context)
 
-    override fun startListening(onResultCallback: (String) -> Unit, onErrorCallback: (String) -> Unit) {
-        attemptListen(onResultCallback, onErrorCallback, hasRetried = false)
+    override fun startListening(
+        onResultCallback: (String) -> Unit,
+        onErrorCallback: (String) -> Unit,
+        onPartialResultCallback: (String) -> Unit,
+        onBeginningOfSpeechCallback: () -> Unit,
+        onEmptyResultCallback: () -> Unit,
+    ) {
+        attemptListen(onResultCallback, onErrorCallback, onPartialResultCallback, onBeginningOfSpeechCallback, onEmptyResultCallback, hasRetried = false)
     }
 
     private fun attemptListen(
         onResultCallback: (String) -> Unit,
         onErrorCallback: (String) -> Unit,
+        onPartialResultCallback: (String) -> Unit,
+        onBeginningOfSpeechCallback: () -> Unit,
+        onEmptyResultCallback: () -> Unit,
         hasRetried: Boolean,
     ) {
         destroyExisting()
@@ -189,13 +226,26 @@ internal class AndroidSpeechRecognizerEngine(
             putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 3000L)
             putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1500L)
             putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 3000L)
+            // TD-029 investigation probe: partials were previously never
+            // requested (EXTRA_PARTIAL_RESULTS unset), so onPartialResults
+            // never fired even though the callback existed. Needed to
+            // measure this device's actual endpointing/partial-result
+            // timing before committing to a parallel-capture design.
+            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
         }
 
+        val startedAtMs = android.os.SystemClock.elapsedRealtime()
         sr.setRecognitionListener(object : RecognitionListener {
             override fun onResults(results: Bundle) {
                 val transcript = extractTopResult(results)
-                if (transcript != null) {
+                android.util.Log.i(
+                    "SpeechRecognizerTiming",
+                    "onResults t=${android.os.SystemClock.elapsedRealtime() - startedAtMs}ms transcript=\"$transcript\"",
+                )
+                if (transcript != null && transcript.isNotBlank()) {
                     onResultCallback(transcript)
+                } else if (transcript != null) {
+                    onEmptyResultCallback()
                 } else {
                     onErrorCallback("No recognition results")
                 }
@@ -203,6 +253,10 @@ internal class AndroidSpeechRecognizerEngine(
             }
 
             override fun onError(errorCode: Int) {
+                android.util.Log.i(
+                    "SpeechRecognizerTiming",
+                    "onError t=${android.os.SystemClock.elapsedRealtime() - startedAtMs}ms code=$errorCode (${errorCodeToMessage(errorCode)})",
+                )
                 // Milestone 9B.10 RC finding: ERROR_CLIENT observed
                 // specifically launching via the lock-screen full-screen-
                 // intent path, correlated with the screen still turning on
@@ -213,7 +267,7 @@ internal class AndroidSpeechRecognizerEngine(
                 if (errorCode == SpeechRecognizer.ERROR_CLIENT && !hasRetried) {
                     destroyExisting()
                     mainHandler.postDelayed({
-                        attemptListen(onResultCallback, onErrorCallback, hasRetried = true)
+                        attemptListen(onResultCallback, onErrorCallback, onPartialResultCallback, onBeginningOfSpeechCallback, onEmptyResultCallback, hasRetried = true)
                     }, RETRY_DELAY_MS)
                     return
                 }
@@ -221,12 +275,28 @@ internal class AndroidSpeechRecognizerEngine(
                 destroyExisting()
             }
 
-            override fun onReadyForSpeech(params: Bundle?) {}
-            override fun onBeginningOfSpeech() {}
+            override fun onReadyForSpeech(params: Bundle?) {
+                android.util.Log.i("SpeechRecognizerTiming", "onReadyForSpeech t=${android.os.SystemClock.elapsedRealtime() - startedAtMs}ms")
+            }
+            override fun onBeginningOfSpeech() {
+                android.util.Log.i("SpeechRecognizerTiming", "onBeginningOfSpeech t=${android.os.SystemClock.elapsedRealtime() - startedAtMs}ms")
+                onBeginningOfSpeechCallback()
+            }
             override fun onRmsChanged(rmsdB: Float) {}
             override fun onBufferReceived(buffer: ByteArray?) {}
-            override fun onEndOfSpeech() {}
-            override fun onPartialResults(partialResults: Bundle?) {}
+            override fun onEndOfSpeech() {
+                android.util.Log.i("SpeechRecognizerTiming", "onEndOfSpeech t=${android.os.SystemClock.elapsedRealtime() - startedAtMs}ms")
+            }
+            override fun onPartialResults(partialResults: Bundle?) {
+                val partial = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
+                android.util.Log.i(
+                    "SpeechRecognizerTiming",
+                    "onPartialResults t=${android.os.SystemClock.elapsedRealtime() - startedAtMs}ms text=\"$partial\"",
+                )
+                if (partial != null) {
+                    onPartialResultCallback(partial)
+                }
+            }
             override fun onEvent(eventType: Int, params: Bundle?) {}
         })
 

@@ -51,6 +51,26 @@ class ConversationViewMapperTest {
     }
 
     @Test
+    fun `USER_MESSAGE started with empty content shows listening placeholder`() {
+        val message = makeMessage(
+            type = ConversationMessage.Type.USER_MESSAGE,
+            content = "",
+            status = ConversationMessage.Status.STARTED,
+        )
+        assertEquals("Listening\u2026", message.toConversationDisplayText())
+    }
+
+    @Test
+    fun `USER_MESSAGE started with partial content shows content`() {
+        val message = makeMessage(
+            type = ConversationMessage.Type.USER_MESSAGE,
+            content = "what is the",
+            status = ConversationMessage.Status.STARTED,
+        )
+        assertEquals("what is the", message.toConversationDisplayText())
+    }
+
+    @Test
     fun `ASSISTANT_MESSAGE display text is content`() {
         val message = makeMessage(
             type = ConversationMessage.Type.ASSISTANT_MESSAGE,
@@ -186,6 +206,47 @@ class ConversationViewMapperTest {
             assertFalse(
                 "type=$type should not be user-aligned end",
                 makeMessage(type = type).isUserAlignedEnd(),
+            )
+        }
+    }
+
+    // --- isLivePartialTranscript ---
+
+    @Test
+    fun `USER_MESSAGE with STARTED status is live partial transcript`() {
+        val message = makeMessage(
+            type = ConversationMessage.Type.USER_MESSAGE,
+            status = ConversationMessage.Status.STARTED,
+        )
+        assertTrue(message.isLivePartialTranscript())
+    }
+
+    @Test
+    fun `USER_MESSAGE with COMPLETED status is not live partial transcript`() {
+        val message = makeMessage(
+            type = ConversationMessage.Type.USER_MESSAGE,
+            status = ConversationMessage.Status.COMPLETED,
+        )
+        assertFalse(message.isLivePartialTranscript())
+    }
+
+    @Test
+    fun `USER_MESSAGE without status is not live partial transcript`() {
+        val message = makeMessage(type = ConversationMessage.Type.USER_MESSAGE)
+        assertFalse(message.isLivePartialTranscript())
+    }
+
+    @Test
+    fun `non-USER_MESSAGE types are never live partial transcript`() {
+        for (type in listOf(
+            ConversationMessage.Type.ASSISTANT_MESSAGE,
+            ConversationMessage.Type.THINKING,
+            ConversationMessage.Type.PERMISSION_REQUEST,
+            ConversationMessage.Type.SYSTEM_EVENT,
+        )) {
+            assertFalse(
+                "type=$type should not be a live partial transcript",
+                makeMessage(type = type, status = ConversationMessage.Status.STARTED).isLivePartialTranscript(),
             )
         }
     }

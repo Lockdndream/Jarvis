@@ -1,5 +1,6 @@
 package com.jarvis.companion.ui
 
+import android.graphics.Typeface
 import android.view.Gravity
 import android.view.LayoutInflater
 import android.view.View
@@ -17,6 +18,7 @@ import com.jarvis.companion.R
 import com.jarvis.companion.conversation.ConversationMessage
 import com.jarvis.companion.conversation.VIEW_TYPE_CHAT
 import com.jarvis.companion.conversation.VIEW_TYPE_SYSTEM
+import com.jarvis.companion.conversation.isLivePartialTranscript
 import com.jarvis.companion.conversation.isUserAlignedEnd
 import com.jarvis.companion.conversation.showsPermissionActions
 import com.jarvis.companion.conversation.toConversationDisplayText
@@ -90,6 +92,15 @@ class ConversationAdapter : ListAdapter<ConversationMessage, RecyclerView.ViewHo
                 card.strokeWidth = (2 * card.resources.displayMetrics.density).toInt()
             } else {
                 card.strokeWidth = 0
+            }
+            // Live partial-transcript bubble (Step 3): italic and muted until
+            // the final transcript arrives.
+            if (message.isLivePartialTranscript()) {
+                text.typeface = Typeface.defaultFromStyle(Typeface.ITALIC)
+                text.alpha = 0.6f
+            } else {
+                text.typeface = Typeface.defaultFromStyle(Typeface.NORMAL)
+                text.alpha = 1.0f
             }
         }
     }

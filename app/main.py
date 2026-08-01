@@ -780,6 +780,23 @@ async def websocket_endpoint(ws: WebSocket):
                 transcript = data.get("transcript", "")
                 if not vsid:
                     continue
+                # TD-029 v2 finding: the audio path (above) broadcasts
+                # conversation_turn before invoking the supervisor; this
+                # text path (now primary for interactive/screen-on mode,
+                # via Android's on-device SpeechRecognizer) previously did
+                # not, so any client relying on the server's own
+                # conversation_turn frame to render the user's turn (not
+                # the Android companion, which shows its own client-side
+                # live transcript) would never see it for a text-based
+                # turn. Mirrored here for parity between both paths.
+                await ws.send_text(json.dumps({
+                    "type": "conversation_turn",
+                    "role": "user",
+                    "content": transcript,
+                    "voice_session_id": vsid,
+                    "conversation_id": conversation_id,
+                    "timestamp": _now(),
+                }))
                 new_cid = await _process_transcript(vsid, transcript)
                 conversation_id = new_cid or conversation_id
                 continue

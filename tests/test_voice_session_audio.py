@@ -236,7 +236,61 @@ def test_voice_session_transcript_round_trip_unchanged_after_loop_restructure(cl
         )
 
         ws.send_json({"type": "voice_session_transcript", "voice_session_id": vsid, "transcript": "hello"})
+
+        # TD-029 v2: the text path now broadcasts conversation_turn before
+        # invoking the supervisor, for parity with the audio path.
+        conversation_turn = ws.receive_json()
+        assert conversation_turn["type"] == "conversation_turn"
+        assert conversation_turn["content"] == "hello"
+        assert conversation_turn["voice_session_id"] == vsid
+
         reply = ws.receive_json()
         assert reply["type"] == "voice_session_response"
         assert reply["voice_session_id"] == vsid
         assert reply["response"] == "fake response"
+
+
+def test_voice_session_transcript_broadcasts_conversation_turn(client, monkeypatch):
+    """TD-029 v2 regression: interactive mode (Android's on-device
+    SpeechRecognizer) sends the final transcript via voice_session_transcript,
+    not voice_session_audio. Before this fix, only the audio/Groq path
+    broadcast conversation_turn -- a client relying on the server's own
+    conversation_turn frame (rather than a local live-transcript UI, as the
+    Android companion now has) would never see the user's turn for a
+    text-based interaction."""
+    with client.websocket_connect("/ws") as ws:
+        _drain_initial(ws)
+
+        ws.send_json({"type": "voice_session_open", "conversation_id": None, "attention_request_id": None})
+        opened = ws.receive_json()
+        vsid = opened["voice_session_id"]
+
+        async def fake_handle_transcript(voice_session_id, transcript):
+            return {
+                "response": "fake response",
+                "conversation_id": "conv_123",
+                "attention_request_id": None,
+                "voice_session_state": "listening",
+                "trace_id": "trace-123",
+            }
+
+        monkeypatch.setattr(
+            _main_module.voice_session_manager,
+            "handle_transcript",
+            fake_handle_transcript,
+        )
+
+        ws.send_json({
+            "type": "voice_session_transcript",
+            "voice_session_id": vsid,
+            "transcript": "what is the circumference of the world",
+        })
+
+        conversation_turn = ws.receive_json()
+        assert conversation_turn["type"] == "conversation_turn"
+        assert conversation_turn["role"] == "user"
+        assert conversation_turn["content"] == "what is the circumference of the world"
+        assert conversation_turn["voice_session_id"] == vsid
+
+        reply = ws.receive_json()
+        assert reply["type"] == "voice_session_response"

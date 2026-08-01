@@ -102,6 +102,7 @@ class VoiceActivity : AppCompatActivity() {
     private var lastSpokenText: String? = null
     private var lastSpokenSessionId: String? = null
     private var userFacingError: String? = null
+    private var pendingLiveTranscriptId: String? = null
 
     // Milestone 9B.10 RC finding: the server sends exactly one
     // voice_session_response per turn, delivered only after the whole
@@ -269,8 +270,22 @@ class VoiceActivity : AppCompatActivity() {
 
     override fun onPause() {
         super.onPause()
+        val wasCapturing = speechInputController.state.value == SpeechInputController.State.LISTENING ||
+            speechInputController.state.value == SpeechInputController.State.PROCESSING
         speechInputController.cancel()
         playbackManager.cancel()
+        if (wasCapturing) {
+            audioFocusManager.abandonFocus()
+            clearPendingLiveTranscript()
+            app.conversationRepository.addMessage(
+                ConversationMessage(
+                    id = java.util.UUID.randomUUID().toString(),
+                    type = ConversationMessage.Type.SYSTEM_EVENT,
+                    content = "Listening was interrupted \u2014 please repeat that.",
+                    timestamp = System.currentTimeMillis(),
+                )
+            )
+        }
     }
 
     override fun onStop() {
@@ -322,7 +337,71 @@ class VoiceActivity : AppCompatActivity() {
 
     private fun startListening() {
         userFacingError = null
-        if (useRawAudioCapture) {
+        // Real-device finding: WakeWordManager only pauses via
+        // pauseForVoiceSession() (which requires a VoiceSession to already
+        // exist) or pauseForAudioFocusLoss() (triggered by a competing
+        // AUDIOFOCUS_GAIN request). A manual mic tap with no existing
+        // session previously satisfied neither -- WakeWordManager's own
+        // AudioRecord kept running and starved SpeechRecognizer of audio,
+        // reproducing the same "onReadyForSpeech then silence then
+        // NO_MATCH ~5s later" signature found during the parallel-capture
+        // investigation. Requesting focus here, unconditionally, before
+        // either capture path starts, guarantees WakeWordManager's own
+        // focus-loss handler pauses it regardless of session state.
+        audioFocusManager.requestFocus()
+        if (speechInputController.isRecognitionAvailable()) {
+            speechInputController.startListening(
+                onResult = { transcript ->
+                    val id = pendingLiveTranscriptId
+                    if (id != null) {
+                        app.conversationRepository.updateMessage(id, content = transcript, status = ConversationMessage.Status.COMPLETED)
+                        pendingLiveTranscriptId = null
+                    }
+                    val session = app.voiceSessionRepository.current.value
+                    if (session != null) {
+                        PresenceService.activeClient?.sendVoiceSessionTranscript(
+                            session.voiceSessionId, transcript,
+                        )
+                        isAwaitingResponse = true
+                        render(
+                            app.voiceSessionRepository.current.value,
+                            app.voiceSessionRepository.lastResponse.value,
+                            app.connectionState.value,
+                        )
+                    } else {
+                        val attentionRequestId = intent.getStringExtra(EXTRA_ATTENTION_REQUEST_ID)
+                        pendingTranscript = transcript
+                        PresenceService.activeClient?.sendVoiceSessionOpen(
+                            conversationId = null,
+                            attentionRequestId = attentionRequestId,
+                        )
+                    }
+                },
+                onError = { message -> showError(message) },
+                onPartialResult = { text ->
+                    val id = pendingLiveTranscriptId
+                    if (id != null) {
+                        app.conversationRepository.updateMessage(id, content = text, status = ConversationMessage.Status.STARTED)
+                    }
+                },
+                onBeginningOfSpeech = {
+                    val id = java.util.UUID.randomUUID().toString()
+                    pendingLiveTranscriptId = id
+                    app.conversationRepository.addMessage(
+                        ConversationMessage(
+                            id = id,
+                            type = ConversationMessage.Type.USER_MESSAGE,
+                            content = "",
+                            status = ConversationMessage.Status.STARTED,
+                            timestamp = System.currentTimeMillis(),
+                        )
+                    )
+                },
+                onEmptyResult = {
+                    clearPendingLiveTranscript()
+                },
+            )
+        } else {
             speechInputController.startListeningRaw(
                 onAudioCaptured = { audioBytes ->
                     val session = app.voiceSessionRepository.current.value
@@ -345,31 +424,6 @@ class VoiceActivity : AppCompatActivity() {
                 },
                 onError = { message -> showError(message) },
             )
-        } else {
-            speechInputController.startListening(
-                onResult = { transcript ->
-                    val session = app.voiceSessionRepository.current.value
-                    if (session != null) {
-                        PresenceService.activeClient?.sendVoiceSessionTranscript(
-                            session.voiceSessionId, transcript,
-                        )
-                        isAwaitingResponse = true
-                        render(
-                            app.voiceSessionRepository.current.value,
-                            app.voiceSessionRepository.lastResponse.value,
-                            app.connectionState.value,
-                        )
-                    } else {
-                        val attentionRequestId = intent.getStringExtra(EXTRA_ATTENTION_REQUEST_ID)
-                        pendingTranscript = transcript
-                        PresenceService.activeClient?.sendVoiceSessionOpen(
-                            conversationId = null,
-                            attentionRequestId = attentionRequestId,
-                        )
-                    }
-                },
-                onError = { message -> showError(message) },
-            )
         }
     }
 
@@ -378,6 +432,16 @@ class VoiceActivity : AppCompatActivity() {
      * doesn't touch any of those, so without this explicit call the error
      * would silently never reach the screen. */
     private fun showError(message: String) {
+        // Remove any in-progress live-transcript bubble before showing the
+        // error, so a failed capture doesn't leave a dangling "listening..."
+        // bubble on screen.
+        clearPendingLiveTranscript()
+        // A failed/errored capture attempt never proceeds to a real
+        // VoiceSession, so PresenceService's session-based WakeWordManager
+        // pause never happens either -- abandon our own focus request here
+        // so wake-word listening isn't left paused indefinitely after a
+        // failure.
+        audioFocusManager.abandonFocus()
         userFacingError = message
         app.conversationRepository.addMessage(
             ConversationMessage(
@@ -392,6 +456,14 @@ class VoiceActivity : AppCompatActivity() {
             app.voiceSessionRepository.lastResponse.value,
             app.connectionState.value,
         )
+    }
+
+    private fun clearPendingLiveTranscript() {
+        val id = pendingLiveTranscriptId
+        if (id != null) {
+            app.conversationRepository.removeMessage(id)
+        }
+        pendingLiveTranscriptId = null
     }
 
     private fun onClose() {
@@ -462,13 +534,6 @@ class VoiceActivity : AppCompatActivity() {
         // so unlike EXTRA_ATTENTION_REQUEST_ID this extra never triggers a
         // sendVoiceSessionOpen() call here; it only triggers auto-listening.
         const val EXTRA_LAUNCHED_BY_WAKEWORD = "com.jarvis.companion.EXTRA_VOICE_LAUNCHED_BY_WAKEWORD"
-
-        // Raw audio capture (Groq Whisper STT upgrade) feature flag.
-        // false = existing on-device SpeechRecognizer path (default
-        // production behavior). Flipped to true for Step 4's end-to-end
-        // validation. Local only — no settings-sync or server-pushed
-        // config for this milestone step.
-        private val useRawAudioCapture = true
 
         // In-process only (this app has no other process), read access for
         // the Diagnostics screen — same rationale as

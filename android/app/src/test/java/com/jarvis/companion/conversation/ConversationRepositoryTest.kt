@@ -162,6 +162,83 @@ class ConversationRepositoryTest {
         assertEquals(null, messages[2].status)
     }
 
+    @Test
+    fun `updateMessage replaces content and preserves position`() {
+        val first = sampleMessage("First")
+        val second = sampleMessage("Second")
+        repository.addMessage(first)
+        repository.addMessage(second)
+
+        repository.updateMessage(first.id, content = "Updated first")
+
+        val messages = repository.messages.value
+        assertEquals(2, messages.size)
+        assertEquals("Updated first", messages[0].content)
+        assertEquals("Second", messages[1].content)
+        assertEquals(first.id, messages[0].id)
+    }
+
+    @Test
+    fun `updateMessage sets status when provided`() {
+        val message = sampleMessage("Hello")
+        repository.addMessage(message)
+
+        repository.updateMessage(message.id, content = "Hello", status = ConversationMessage.Status.STARTED)
+
+        val messages = repository.messages.value
+        assertEquals(1, messages.size)
+        assertEquals(ConversationMessage.Status.STARTED, messages[0].status)
+    }
+
+    @Test
+    fun `updateMessage preserves existing status when omitted`() {
+        val message = sampleMessage("Hello").copy(status = ConversationMessage.Status.COMPLETED)
+        repository.addMessage(message)
+
+        repository.updateMessage(message.id, content = "Updated")
+
+        val messages = repository.messages.value
+        assertEquals(1, messages.size)
+        assertEquals(ConversationMessage.Status.COMPLETED, messages[0].status)
+        assertEquals("Updated", messages[0].content)
+    }
+
+    @Test
+    fun `updateMessage is no-op when id not found`() {
+        val message = sampleMessage("Hello")
+        repository.addMessage(message)
+
+        repository.updateMessage("nonexistent", content = "Updated")
+
+        val messages = repository.messages.value
+        assertEquals(1, messages.size)
+        assertEquals("Hello", messages[0].content)
+    }
+
+    @Test
+    fun `removeMessage deletes message by id`() {
+        val first = sampleMessage("First")
+        val second = sampleMessage("Second")
+        repository.addMessage(first)
+        repository.addMessage(second)
+
+        repository.removeMessage(first.id)
+
+        val messages = repository.messages.value
+        assertEquals(1, messages.size)
+        assertEquals("Second", messages[0].content)
+    }
+
+    @Test
+    fun `removeMessage is no-op when id not found`() {
+        val message = sampleMessage("Hello")
+        repository.addMessage(message)
+
+        repository.removeMessage("nonexistent")
+
+        assertEquals(1, repository.messages.value.size)
+    }
+
     private fun sampleMessage(content: String) = ConversationMessage(
         id = content,
         type = ConversationMessage.Type.USER_MESSAGE,

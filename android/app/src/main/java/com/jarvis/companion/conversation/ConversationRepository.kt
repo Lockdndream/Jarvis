@@ -26,6 +26,18 @@ class ConversationRepository {
         }
     }
 
+    fun updateMessage(id: String, content: String, status: ConversationMessage.Status? = null) {
+        _messages.update { current ->
+            current.map { message ->
+                if (message.id == id) message.copy(content = content, status = status ?: message.status) else message
+            }
+        }
+    }
+
+    fun removeMessage(id: String) {
+        _messages.update { current -> current.filter { it.id != id } }
+    }
+
     fun clear() {
         _messages.value = emptyList()
     }

@@ -129,3 +129,4 @@ Every ADR uses the same section structure, in this order:
 | [ADR-028](ADR-028-memory-v1-three-tier-model.md) | Memory v1 — Three-Tier Model on SQLite FTS5 | Accepted |
 | [ADR-029](ADR-029-walk-away-mode.md) | Walk-Away Mode — Delegate, Notify, Recall | Accepted |
 | [ADR-030](ADR-030-interaction-layer.md) | Interaction Layer — Conversation Transparency and Permission Resolution | Accepted |
+| [ADR-031](ADR-031-dual-mode-voice-capture.md) | Dual-Mode Voice Capture (Screen-On SpeechRecognizer / Screen-Off AudioRecord) | Accepted |

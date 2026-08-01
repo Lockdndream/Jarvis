@@ -251,8 +251,63 @@ not urgently), **Low** (cosmetic or very low probability of mattering).
   the existing amplitude threshold further. May share implementation
   territory with TD-028's speaker-isolation fix, but the VAD swap itself
   is the well-scoped, immediately actionable piece.
-- **Status**: Open, newly discovered and documented this milestone.
-  Explicit user priority: fix immediately after Interaction Layer closes.
+- **Status**: **Open at reduced severity (downgraded from Critical to
+  Medium)**, per TD-029 v2 (this milestone, 2026-08-01). See below —
+  the fix landed, but only covers part of the surface this entry
+  originally described.
+
+**TD-029 v2 update (2026-08-01)**: The original brief called for a VAD
+swap inside `AndroidAudioCaptureEngine`'s raw-capture path. Real-device
+testing during this milestone showed `SpeechRecognizer` and
+`AudioRecord` cannot share the microphone on the S20 FE — one always
+starves the other (confirmed via 5 controlled trials; see
+`docs/decisions/ADR-025-amendment.md`). That ruled out running both
+concurrently, which forced a redesign: **dual-mode capture, not a
+single VAD upgrade.**
+
+- **Screen-on (interactive) mode** now uses Android's on-device
+  `SpeechRecognizer` exclusively — live partial transcripts, trained
+  endpoint detection, no `AudioRecord` involved at all. This is the
+  path a user hits by tapping the mic button or opening the app.
+  Device-tested and confirmed **not to hang** under quiet-room
+  conditions (many runs) and under moderate TV background noise (one
+  run, 2026-08-01) — the TD-029 failure mode (indefinite listening,
+  silent loss of the turn) did not reproduce. Trade-off: Google's
+  on-device recognizer is measurably less accurate than the Groq
+  Whisper path it replaces for this mode (ADR-025 reversal, accepted
+  by explicit user decision — the live transcript lets the user see
+  and repeat a misheard turn, judged worth the accuracy cost). Confirmed
+  live: one word ("Endgame") was misheard under TV noise, but the
+  capture itself completed and returned cleanly.
+- **The originally-planned fix** — adaptive, rolling-noise-floor
+  silence detection replacing the flat `SILENCE_RMS_THRESHOLD = 328.0`
+  — was implemented in `AndroidAudioCaptureEngine.kt` exactly as
+  scoped, and is unit-tested (30/30, including the user's own
+  fan/quiet-room worked examples). **It has not run on a real device
+  under real ambient noise**, because it only executes as a fallback
+  when `SpeechRecognizer.isRecognitionAvailable()` is false — never
+  true on the S20 FE, or on any device with Google's speech services
+  installed. The code that fixes TD-029's literal described defect is
+  correct on paper and unverified in practice.
+- **Screen-off/background mode is out of scope for this milestone**,
+  by explicit user decision — it doesn't exist as a capability today
+  (`PresenceService` owns no capture engine of its own) and would need
+  new architecture, not a threshold fix. It remains a documented gap,
+  not a regression: background listening was never reliable before
+  this work either.
+
+**Why Medium, not Closed**: the failure mode TD-029 describes (silent,
+indefinite capture loss under ambient noise) is not reproducing on the
+path most users will actually exercise. But the specific fix this
+entry asked for is only proven in a unit-test harness, and the one
+scenario where it would run for real (a device without on-device
+speech recognition, or a future background-mode capture path) is
+exactly the scenario nobody has tested. Closing this out would assert
+more confidence than the evidence supports.
+- **Recommended next milestone**: When background-mode capture is
+  built (tracked separately, not yet scheduled), exercise this same
+  adaptive-threshold code path on-device under real ambient noise
+  before considering TD-029 fully closed.
 
 ---
 

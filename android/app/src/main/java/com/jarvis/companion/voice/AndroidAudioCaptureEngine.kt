@@ -45,7 +45,11 @@ internal class AndroidAudioCaptureEngine(
 
     override fun isCaptureAvailable(): Boolean = audioSource.isAvailable()
 
-    override fun startCapture(onAudioCaptured: (ByteArray) -> Unit, onError: (String) -> Unit) {
+    override fun startCapture(
+        onAudioCaptured: (ByteArray) -> Unit,
+        onError: (String) -> Unit,
+        onIdleTimeout: () -> Unit,
+    ) {
         if (isCapturing) return
 
         if (!audioSource.isAvailable()) {
@@ -61,16 +65,33 @@ internal class AndroidAudioCaptureEngine(
         isCapturing = true
         cancelled = false
         captureThread = Thread {
-            captureLoop(onAudioCaptured, onError)
+            captureLoop(onAudioCaptured, onError, onIdleTimeout)
         }.apply { start() }
     }
 
-    private fun captureLoop(onAudioCaptured: (ByteArray) -> Unit, onError: (String) -> Unit) {
+    private fun captureLoop(
+        onAudioCaptured: (ByteArray) -> Unit,
+        onError: (String) -> Unit,
+        onIdleTimeout: () -> Unit,
+    ) {
         val buffer = ShortArray(READ_BUFFER_SIZE_SAMPLES)
         val pcmStream = ByteArrayOutputStream()
         var capturedDurationMs = 0L
         var consecutiveSilenceMs = 0L
         var hadLoud = false
+        var primingComplete = false
+        // Freeze-on-hadLoud strategy (combined with speech-chunk exclusion):
+        // once speech is first detected, the noise floor stops updating for
+        // the remainder of this utterance. This prevents a long continuous
+        // utterance from polluting the floor estimate with speech-level RMS
+        // values, which would raise the end-of-speech threshold and risk
+        // hanging. Speech chunks are excluded from the rolling window even
+        // before the freeze, so the floor only ever reflects pre-speech
+        // ambient noise.
+        var noiseFloorFrozen = false
+        val rmsWindow = ArrayDeque<Double>()
+        var noiseFloor = NOISE_FLOOR_MIN
+
         var rmsMin = Double.MAX_VALUE
         var rmsMax = 0.0
         var rmsSum = 0.0
@@ -101,15 +122,52 @@ internal class AndroidAudioCaptureEngine(
 
                 capturedDurationMs += durationMs
 
-                if (chunkRms >= SILENCE_RMS_THRESHOLD) {
-                    hadLoud = true
-                    consecutiveSilenceMs = 0
+                if (!primingComplete) {
+                    // Priming phase: collect ambient RMS values into the
+                    // window without attempting speech detection. This lets
+                    // the noise floor stabilise so that steady ambient noise
+                    // (fan, wind, traffic) is not misclassified as speech.
+                    rmsWindow.addLast(chunkRms)
+                    while (rmsWindow.size > NOISE_FLOOR_WINDOW_CHUNKS) {
+                        rmsWindow.removeFirst()
+                    }
+                    noiseFloor = computeNoiseFloor(rmsWindow.toList(), NOISE_FLOOR_MIN)
+                    if (rmsWindow.size >= NOISE_FLOOR_PRIME_CHUNKS) {
+                        primingComplete = true
+                    }
                 } else {
-                    consecutiveSilenceMs += durationMs
-                }
+                    // Adaptive detection phase
+                    val threshold = noiseFloor * SPEECH_MULTIPLIER
 
-                if (isUtteranceComplete(hadLoud, capturedDurationMs, consecutiveSilenceMs)) {
-                    break
+                    if (chunkRms > threshold) {
+                        hadLoud = true
+                        consecutiveSilenceMs = 0
+                        noiseFloorFrozen = true
+                        // Speech chunk: do NOT add to window
+                    } else {
+                        consecutiveSilenceMs += durationMs
+                        if (!noiseFloorFrozen) {
+                            rmsWindow.addLast(chunkRms)
+                            while (rmsWindow.size > NOISE_FLOOR_WINDOW_CHUNKS) {
+                                rmsWindow.removeFirst()
+                            }
+                            noiseFloor = computeNoiseFloor(rmsWindow.toList(), NOISE_FLOOR_MIN)
+                        }
+                    }
+
+                    if (!hadLoud && capturedDurationMs >= IDLE_TIMEOUT_MS) {
+                        postCallbackIfNotCancelled { onIdleTimeout() }
+                        return
+                    }
+
+                    if (capturedDurationMs >= MAX_CAPTURE_DURATION_MS) {
+                        break
+                    }
+
+                    if (isUtteranceComplete(hadLoud, capturedDurationMs, consecutiveSilenceMs,
+                            MIN_CAPTURE_DURATION_MS, SILENCE_DURATION_MS)) {
+                        break
+                    }
                 }
             }
 
@@ -119,7 +177,8 @@ internal class AndroidAudioCaptureEngine(
                     "rms min=${"%.1f".format(if (rmsCount > 0) rmsMin else 0.0)} " +
                     "max=${"%.1f".format(rmsMax)} " +
                     "mean=${"%.1f".format(if (rmsCount > 0) rmsSum / rmsCount else 0.0)} " +
-                    "threshold=$SILENCE_RMS_THRESHOLD",
+                    "noiseFloor=${"%.1f".format(noiseFloor)} " +
+                    "threshold=${"%.1f".format(noiseFloor * SPEECH_MULTIPLIER)}",
             )
 
             val pcmBytes = pcmStream.toByteArray()
@@ -155,20 +214,40 @@ internal class AndroidAudioCaptureEngine(
     companion object {
         const val SAMPLE_RATE = 16000
 
-        // Ported from AndroidSpeechRecognizerEngine's real-device-tuned
-        // constants (lines 143-145) — 3s minimum utterance + 3s trailing
-        // silence; empirically prevents both premature cutoffs and
-        // indefinite hangs on the target device (S20 FE / Android 13).
-        const val COMPLETE_SILENCE_MS = 3000L
-        const val MINIMUM_LENGTH_MS = 3000L
-
-        // Threshold corresponding to roughly -40 dB full-scale for 16-bit PCM.
-        // -40 dB FS = 20 * log10(rms / 32767) => rms / 32767 = 10^(-2) = 0.01
-        // => rms ≈ 327.67.  This is low enough that room tone consistently
-        // falls below it on the target device (S20 FE) while normal speech
-        // reliably exceeds it — same real-device-finding comment style as
-        // AndroidSpeechRecognizerEngine lines 143-145.
+        // Legacy absolute threshold — retained only for the regression test
+        // that demonstrates the old fixed threshold would hang under ambient
+        // noise (TD-029). Not used in the adaptive capture path.
         const val SILENCE_RMS_THRESHOLD = 328.0
+
+        // Adaptive speech detection
+        const val SPEECH_MULTIPLIER = 2.5
+
+        // Silence duration required to end utterance (same 3000ms as before)
+        const val SILENCE_DURATION_MS = 3000L
+
+        // Never trigger end-of-speech before this much has been captured
+        const val MIN_CAPTURE_DURATION_MS = 1000L
+
+        // Hard stop regardless of RMS state — the actual backstop
+        const val MAX_CAPTURE_DURATION_MS = 60_000L
+
+        // Floor the noise-floor estimate so a perfectly silent room doesn't
+        // produce a near-zero threshold
+        const val NOISE_FLOOR_MIN = 50.0
+
+        // Rolling window for noise-floor estimation: 5 seconds at 100ms/chunk
+        const val NOISE_FLOOR_WINDOW_MS = 5_000L
+        internal const val NOISE_FLOOR_WINDOW_CHUNKS = (NOISE_FLOOR_WINDOW_MS / 100).toInt()
+
+        // Minimum chunks before speech detection is enabled. This brief priming
+        // period lets the noise floor stabilise so that steady ambient noise
+        // (fan, wind, traffic) is not misclassified as speech on the first
+        // chunk.  500ms is short enough that speech onset within the priming
+        // window is unlikely to contaminate the floor beyond recovery.
+        internal const val NOISE_FLOOR_PRIME_CHUNKS = 5
+
+        // If hadLoud never becomes true within 10 seconds, signal idle timeout
+        const val IDLE_TIMEOUT_MS = 10_000L
 
         // 100ms chunks at 16kHz — responsive enough for silence detection
         // without excessive thread wakeups.
@@ -183,6 +262,15 @@ internal fun computeRms(samples: ShortArray, sampleCount: Int): Double {
         sum += s * s
     }
     return sqrt(sum / sampleCount)
+}
+
+internal fun computeNoiseFloor(rmsValues: List<Double>, noiseFloorMin: Double): Double {
+    if (rmsValues.isEmpty()) return noiseFloorMin
+    val sorted = rmsValues.sorted()
+    val count = maxOf(1, (sorted.size * 0.2).toInt())
+    val lowest = sorted.take(count)
+    val floor = lowest.sum() / lowest.size
+    return maxOf(floor, noiseFloorMin)
 }
 
 internal fun buildWav(pcmData: ByteArray): ByteArray {
@@ -284,8 +372,8 @@ internal fun isUtteranceComplete(
     hadLoud: Boolean,
     capturedDurationMs: Long,
     consecutiveSilenceMs: Long,
-    minimumLengthMs: Long = AndroidAudioCaptureEngine.MINIMUM_LENGTH_MS,
-    completeSilenceMs: Long = AndroidAudioCaptureEngine.COMPLETE_SILENCE_MS,
+    minimumLengthMs: Long = AndroidAudioCaptureEngine.MIN_CAPTURE_DURATION_MS,
+    completeSilenceMs: Long = AndroidAudioCaptureEngine.SILENCE_DURATION_MS,
 ): Boolean {
     return hadLoud && capturedDurationMs >= minimumLengthMs && consecutiveSilenceMs >= completeSilenceMs
 }

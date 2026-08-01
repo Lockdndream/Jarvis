@@ -339,7 +339,13 @@ private class FakeSpeechRecognizerEngine : SpeechInputController.SpeechRecognize
 
     override fun isRecognitionAvailable(): Boolean = recognitionAvailable
 
-    override fun startListening(onResultCallback: (String) -> Unit, onErrorCallback: (String) -> Unit) {
+    override fun startListening(
+        onResultCallback: (String) -> Unit,
+        onErrorCallback: (String) -> Unit,
+        onPartialResultCallback: (String) -> Unit,
+        onBeginningOfSpeechCallback: () -> Unit,
+        onEmptyResultCallback: () -> Unit,
+    ) {
         val result = triggerResultOnNextStart
         val error = triggerErrorOnNextStart
 
@@ -367,7 +373,11 @@ private class FakeAudioCaptureEngine : AudioCaptureEngine {
 
     override fun isCaptureAvailable(): Boolean = captureAvailable
 
-    override fun startCapture(onAudioCaptured: (ByteArray) -> Unit, onError: (String) -> Unit) {
+    override fun startCapture(
+        onAudioCaptured: (ByteArray) -> Unit,
+        onError: (String) -> Unit,
+        onIdleTimeout: () -> Unit,
+    ) {
         val audio = triggerAudioOnNextStart
         val error = triggerErrorOnNextStart
 
