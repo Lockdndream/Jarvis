@@ -80,6 +80,72 @@ class CompanionWebSocketClientConversationTest {
     }
 
     @Test
+    fun `conversation_turn echo is suppressed when it matches a transcript this device just sent`() {
+        client.sendVoiceSessionTranscript("vs_test", "Hello from the test")
+
+        val frame = """
+        {
+          "type": "conversation_turn",
+          "role": "user",
+          "content": "Hello from the test",
+          "voice_session_id": "vs_test",
+          "conversation_id": "conv_test",
+          "timestamp": "2026-07-31T12:00:00.000Z"
+        }
+        """.trimIndent()
+
+        invokePrivate("applyConversationFrame", frame)
+
+        assertTrue(conversationRepository.messages.value.isEmpty())
+    }
+
+    @Test
+    fun `conversation_turn with different content than what this device sent is not suppressed`() {
+        client.sendVoiceSessionTranscript("vs_test", "Something else entirely")
+
+        val frame = """
+        {
+          "type": "conversation_turn",
+          "role": "user",
+          "content": "Hello from the test",
+          "voice_session_id": "vs_test",
+          "conversation_id": "conv_test",
+          "timestamp": "2026-07-31T12:00:00.000Z"
+        }
+        """.trimIndent()
+
+        invokePrivate("applyConversationFrame", frame)
+
+        val messages = conversationRepository.messages.value
+        assertEquals(1, messages.size)
+        assertEquals("Hello from the test", messages[0].content)
+    }
+
+    @Test
+    fun `conversation_turn suppression only consumes the marker once`() {
+        client.sendVoiceSessionTranscript("vs_test", "Hello from the test")
+
+        val frame = """
+        {
+          "type": "conversation_turn",
+          "role": "user",
+          "content": "Hello from the test",
+          "voice_session_id": "vs_test",
+          "conversation_id": "conv_test",
+          "timestamp": "2026-07-31T12:00:00.000Z"
+        }
+        """.trimIndent()
+
+        invokePrivate("applyConversationFrame", frame)
+        invokePrivate("applyConversationFrame", frame)
+
+        // First delivery is suppressed (this device's own echo); a second,
+        // identical frame arriving later (e.g. a genuine repeat turn) is not
+        // silently swallowed forever -- the marker is one-shot.
+        assertEquals(1, conversationRepository.messages.value.size)
+    }
+
+    @Test
     fun `voice_session_response frame updates both repositories`() {
         // Seed a voice session so applyResponse actually records the reply.
         voiceSessionRepository.applyOpened(

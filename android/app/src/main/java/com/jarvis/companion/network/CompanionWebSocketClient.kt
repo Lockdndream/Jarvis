@@ -118,6 +118,19 @@ class CompanionWebSocketClient(
 
     fun currentTraceId(): String? = lastKnownTraceId
 
+    // Interaction Layer dedup: the caller (VoiceActivity) already adds its
+    // own final user-message bubble locally the moment it sends a
+    // transcript (live-partial-to-COMPLETED, or the push-to-talk Send
+    // flow). The server's own conversation_turn broadcast for that exact
+    // turn then arrives moments later and, before this field existed,
+    // unconditionally added a SECOND bubble with a fresh id -- every voice
+    // turn showed the user's own utterance twice. Tracked per (voiceSessionId,
+    // transcript) pair since that's all sendVoiceSessionTranscript knows;
+    // cleared on first match so a later, genuinely different conversation_turn
+    // for the same session (e.g. a second device's turn) still displays.
+    @Volatile
+    private var lastSentTranscript: Pair<String, String>? = null
+
     @Volatile
     var state: ConnectionState = ConnectionState.DISCONNECTED
         private set
@@ -197,6 +210,7 @@ class CompanionWebSocketClient(
     }
 
     fun sendVoiceSessionTranscript(voiceSessionId: String, transcript: String): Boolean {
+        lastSentTranscript = voiceSessionId to transcript
         val payload = JSONObject().apply {
             put("type", "voice_session_transcript")
             put("voice_session_id", voiceSessionId)
@@ -540,6 +554,14 @@ class CompanionWebSocketClient(
         if (!ConversationParser.isConversationEventType(type)) return
         when (type) {
             "conversation_turn" -> ConversationParser.parseConversationTurn(text)?.let {
+                val voiceSessionId = it.metadata?.get("voice_session_id")
+                if (voiceSessionId != null && lastSentTranscript == voiceSessionId to it.content) {
+                    // This device already showed its own final bubble the
+                    // moment it sent this exact transcript -- the server's
+                    // echo for that same turn would otherwise duplicate it.
+                    lastSentTranscript = null
+                    return@let
+                }
                 conversationRepository.addMessage(it)
             }
             "thinking_update" -> ConversationParser.parseThinkingUpdate(text)?.let {
