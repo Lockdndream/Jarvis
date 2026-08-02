@@ -82,7 +82,7 @@ internal fun mapDeviceTypesToRoute(deviceTypes: Collection<Int>): AudioFocusMana
  * permission — this is pure focus/routing observation and control, zero
  * microphone involvement, per Milestone 9B.4 scope boundary.
  */
-class AudioFocusManager(private val context: Context) {
+open class AudioFocusManager(private val context: Context) {
 
     enum class FocusState { NONE, GAINED, LOST, LOST_TRANSIENT, LOST_TRANSIENT_CAN_DUCK }
 
@@ -97,11 +97,20 @@ class AudioFocusManager(private val context: Context) {
     private val _currentRoute = MutableStateFlow(AudioRoute.UNKNOWN)
     val currentRoute: StateFlow<AudioRoute> = _currentRoute.asStateFlow()
 
-    private val focusChangeListener = AudioManager.OnAudioFocusChangeListener { change ->
-        _focusState.value = mapFocusChange(change)
+    internal val focusChangeListener = AudioManager.OnAudioFocusChangeListener { change ->
+        val newState = mapFocusChange(change)
+        android.util.Log.i("AudioFocusManager", "focusChangeListener: $change -> $newState (currentlyHoldingFocus was $currentlyHoldingFocus)")
+        _focusState.value = newState
+        when (newState) {
+            FocusState.GAINED -> currentlyHoldingFocus = true
+            FocusState.LOST -> currentlyHoldingFocus = false
+            else -> { /* LOST_TRANSIENT, LOST_TRANSIENT_CAN_DUCK, NONE — focus still held */ }
+        }
     }
 
     private var focusRequest: AudioFocusRequest? = null
+
+    private var currentlyHoldingFocus = false
 
     private val headsetReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -112,7 +121,23 @@ class AudioFocusManager(private val context: Context) {
     private var started = false
 
     fun requestFocus(): Boolean {
-        val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+        if (currentlyHoldingFocus) {
+            android.util.Log.i("AudioFocusManager", "requestFocus(): no-op, already holding")
+            return true
+        }
+        val request = createAudioFocusRequest()
+        focusRequest = request
+        val result = audioManager.requestAudioFocus(request)
+        val granted = result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+        android.util.Log.i("AudioFocusManager", "requestFocus(): real system call, granted=$granted")
+        if (granted) {
+            currentlyHoldingFocus = true
+        }
+        return granted
+    }
+
+    internal open fun createAudioFocusRequest(): AudioFocusRequest {
+        return AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
             .setAudioAttributes(
                 AudioAttributes.Builder()
                     .setUsage(AudioAttributes.USAGE_ASSISTANT)
@@ -121,14 +146,13 @@ class AudioFocusManager(private val context: Context) {
             )
             .setOnAudioFocusChangeListener(focusChangeListener)
             .build()
-        focusRequest = request
-        val result = audioManager.requestAudioFocus(request)
-        return result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
     }
 
     fun abandonFocus() {
+        android.util.Log.i("AudioFocusManager", "abandonFocus(): hadRequest=${focusRequest != null}, currentlyHoldingFocus was $currentlyHoldingFocus")
         focusRequest?.let { audioManager.abandonAudioFocusRequest(it) }
         focusRequest = null
+        currentlyHoldingFocus = false
         _focusState.value = FocusState.NONE
     }
 

@@ -622,10 +622,42 @@ the installed OpenCode version (1.15.10):
   interaction with `com.google.android.tts` causes a delayed focus
   re-grab after speaking, and whether releasing/rebinding the TTS engine
   differently between utterances avoids it.
-- **Status**: Open, newly discovered and documented this milestone. No
-  reliable workaround currently known — even the wake-word/notification
-  entry path is a fresh single-turn case, not proven safe across a
-  multi-turn conversation with a prior spoken response.
+- **Status**: **Finding 1 fixed 2026-08-02** — `AudioFocusManager.requestFocus()`
+  now tracks a `currentlyHoldingFocus` flag (set on `AUDIOFOCUS_GAIN`,
+  cleared only on `AUDIOFOCUS_LOSS` — not the transient variants — or
+  `abandonFocus()`) and returns immediately without rebuilding/resubmitting
+  an `AudioFocusRequest` when focus is already held. Verified on-device:
+  8 consecutive multi-turn conversation cycles (wake-word → speak → TTS
+  response → TTS finishes → speak again) all captured successfully with
+  zero `NO_MATCH` failures, versus the pre-fix signature of a silent
+  capture failure on the second-or-later turn. 412 unit tests passing (11
+  new), zero regressions.
+
+  **Finding 2 (`com.google.android.tts`'s independent focus grab) is not
+  separately re-confirmed** — during the 8-turn verification run it either
+  did not recur or was masked by finding 1's fix; no dedicated repro
+  attempt was made this pass.
+
+  **A third, related failure mode was found during the same verification
+  session and is NOT fixed by finding 1's change**: a manual mic tap
+  immediately after backgrounding and re-foregrounding the app reproduces
+  the same `onReadyForSpeech` → ~5.4s silence → `onError code=7 (No match
+  found)` signature, user-visible as the expected "mic started" earcon
+  not playing. This is the same mechanism as the cold-launch race noted
+  below (`WakeWordManager` re-competing for the microphone), not a new
+  bug — grouped here rather than opened as a separate item since the
+  underlying cause is identical. Still open, still out of scope for
+  finding 1's fix, which only addressed same-conversation repeat requests.
+
+  **User-proposed direction for the remaining cold-launch/backgrounding
+  race** (2026-08-02, not yet actioned): pause `WakeWordManager` entirely
+  whenever `VoiceActivity` is foregrounded and `IDLE` — not only during an
+  active voice session (the existing `pauseForVoiceSession()` scope) — so
+  a manual mic tap on a page the user is already looking at never has to
+  contend with `WakeWordManager`'s own `AudioRecord` for the microphone in
+  the first place. Plausible fix for the remaining half; not yet
+  evaluated for side effects (e.g. whether a user expects "Hey Wake Word"
+  to still work while `VoiceActivity` is open in `IDLE`) or implemented.
 
 ### TD-024 — Control Center event-shape handling relies on an unenforced naming convention
 
