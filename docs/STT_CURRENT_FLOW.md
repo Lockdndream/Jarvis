@@ -4,11 +4,12 @@ Originally written as Step 0 of the Groq Whisper STT upgrade (Month 1,
 Week 1 of the post-F1 roadmap), documenting both client-side recognition
 paths as they existed **before** that upgrade. The body below this notice
 is that original, pre-Groq snapshot — left intact as history. **See the
-"Update (2026-08-01)" section at the end for the current state of Path B**
-after the Groq Whisper upgrade (ADR-025) and the TD-029 v2 dual-mode
-redesign (ADR-031). Path A (the browser PWA) was not touched or
-re-verified during TD-029 v2 — treat its section below as unconfirmed for
-the current state until someone checks `app/static/app.js` directly.
+"Update (2026-08-01)" section for the dual-mode redesign (ADR-031), and
+the "Update (2026-08-02)" section at the end for the current
+push-to-talk/editable-transcript behavior of Path B's interactive mode**
+(ADR-033). Path A (the browser PWA) was not touched or re-verified during
+either update — treat its section below as unconfirmed for the current
+state until someone checks `app/static/app.js` directly.
 
 ## The architecture fork this document exists to surface
 
@@ -158,3 +159,63 @@ fallback case.** The primary, real-world Path B experience (interactive
 mode) is back on Google's on-device recognizer, by deliberate, accepted
 trade-off (see ADR-031's ADR-025 amendment) — live partial feedback in
 exchange for the accuracy Groq would have given.
+
+## Update (2026-08-02) — Path B interactive mode gains a manual review step (ADR-033)
+
+Path B's interactive mode (mic tap, or a wake-word launch — both always
+screen-on) no longer sends a transcript to the Supervisor the moment
+`SpeechRecognizer` produces one. A `VoiceScreenState` layer
+(`IDLE, LISTENING, REVIEWING, PROCESSING, RESPONDING`) sits above
+`SpeechInputController`'s own state and inserts a review step:
+
+```
+mic tap / wake word -> LISTENING (live partials render as before)
+  -> tap Stop (speechInputController.stopListening(), flushes via onResults)
+     OR auto-endpoint fires (same target -- fallback, not removed)
+  -> REVIEWING: final transcript populates an editable text field
+  -> user reviews, optionally edits, optionally taps Re-record to discard
+     and start over, or Clear/X to discard back to IDLE
+  -> tap Send -> PROCESSING -> (existing voice_session_transcript flow,
+     unchanged) -> RESPONDING -> TTS finishes -> LISTENING (continuous
+     conversation) or IDLE
+```
+
+**What changed for the message actually sent to the server**: none of it.
+`REVIEWING`'s Send button still calls the identical
+`sendVoiceSessionTranscript()` path shown above, with the same
+`voice_session_transcript` message shape — the only difference is *when*
+it fires (after explicit user confirmation, with the EditText's current
+content, which may differ from what `SpeechRecognizer` originally
+produced) rather than immediately on `onResult`.
+
+**What changed for endpoint detection**: `SpeechInputController`'s
+`EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS` /
+`..._POSSIBLY_COMPLETE_..._MILLIS` extras were raised from 3000ms/1500ms
+to 60000ms specifically for this interactive path (confirmed via
+`isRecognitionAvailable()` usage that this class is never reached by
+background/automatic capture), so a mid-sentence pause is far less likely
+to auto-end capture before the user taps Stop — real-device silence
+tolerance went from ~1.1s to 8.7s+ observed. The platform's own
+`onEndOfSpeech` voice-activity detector still fires independently of these
+extras (confirmed via logcat: 100-200ms before every `onResults`
+regardless of the extras' value), so auto-endpoint is reduced, not
+eliminated — see ADR-033 for the full finding and why true Stop-only
+capture would require a structural change (recognizer chaining), not a
+tuning change.
+
+**A text-only fallback** exists alongside voice: a subtle "type instead"
+affordance, visible only in `IDLE`, enters the same `REVIEWING` state via
+typed text and reuses the identical Send/Re-record/Clear flow — not a
+separate input path, not a persistent chat bar.
+
+**New known gap (TD-038, not fixed by this update)**: real-device testing
+found that Android audio-focus re-acquisition within a single ongoing
+conversation is unreliable — a self-inflicted focus loss on the second and
+later mic taps in a conversation, and `com.google.android.tts`
+independently re-grabbing focus ~1.5s into captures after a TTS response
+has played once. Both produce a silent `onError code=7 (No match found)`
+even when the user spoke normally. See `docs/TECHNICAL_DEBT.md` (TD-038)
+and `docs/decisions/ADR-033-push-to-talk-editable-transcript.md`.
+
+See `docs/decisions/ADR-033-push-to-talk-editable-transcript.md` for the
+full state machine, design decisions, and device-test results.

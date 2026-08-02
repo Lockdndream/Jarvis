@@ -166,7 +166,11 @@ to a separate future milestone; documented here as a known gap.
   it is a known, documented gap this ADR does not close.
 - SpeechRecognizer's own endpoint detection is not tunable by Jarvis —
   observed mid-sentence cutoffs during device testing are an inherent
-  platform behavior, not a parameter this codebase controls.
+  platform behavior, not a parameter this codebase controls. **Partially
+  corrected by ADR-033** (2026-08-02): the silence-length extras are a
+  real, usable lever for the ambiguous "is this really the end" window
+  (1.1s tolerance raised to 8.7s+ observed), even though the underlying
+  `onEndOfSpeech` VAD event remains outside this codebase's control.
 
 ## Future Revisit Conditions
 
@@ -195,7 +199,10 @@ to a separate future milestone; documented here as a known gap.
 
 ## Related Milestones
 
-TD-029 v2 (post-F1 feature roadmap), 2026-08-01.
+TD-029 v2 (post-F1 feature roadmap), 2026-08-01. Extended by
+`ADR-033-push-to-talk-editable-transcript.md` (2026-08-02), which adds a
+manual review step and partially revisits the endpoint-detection claim
+above for interactive mode.
 
 ## Related Source Files
 
