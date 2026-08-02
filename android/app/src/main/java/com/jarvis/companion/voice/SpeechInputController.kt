@@ -223,14 +223,24 @@ internal class AndroidSpeechRecognizerEngine(
             // the utterance ~1.1s after onStartOfSpeech -- confirmed via
             // system log (onStartOfSpeech to onEndOfSpeech was 1.14s),
             // regardless of whether the user spoke immediately or waited
-            // for the "listening" earcon first. That's shorter than any
-            // normal spoken sentence, so every recognition attempt this
-            // session was truncated to a near-silent fragment and decoded
-            // as a low-confidence "now". These extras are hints, not a
-            // hard guarantee (the platform recognizer may still ignore or
-            // cap them), but they're the documented lever for this.
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 3000L)
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1500L)
+            // for the "listening" earcon first. These extras are hints,
+            // not a hard guarantee (the platform recognizer may still
+            // ignore or cap them), but they're the documented lever for
+            // this.
+            //
+            // Push-to-talk real-device finding: even the 3000/1500ms
+            // values above still auto-endpointed mid-sentence during
+            // normal pauses, which defeats the point of a manual Stop
+            // button in interactive mode -- the user should decide when
+            // they're done, not a silence timer. This class is only ever
+            // constructed from VoiceActivity's interactive push-to-talk
+            // path (and DiagnosticsActivity), never from the background
+            // auto-capture flow, so pushing these out to 60s makes
+            // auto-endpoint a last-resort safety net (a truly abandoned
+            // recognizer, not a normal thinking-pause) without touching
+            // background mode's behavior at all.
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 60000L)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 60000L)
             putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 3000L)
             // TD-029 investigation probe: partials were previously never
             // requested (EXTRA_PARTIAL_RESULTS unset), so onPartialResults

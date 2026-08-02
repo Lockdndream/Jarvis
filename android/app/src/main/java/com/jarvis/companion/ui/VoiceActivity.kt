@@ -329,10 +329,23 @@ class VoiceActivity : AppCompatActivity() {
         }
 
         binding.micButton.setOnClickListener {
-            if (screenState == VoiceScreenState.LISTENING) {
-                speechInputController.stopListening()
-            } else {
-                onMicTap()
+            when (screenState) {
+                VoiceScreenState.LISTENING -> speechInputController.stopListening()
+                // The mic button stays visible (and labeled "Mic") during
+                // REVIEWING; without this branch, tapping it silently
+                // restarted capture in the background -- screenState never
+                // left REVIEWING (no matching table entry), so the old
+                // transcript stayed on screen with no "Stop" affordance
+                // until the new result overwrote it. Route it through the
+                // same discard-and-restart path as the Re-record button,
+                // which is what the original spec calls for.
+                VoiceScreenState.REVIEWING -> {
+                    binding.reviewEditText.setText("")
+                    cancelReviewTimeout()
+                    transition(VoiceScreenEvent.ReRecordTapped)
+                    startListening()
+                }
+                else -> onMicTap()
             }
         }
 
@@ -622,7 +635,9 @@ class VoiceActivity : AppCompatActivity() {
     }
 
     private fun transition(event: VoiceScreenEvent, continuousConversationActive: Boolean = false) {
+        val from = screenState
         screenState = nextVoiceScreenState(screenState, event, continuousConversationActive)
+        android.util.Log.i("VoiceScreenState", "$from + $event -> $screenState")
         applyScreenState()
     }
 

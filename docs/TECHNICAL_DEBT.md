@@ -559,6 +559,74 @@ the installed OpenCode version (1.15.10):
 - **Status**: Open, newly discovered and documented this milestone — not
   fixed.
 
+### TD-038 — Repeated audio-focus re-requests within one conversation cause self-inflicted focus loss, and the system TTS engine independently steals focus back after speaking once
+
+- **Description**: Discovered live during push-to-talk Step 5 real-device
+  testing (2026-08-02), across two related findings from the same test
+  session.
+  1. **First mic tap in a fresh session is clean; every later one in the
+     same conversation is not.** `AudioFocusManager.requestFocus()`
+     (`android/.../audio/AudioFocusManager.kt`) builds and submits a brand
+     new `AudioFocusRequest` on every call with no check for whether this
+     app already holds focus, and `abandonFocus()` is deliberately only
+     ever called from `onPause()`/`showError()` — by design, focus is
+     held continuously across an entire conversation (LISTENING →
+     REVIEWING → PROCESSING → RESPONDING) so `WakeWordManager` stays
+     paused throughout. That means every mic tap after the first one in
+     an ongoing conversation re-requests focus while already holding it.
+     Logcat shows the framework delivering `AUDIOFOCUS_LOSS_TRANSIENT`
+     back to the app's own listener 10-16ms after its own `requestFocus()`
+     call, on every repeat request observed, and never on a first/cold
+     request in a fresh session — e.g. the 16:40:24 turn (first request,
+     no self-loss, clean 8.7s capture) versus 16:42:11/16:42:18/16:42:23
+     (all repeat requests within the same ongoing conversation, all show
+     the self-loss).
+  2. **`com.google.android.tts` (confirmed via `adb shell ps -A`, not a
+     third-party app) independently grabs `AUDIOFOCUS_GAIN` roughly 1.5-1.6
+     seconds into subsequent `SpeechRecognizer` sessions, but only after
+     this app has actually played a TTS response at least once.** The
+     16:40:24 turn (before any TTS had played this session) shows no such
+     grab; every capture attempt after the first TTS playback
+     (16:41:03-16:41:09) shows `com.google.android.tts`'s process
+     requesting and receiving focus ~1.5s in, consistently. Two
+     consecutive real captures after that point both ended in `onError
+     code=7 (No match found)` at almost exactly the same elapsed time
+     (~3.2-3.4s), despite the user audibly speaking the whole time
+     (confirmed by the user directly).
+  Both findings came from the same test session and may compound (two
+  separate contenders for focus during the same capture window), but each
+  is independently real and evidenced.
+- **Severity**: High — this is not confined to a fresh-launch edge case
+  (the earlier framing of this item before the fuller investigation).
+  Finding 1 means essentially every second-and-later voice turn within a
+  single ongoing conversation is at risk; finding 2 means any conversation
+  that has already had one spoken response is at elevated risk for every
+  turn after it. Both silently produce "No match found" even when the
+  user spoke normally, with no error distinguishing "you said nothing"
+  from "the mic never really heard you."
+- **Owner**: `android/.../audio/AudioFocusManager.kt` (finding 1),
+  `android/.../voice/PlaybackManager.kt` and its interaction with the
+  bound `com.google.android.tts` engine (finding 2, needs investigation
+  into whether `PlaybackManager` leaves the TTS engine's session in a
+  state that causes a delayed focus re-grab).
+- **Origin milestone**: Push-to-talk with editable transcript (this
+  milestone), Step 5 device testing, 2026-08-02.
+- **Risk**: Any multi-turn voice conversation is at risk of silently
+  losing capture on turns after the first, read by the user as "the
+  feature doesn't work" rather than a focus race — directly undermines
+  trust in the core voice interaction loop, not just a rare edge case.
+- **Recommended milestone**: Unscheduled — needs real investigation, not
+  a same-session patch: (a) make `AudioFocusManager.requestFocus()` a
+  no-op (or at least not rebuild+resubmit the request) when focus is
+  already held by this app, and (b) determine what in `PlaybackManager`'s
+  interaction with `com.google.android.tts` causes a delayed focus
+  re-grab after speaking, and whether releasing/rebinding the TTS engine
+  differently between utterances avoids it.
+- **Status**: Open, newly discovered and documented this milestone. No
+  reliable workaround currently known — even the wake-word/notification
+  entry path is a fresh single-turn case, not proven safe across a
+  multi-turn conversation with a prior spoken response.
+
 ### TD-024 — Control Center event-shape handling relies on an unenforced naming convention
 
 - **Description**: `dashboard.js`'s `handleNamedEvent`/`routeWsMessage`
