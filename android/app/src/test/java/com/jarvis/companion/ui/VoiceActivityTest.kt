@@ -175,4 +175,164 @@ class VoiceActivityTest {
             )
         }
     }
+
+    // --- VoiceScreenState transitions ---
+
+    @Test
+    fun `IDLE + MicTapped → LISTENING`() {
+        assertEquals(
+            VoiceScreenState.LISTENING,
+            nextVoiceScreenState(VoiceScreenState.IDLE, VoiceScreenEvent.MicTapped),
+        )
+    }
+
+    @Test
+    fun `IDLE + TextTyped → REVIEWING`() {
+        assertEquals(
+            VoiceScreenState.REVIEWING,
+            nextVoiceScreenState(VoiceScreenState.IDLE, VoiceScreenEvent.TextTyped),
+        )
+    }
+
+    @Test
+    fun `LISTENING + StopTapped → REVIEWING`() {
+        assertEquals(
+            VoiceScreenState.REVIEWING,
+            nextVoiceScreenState(VoiceScreenState.LISTENING, VoiceScreenEvent.StopTapped),
+        )
+    }
+
+    @Test
+    fun `LISTENING + FinalTranscriptReceived → REVIEWING`() {
+        assertEquals(
+            VoiceScreenState.REVIEWING,
+            nextVoiceScreenState(VoiceScreenState.LISTENING, VoiceScreenEvent.FinalTranscriptReceived("hello")),
+        )
+    }
+
+    @Test
+    fun `LISTENING + EmptyTranscriptReceived → IDLE`() {
+        assertEquals(
+            VoiceScreenState.IDLE,
+            nextVoiceScreenState(VoiceScreenState.LISTENING, VoiceScreenEvent.EmptyTranscriptReceived),
+        )
+    }
+
+    @Test
+    fun `LISTENING + CancelledOrBackgrounded → IDLE`() {
+        assertEquals(
+            VoiceScreenState.IDLE,
+            nextVoiceScreenState(VoiceScreenState.LISTENING, VoiceScreenEvent.CancelledOrBackgrounded),
+        )
+    }
+
+    @Test
+    fun `REVIEWING + SendTapped → PROCESSING`() {
+        assertEquals(
+            VoiceScreenState.PROCESSING,
+            nextVoiceScreenState(VoiceScreenState.REVIEWING, VoiceScreenEvent.SendTapped),
+        )
+    }
+
+    @Test
+    fun `REVIEWING + ReRecordTapped → LISTENING`() {
+        assertEquals(
+            VoiceScreenState.LISTENING,
+            nextVoiceScreenState(VoiceScreenState.REVIEWING, VoiceScreenEvent.ReRecordTapped),
+        )
+    }
+
+    @Test
+    fun `REVIEWING + ClearTapped → IDLE`() {
+        assertEquals(
+            VoiceScreenState.IDLE,
+            nextVoiceScreenState(VoiceScreenState.REVIEWING, VoiceScreenEvent.ClearTapped),
+        )
+    }
+
+    @Test
+    fun `REVIEWING + ReviewTimedOut → IDLE`() {
+        assertEquals(
+            VoiceScreenState.IDLE,
+            nextVoiceScreenState(VoiceScreenState.REVIEWING, VoiceScreenEvent.ReviewTimedOut),
+        )
+    }
+
+    @Test
+    fun `PROCESSING + ResponseReceived → RESPONDING`() {
+        assertEquals(
+            VoiceScreenState.RESPONDING,
+            nextVoiceScreenState(VoiceScreenState.PROCESSING, VoiceScreenEvent.ResponseReceived),
+        )
+    }
+
+    @Test
+    fun `RESPONDING + TtsFinished with continuous false → IDLE`() {
+        assertEquals(
+            VoiceScreenState.IDLE,
+            nextVoiceScreenState(
+                VoiceScreenState.RESPONDING,
+                VoiceScreenEvent.TtsFinished,
+                continuousConversationActive = false,
+            ),
+        )
+    }
+
+    @Test
+    fun `RESPONDING + TtsFinished with continuous true → LISTENING`() {
+        assertEquals(
+            VoiceScreenState.LISTENING,
+            nextVoiceScreenState(
+                VoiceScreenState.RESPONDING,
+                VoiceScreenEvent.TtsFinished,
+                continuousConversationActive = true,
+            ),
+        )
+    }
+
+    @Test
+    fun `RESPONDING + MicTapped barge-in → LISTENING regardless of continuous`() {
+        assertEquals(
+            VoiceScreenState.LISTENING,
+            nextVoiceScreenState(
+                VoiceScreenState.RESPONDING,
+                VoiceScreenEvent.MicTapped,
+                continuousConversationActive = false,
+            ),
+        )
+        assertEquals(
+            VoiceScreenState.LISTENING,
+            nextVoiceScreenState(
+                VoiceScreenState.RESPONDING,
+                VoiceScreenEvent.MicTapped,
+                continuousConversationActive = true,
+            ),
+        )
+    }
+
+    // --- invalid transitions are no-ops ---
+
+    @Test
+    fun `IDLE + SendTapped stays IDLE`() {
+        assertEquals(
+            VoiceScreenState.IDLE,
+            nextVoiceScreenState(VoiceScreenState.IDLE, VoiceScreenEvent.SendTapped),
+        )
+    }
+
+    @Test
+    fun `PROCESSING + MicTapped stays PROCESSING`() {
+        assertEquals(
+            VoiceScreenState.PROCESSING,
+            nextVoiceScreenState(VoiceScreenState.PROCESSING, VoiceScreenEvent.MicTapped),
+        )
+    }
+
+    @Test
+    fun `REVIEWING + ResponseReceived stays REVIEWING`() {
+        assertEquals(
+            VoiceScreenState.REVIEWING,
+            nextVoiceScreenState(VoiceScreenState.REVIEWING, VoiceScreenEvent.ResponseReceived),
+        )
+    }
 }

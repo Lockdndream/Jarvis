@@ -1,6 +1,7 @@
 package com.jarvis.companion.ui
 
 import android.os.Bundle
+import android.view.View
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.Lifecycle
@@ -81,6 +82,58 @@ fun shouldAutoResumeListening(
     return connectionState == ConnectionState.CONNECTED
 }
 
+enum class VoiceScreenState { IDLE, LISTENING, REVIEWING, PROCESSING, RESPONDING }
+
+sealed class VoiceScreenEvent {
+    object MicTapped : VoiceScreenEvent()
+    object StopTapped : VoiceScreenEvent()
+    data class FinalTranscriptReceived(val transcript: String) : VoiceScreenEvent()
+    object EmptyTranscriptReceived : VoiceScreenEvent()
+    object SendTapped : VoiceScreenEvent()
+    object ReRecordTapped : VoiceScreenEvent()
+    object ClearTapped : VoiceScreenEvent()
+    object ReviewTimedOut : VoiceScreenEvent()
+    object ResponseReceived : VoiceScreenEvent()
+    object TtsFinished : VoiceScreenEvent()
+    object CancelledOrBackgrounded : VoiceScreenEvent()
+    object TextTyped : VoiceScreenEvent()
+}
+
+fun nextVoiceScreenState(
+    current: VoiceScreenState,
+    event: VoiceScreenEvent,
+    continuousConversationActive: Boolean = false,
+): VoiceScreenState = when (current) {
+    VoiceScreenState.IDLE -> when (event) {
+        VoiceScreenEvent.MicTapped -> VoiceScreenState.LISTENING
+        VoiceScreenEvent.TextTyped -> VoiceScreenState.REVIEWING
+        else -> current
+    }
+    VoiceScreenState.LISTENING -> when (event) {
+        VoiceScreenEvent.StopTapped -> VoiceScreenState.REVIEWING
+        is VoiceScreenEvent.FinalTranscriptReceived -> VoiceScreenState.REVIEWING
+        VoiceScreenEvent.EmptyTranscriptReceived -> VoiceScreenState.IDLE
+        VoiceScreenEvent.CancelledOrBackgrounded -> VoiceScreenState.IDLE
+        else -> current
+    }
+    VoiceScreenState.REVIEWING -> when (event) {
+        VoiceScreenEvent.SendTapped -> VoiceScreenState.PROCESSING
+        VoiceScreenEvent.ReRecordTapped -> VoiceScreenState.LISTENING
+        VoiceScreenEvent.ClearTapped -> VoiceScreenState.IDLE
+        VoiceScreenEvent.ReviewTimedOut -> VoiceScreenState.IDLE
+        else -> current
+    }
+    VoiceScreenState.PROCESSING -> when (event) {
+        VoiceScreenEvent.ResponseReceived -> VoiceScreenState.RESPONDING
+        else -> current
+    }
+    VoiceScreenState.RESPONDING -> when (event) {
+        VoiceScreenEvent.TtsFinished -> if (continuousConversationActive) VoiceScreenState.LISTENING else VoiceScreenState.IDLE
+        VoiceScreenEvent.MicTapped -> VoiceScreenState.LISTENING
+        else -> current
+    }
+}
+
 /**
  * Production voice screen for Milestone 9B.4. Displays the current
  * [VoiceSession] status, the latest spoken response, and a mic button.
@@ -130,6 +183,19 @@ class VoiceActivity : AppCompatActivity() {
     // edge (TTS just finished) rather than firing on every collector
     // emission where isSpeaking happens to already be false.
     private var wasSpeaking = false
+
+    // Push-to-talk state machine field, updated via transition() only.
+    private var screenState: VoiceScreenState = VoiceScreenState.IDLE
+
+    // 60-second review-abandonment timeout: if the user leaves a transcript
+    // in the review field without editing or sending for 60s, discard it.
+    private val reviewTimeoutHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val reviewTimeoutRunnable = Runnable {
+        if (screenState == VoiceScreenState.REVIEWING) {
+            binding.reviewEditText.setText("")
+            transition(VoiceScreenEvent.ReviewTimedOut)
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -217,6 +283,9 @@ class VoiceActivity : AppCompatActivity() {
                             session.voiceSessionId, pendingAudio,
                         )
                     }
+                    if (response != null && response != lastSpokenText && screenState == VoiceScreenState.PROCESSING) {
+                        transition(VoiceScreenEvent.ResponseReceived)
+                    }
                     render(session, response, connectionState)
 
                     // Interaction Layer v1 (Goal 1): once a spoken response
@@ -237,31 +306,113 @@ class VoiceActivity : AppCompatActivity() {
                     // unless SpeechInputController is IDLE, so this can
                     // never double-start a session already listening from
                     // the wake-word-launch path.
-                    if (shouldAutoResumeListening(
+                    // Push-to-talk (Step 3): the transition is now driven
+                    // by the screen state machine — TtsFinished on the
+                    // RESPONDING state decides whether to go to LISTENING
+                    // or IDLE based on continuousConversationActive.
+                    if (wasSpeaking && !isSpeaking && screenState == VoiceScreenState.RESPONDING) {
+                        val continuousActive = shouldAutoResumeListening(
                             wasSpeaking = wasSpeaking,
                             isSpeaking = isSpeaking,
                             sessionState = session?.state,
                             hasUserFacingError = userFacingError != null,
                             connectionState = connectionState,
                         )
-                    ) {
-                        onMicTap()
+                        transition(VoiceScreenEvent.TtsFinished, continuousActive)
+                        if (screenState == VoiceScreenState.LISTENING) {
+                            onMicTap()
+                        }
                     }
                     wasSpeaking = isSpeaking
                 }
             }
         }
 
-        binding.micButton.setOnClickListener { onMicTap() }
+        binding.micButton.setOnClickListener {
+            if (screenState == VoiceScreenState.LISTENING) {
+                speechInputController.stopListening()
+            } else {
+                onMicTap()
+            }
+        }
 
         binding.closeButton.setOnClickListener { onClose() }
 
-        // ADR-017 Section C: a wake-word-initiated launch means the user
-        // just spoke a trigger phrase — start listening immediately rather
-        // than waiting for a mic tap. savedInstanceState == null (not just
-        // the intent extra) guards this so a configuration-change
-        // recreation of this same Activity/Intent doesn't re-trigger a
-        // second startListening() call over an already-listening session.
+        binding.sendButton.setOnClickListener {
+            val text = binding.reviewEditText.text?.toString()?.trim().orEmpty()
+            if (text.isEmpty()) return@setOnClickListener
+
+            cancelReviewTimeout()
+
+            app.conversationRepository.addMessage(
+                ConversationMessage(
+                    id = java.util.UUID.randomUUID().toString(),
+                    type = ConversationMessage.Type.USER_MESSAGE,
+                    content = text,
+                    status = ConversationMessage.Status.COMPLETED,
+                    timestamp = System.currentTimeMillis(),
+                )
+            )
+
+            val session = app.voiceSessionRepository.current.value
+            if (session != null) {
+                PresenceService.activeClient?.sendVoiceSessionTranscript(session.voiceSessionId, text)
+                isAwaitingResponse = true
+            } else {
+                pendingTranscript = text
+                PresenceService.activeClient?.sendVoiceSessionOpen(
+                    conversationId = null,
+                    attentionRequestId = intent.getStringExtra(EXTRA_ATTENTION_REQUEST_ID),
+                )
+            }
+
+            binding.reviewEditText.setText("")
+            transition(VoiceScreenEvent.SendTapped)
+            render(
+                app.voiceSessionRepository.current.value,
+                app.voiceSessionRepository.lastResponse.value,
+                app.connectionState.value,
+            )
+        }
+
+        binding.reRecordButton.setOnClickListener {
+            binding.reviewEditText.setText("")
+            cancelReviewTimeout()
+            transition(VoiceScreenEvent.ReRecordTapped)
+            startListening()
+        }
+
+        binding.clearReviewButton.setOnClickListener {
+            binding.reviewEditText.setText("")
+            cancelReviewTimeout()
+            transition(VoiceScreenEvent.ClearTapped)
+        }
+
+        binding.reviewEditText.addTextChangedListener(object : android.text.TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
+                startReviewTimeout()
+            }
+            override fun afterTextChanged(s: android.text.Editable?) {}
+        })
+
+        binding.typeInsteadButton.setOnClickListener {
+            binding.reviewEditText.setText("")
+            transition(VoiceScreenEvent.TextTyped)
+            // setText("") on an already-empty field may not reliably fire
+            // the TextWatcher above, so arm the abandonment timeout
+            // explicitly here too -- a user who taps "Type instead" and
+            // then walks away without typing anything should still get
+            // auto-discarded back to IDLE after 60s, same as the voice path.
+            startReviewTimeout()
+            binding.reviewEditText.requestFocus()
+            val imm = getSystemService(android.content.Context.INPUT_METHOD_SERVICE)
+                as android.view.inputmethod.InputMethodManager
+            imm.showSoftInput(binding.reviewEditText, android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT)
+        }
+
+        applyScreenState()
+
         launchedByWakeWord = intent.getBooleanExtra(EXTRA_LAUNCHED_BY_WAKEWORD, false)
         if (savedInstanceState == null && launchedByWakeWord) {
             onMicTap()
@@ -270,6 +421,7 @@ class VoiceActivity : AppCompatActivity() {
 
     override fun onPause() {
         super.onPause()
+        cancelReviewTimeout()
         val wasCapturing = speechInputController.state.value == SpeechInputController.State.LISTENING ||
             speechInputController.state.value == SpeechInputController.State.PROCESSING
         speechInputController.cancel()
@@ -277,14 +429,20 @@ class VoiceActivity : AppCompatActivity() {
         if (wasCapturing) {
             audioFocusManager.abandonFocus()
             clearPendingLiveTranscript()
+            transition(VoiceScreenEvent.CancelledOrBackgrounded)
             app.conversationRepository.addMessage(
                 ConversationMessage(
                     id = java.util.UUID.randomUUID().toString(),
                     type = ConversationMessage.Type.SYSTEM_EVENT,
-                    content = "Listening was interrupted \u2014 please repeat that.",
+                    content = "Listening was interrupted — please repeat that.",
                     timestamp = System.currentTimeMillis(),
                 )
             )
+        }
+        if (screenState == VoiceScreenState.REVIEWING) {
+            binding.reviewEditText.setText("")
+            screenState = VoiceScreenState.IDLE
+            applyScreenState()
         }
     }
 
@@ -337,6 +495,12 @@ class VoiceActivity : AppCompatActivity() {
 
     private fun startListening() {
         userFacingError = null
+        // Barge-in: if Jarvis is currently speaking, cancel TTS (which
+        // releases focus) before re-requesting it, to avoid the
+        // request/abandon ordering fighting itself.
+        if (playbackManager.isSpeaking.value) {
+            playbackManager.cancel()
+        }
         // Real-device finding: WakeWordManager only pauses via
         // pauseForVoiceSession() (which requires a VoiceSession to already
         // exist) or pauseForAudioFocusLoss() (triggered by a competing
@@ -352,30 +516,11 @@ class VoiceActivity : AppCompatActivity() {
         if (speechInputController.isRecognitionAvailable()) {
             speechInputController.startListening(
                 onResult = { transcript ->
-                    val id = pendingLiveTranscriptId
-                    if (id != null) {
-                        app.conversationRepository.updateMessage(id, content = transcript, status = ConversationMessage.Status.COMPLETED)
-                        pendingLiveTranscriptId = null
-                    }
-                    val session = app.voiceSessionRepository.current.value
-                    if (session != null) {
-                        PresenceService.activeClient?.sendVoiceSessionTranscript(
-                            session.voiceSessionId, transcript,
-                        )
-                        isAwaitingResponse = true
-                        render(
-                            app.voiceSessionRepository.current.value,
-                            app.voiceSessionRepository.lastResponse.value,
-                            app.connectionState.value,
-                        )
-                    } else {
-                        val attentionRequestId = intent.getStringExtra(EXTRA_ATTENTION_REQUEST_ID)
-                        pendingTranscript = transcript
-                        PresenceService.activeClient?.sendVoiceSessionOpen(
-                            conversationId = null,
-                            attentionRequestId = attentionRequestId,
-                        )
-                    }
+                    clearPendingLiveTranscript()
+                    binding.reviewEditText.setText(transcript)
+                    binding.reviewEditText.setSelection(binding.reviewEditText.text?.length ?: 0)
+                    transition(VoiceScreenEvent.FinalTranscriptReceived(transcript))
+                    startReviewTimeout()
                 },
                 onError = { message -> showError(message) },
                 onPartialResult = { text ->
@@ -399,8 +544,10 @@ class VoiceActivity : AppCompatActivity() {
                 },
                 onEmptyResult = {
                     clearPendingLiveTranscript()
+                    transition(VoiceScreenEvent.EmptyTranscriptReceived)
                 },
             )
+            transition(VoiceScreenEvent.MicTapped)
         } else {
             speechInputController.startListeningRaw(
                 onAudioCaptured = { audioBytes ->
@@ -436,6 +583,14 @@ class VoiceActivity : AppCompatActivity() {
         // error, so a failed capture doesn't leave a dangling "listening..."
         // bubble on screen.
         clearPendingLiveTranscript()
+        // Without this, a recognizer error (NO_MATCH, network, etc.) leaves
+        // SpeechInputController back at IDLE but screenState stuck at
+        // LISTENING -- the mic button stays showing "Stop" and the next tap
+        // calls stopListening() on an already-idle recognizer, a no-op that
+        // wedges the screen until the Activity is backgrounded. Only valid
+        // from LISTENING (nextVoiceScreenState no-ops otherwise), matching
+        // the one state this callback is ever reached from today.
+        transition(VoiceScreenEvent.CancelledOrBackgrounded)
         // A failed/errored capture attempt never proceeds to a real
         // VoiceSession, so PresenceService's session-based WakeWordManager
         // pause never happens either -- abandon our own focus request here
@@ -466,6 +621,53 @@ class VoiceActivity : AppCompatActivity() {
         pendingLiveTranscriptId = null
     }
 
+    private fun transition(event: VoiceScreenEvent, continuousConversationActive: Boolean = false) {
+        screenState = nextVoiceScreenState(screenState, event, continuousConversationActive)
+        applyScreenState()
+    }
+
+    private fun applyScreenState() {
+        if (screenState != VoiceScreenState.REVIEWING) {
+            cancelReviewTimeout()
+        }
+        when (screenState) {
+            VoiceScreenState.IDLE -> {
+                binding.micButton.text = "Mic"
+                binding.reviewContainer.visibility = View.GONE
+                binding.typeInsteadButton.visibility = View.VISIBLE
+            }
+            VoiceScreenState.LISTENING -> {
+                binding.micButton.text = "Stop"
+                binding.reviewContainer.visibility = View.GONE
+                binding.typeInsteadButton.visibility = View.GONE
+            }
+            VoiceScreenState.REVIEWING -> {
+                binding.micButton.text = "Mic"
+                binding.reviewContainer.visibility = View.VISIBLE
+                binding.typeInsteadButton.visibility = View.GONE
+            }
+            VoiceScreenState.PROCESSING -> {
+                binding.micButton.text = "Mic"
+                binding.reviewContainer.visibility = View.GONE
+                binding.typeInsteadButton.visibility = View.GONE
+            }
+            VoiceScreenState.RESPONDING -> {
+                binding.micButton.text = "Mic"
+                binding.reviewContainer.visibility = View.GONE
+                binding.typeInsteadButton.visibility = View.GONE
+            }
+        }
+    }
+
+    private fun startReviewTimeout() {
+        reviewTimeoutHandler.removeCallbacks(reviewTimeoutRunnable)
+        reviewTimeoutHandler.postDelayed(reviewTimeoutRunnable, 60_000L)
+    }
+
+    private fun cancelReviewTimeout() {
+        reviewTimeoutHandler.removeCallbacks(reviewTimeoutRunnable)
+    }
+
     private fun onClose() {
         val session = app.voiceSessionRepository.current.value
         if (session != null) {
@@ -484,8 +686,8 @@ class VoiceActivity : AppCompatActivity() {
     ) {
         binding.connectionStateText.text = when (connectionState) {
             ConnectionState.CONNECTED -> "Connected"
-            ConnectionState.CONNECTING -> "Connecting\u2026"
-            ConnectionState.RECONNECTING -> "Reconnecting\u2026"
+            ConnectionState.CONNECTING -> "Connecting…"
+            ConnectionState.RECONNECTING -> "Reconnecting…"
             ConnectionState.DISCONNECTED -> "Not connected"
             ConnectionState.FAILED_PERMANENT -> "Connection failed"
         }

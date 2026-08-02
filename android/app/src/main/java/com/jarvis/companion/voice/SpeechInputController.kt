@@ -132,6 +132,11 @@ class SpeechInputController internal constructor(
         _state.value = State.IDLE
     }
 
+    fun stopListening() {
+        if (_state.value != State.LISTENING) return
+        recognizerEngine.stopListening()
+    }
+
     /**
      * Package-private abstraction over Android's [SpeechRecognizer],
      * injected so unit tests can verify state transitions and lifecycle
@@ -146,6 +151,7 @@ class SpeechInputController internal constructor(
             onBeginningOfSpeechCallback: () -> Unit = {},
             onEmptyResultCallback: () -> Unit = {},
         )
+        fun stopListening()
         fun cancel()
     }
 }
@@ -301,6 +307,10 @@ internal class AndroidSpeechRecognizerEngine(
         })
 
         sr.startListening(intent)
+    }
+
+    override fun stopListening() {
+        recognizer?.stopListening()
     }
 
     override fun cancel() {

@@ -168,7 +168,7 @@ class SpeechInputControllerTest {
     }
 
     @Test
-    fun `cancel stops after engine has already delivered a result`() = runTest {
+    fun `cancel after engine has already delivered a result`() = runTest {
         fakeEngine.triggerResultOnNextStart = "hello"
         val controller = SpeechInputController(recognizerEngine = fakeEngine)
         controller.startListening(onResult = {}, onError = {})
@@ -177,6 +177,65 @@ class SpeechInputControllerTest {
         controller.cancel()
 
         // Cancel after result delivered should be a no-op (already IDLE)
+        assertEquals(SpeechInputController.State.IDLE, controller.state.value)
+    }
+
+    // --- stopListening ---
+
+    @Test
+    fun `stopListening while LISTENING calls through to engine`() {
+        val controller = SpeechInputController(recognizerEngine = fakeEngine)
+        controller.startListening(onResult = {}, onError = {})
+
+        controller.stopListening()
+
+        assert(fakeEngine.stopListeningCalled)
+    }
+
+    @Test
+    fun `stopListening while IDLE is no-op does not call engine`() {
+        val controller = SpeechInputController(recognizerEngine = fakeEngine)
+
+        controller.stopListening()
+
+        assert(!fakeEngine.stopListeningCalled)
+    }
+
+    @Test
+    fun `stopListening and cancel are distinct calls`() {
+        val controller = SpeechInputController(recognizerEngine = fakeEngine)
+        controller.startListening(onResult = {}, onError = {})
+
+        controller.stopListening()
+        assert(fakeEngine.stopListeningCalled)
+        assert(!fakeEngine.wasCancelled)
+
+        // Reset for cancel test
+        fakeEngine.stopListeningCalled = false
+        fakeEngine.wasCancelled = false
+        // Re-set state to LISTENING since cancel after stopListening in the
+        // real controller wouldn't change state (stopListening doesn't
+        // change state), but the fake engine's stopListening doesn't
+        // trigger onResult either, so state is still LISTENING.
+        controller.cancel()
+        assert(fakeEngine.wasCancelled)
+        assert(!fakeEngine.stopListeningCalled)
+    }
+
+    @Test
+    fun `stopListening then fake onResult still delivers result and ends at IDLE`() = runTest {
+        fakeEngine.triggerResultOnNextStart = "stopped early"
+        fakeEngine.triggerResultOnStopListening = true
+        val controller = SpeechInputController(recognizerEngine = fakeEngine)
+        val results = mutableListOf<String>()
+
+        controller.startListening(onResult = { results.add(it) }, onError = {})
+        assertEquals(SpeechInputController.State.LISTENING, controller.state.value)
+
+        controller.stopListening()
+        advanceUntilIdle()
+
+        assertEquals(listOf("stopped early"), results)
         assertEquals(SpeechInputController.State.IDLE, controller.state.value)
     }
 
@@ -333,9 +392,15 @@ private class FakeSpeechRecognizerEngine : SpeechInputController.SpeechRecognize
 
     var recognitionAvailable = true
     var triggerResultOnNextStart: String? = null
+    var triggerResultOnStopListening: Boolean = false
     var triggerErrorOnNextStart: Int? = null
+    var stopListeningCalled = false
     var wasCancelled = false
     var wasDestroyedAfterUse = false
+
+    private var storedOnResult: ((String) -> Unit)? = null
+    private var storedOnError: ((String) -> Unit)? = null
+    private var storedOnEmptyResult: (() -> Unit)? = null
 
     override fun isRecognitionAvailable(): Boolean = recognitionAvailable
 
@@ -346,6 +411,12 @@ private class FakeSpeechRecognizerEngine : SpeechInputController.SpeechRecognize
         onBeginningOfSpeechCallback: () -> Unit,
         onEmptyResultCallback: () -> Unit,
     ) {
+        storedOnResult = onResultCallback
+        storedOnError = onErrorCallback
+        storedOnEmptyResult = onEmptyResultCallback
+
+        if (triggerResultOnStopListening) return
+
         val result = triggerResultOnNextStart
         val error = triggerErrorOnNextStart
 
@@ -356,7 +427,19 @@ private class FakeSpeechRecognizerEngine : SpeechInputController.SpeechRecognize
             onErrorCallback(errorCodeToMessage(error))
             wasDestroyedAfterUse = true
         }
-        // If neither is set, the engine "listens" indefinitely until cancelled
+    }
+
+    override fun stopListening() {
+        stopListeningCalled = true
+        if (triggerResultOnStopListening) {
+            val result = triggerResultOnNextStart
+            if (result != null) {
+                storedOnResult?.invoke(result)
+                wasDestroyedAfterUse = true
+            } else {
+                storedOnEmptyResult?.invoke()
+            }
+        }
     }
 
     override fun cancel() {
