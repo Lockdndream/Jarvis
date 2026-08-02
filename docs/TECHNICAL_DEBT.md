@@ -649,15 +649,20 @@ the installed OpenCode version (1.15.10):
   underlying cause is identical. Still open, still out of scope for
   finding 1's fix, which only addressed same-conversation repeat requests.
 
-  **User-proposed direction for the remaining cold-launch/backgrounding
-  race** (2026-08-02, not yet actioned): pause `WakeWordManager` entirely
-  whenever `VoiceActivity` is foregrounded and `IDLE` — not only during an
-  active voice session (the existing `pauseForVoiceSession()` scope) — so
-  a manual mic tap on a page the user is already looking at never has to
-  contend with `WakeWordManager`'s own `AudioRecord` for the microphone in
-  the first place. Plausible fix for the remaining half; not yet
-  evaluated for side effects (e.g. whether a user expects "Hey Wake Word"
-  to still work while `VoiceActivity` is open in `IDLE`) or implemented.
+  **Remaining cold-launch/backgrounding race: fix implemented 2026-08-03,
+  not yet device-verified** (`ADR-034-wakeword-pause-on-voiceactivity-foreground.md`).
+  User-proposed direction, built the same session: `WakeWordManager` now
+  pauses whenever `VoiceActivity` is foregrounded (via an OR-gate in
+  `PresenceService`'s existing pause/resume collector — see ADR-034 for
+  why this is not a direct call to `pauseForVoiceSession()` from
+  `VoiceActivity`), not only during an active voice session — so a manual
+  mic tap on a page the user is already looking at never has to contend
+  with `WakeWordManager`'s own `AudioRecord` for the microphone at all.
+  412 unit tests passing, zero regressions, but the user chose to stop
+  before device-testing this specific fix — next session should confirm
+  it actually closes the reproduced failure (manual tap after
+  backgrounding → silent 5.4s → NO_MATCH, no start earcon) before this
+  status is upgraded to Resolved.
 
 ### TD-024 — Control Center event-shape handling relies on an unenforced naming convention
 

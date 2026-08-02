@@ -459,8 +459,25 @@ class VoiceActivity : AppCompatActivity() {
         }
     }
 
+    override fun onStart() {
+        super.onStart()
+        // TD-038 (cold-launch/manual-tap half): while this screen is open,
+        // WakeWordManager's own AudioRecord has no reason to compete for
+        // the microphone — the user is already looking at the mic button.
+        // See PresenceService.voiceActivityForegrounded's doc comment for
+        // why this is a separate OR-gated signal rather than calling
+        // pauseForVoiceSession() directly from here.
+        PresenceService.voiceActivityForegrounded.value = true
+    }
+
     override fun onStop() {
         super.onStop()
+        // TD-038: only clear on a real exit, not a rotation -- otherwise
+        // the recreated instance's onStart() would race a spurious
+        // resume-then-repause of WakeWordManager on every screen rotation.
+        if (!isChangingConfigurations()) {
+            PresenceService.voiceActivityForegrounded.value = false
+        }
         // Milestone 9B.9 (Item 5): a wake-word-launched conversation is a
         // one-shot interaction — if the user leaves this screen (Home, app
         // switch) without tapping Close, nothing else will ever close the

@@ -33,10 +33,12 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -191,14 +193,17 @@ class PresenceService : Service() {
         // "while speaking": WakeWordManager needs no reference to
         // PlaybackManager/AudioFocusManager to get this right, matching
         // ADR-017 Section B/C exactly. Resume automatically once no
-        // VoiceSession is active. WakeWordManager.pauseForVoiceSession()/
-        // resumeAfterVoiceSession() are themselves idempotent no-ops from
-        // an already-correct state (verified in WakeWordManagerTest), so
-        // repeated or rapid session churn here can never desync the state
-        // machine — each call is independently safe regardless of how
-        // many times it fires or how close together.
+        // VoiceSession is active AND VoiceActivity is not foregrounded (see
+        // TD-038/voiceActivityForegrounded doc comment above -- resume only
+        // fires when neither reason to pause holds, so the two triggers
+        // structurally cannot stomp each other). WakeWordManager.
+        // pauseForVoiceSession()/resumeAfterVoiceSession() are themselves
+        // idempotent no-ops from an already-correct state (verified in
+        // WakeWordManagerTest), so repeated or rapid churn here can never
+        // desync the state machine — each call is independently safe
+        // regardless of how many times it fires or how close together.
         //
-        // distinctUntilChanged on active/inactive (not on the raw
+        // distinctUntilChanged on the combined boolean (not on the raw
         // VoiceSession, which is a data class whose `state` field changes
         // on every turn-progress update within the SAME session —
         // listening/processing/listening again) — without this, one
@@ -208,12 +213,18 @@ class PresenceService : Service() {
         // Found and fixed after independent review flagged it as real,
         // not hypothetical.
         serviceScope.launch {
-            app.voiceSessionRepository.current
-                .distinctUntilChanged { old, new -> (old != null) == (new != null) }
-                .collect { session ->
-                    if (session != null) {
+            combine(
+                app.voiceSessionRepository.current.map { it != null },
+                voiceActivityForegrounded,
+            ) { sessionActive, screenForegrounded -> sessionActive || screenForegrounded }
+                .distinctUntilChanged()
+                .collect { shouldPause ->
+                    if (shouldPause) {
                         wakeWordManager.pauseForVoiceSession()
-                        telemetry.record(TelemetryRecorder.WAKEWORD_PAUSED_FOR_VOICE_SESSION, "voiceSessionId=${session.voiceSessionId}")
+                        telemetry.record(
+                            TelemetryRecorder.WAKEWORD_PAUSED_FOR_VOICE_SESSION,
+                            "sessionActive=${app.voiceSessionRepository.current.value != null} screenForegrounded=${voiceActivityForegrounded.value}",
+                        )
                     } else {
                         wakeWordManager.resumeAfterVoiceSession()
                         telemetry.record(TelemetryRecorder.WAKEWORD_RESUMED_AFTER_VOICE_SESSION)
@@ -541,6 +552,20 @@ class PresenceService : Service() {
         @Volatile
         var wakeWordSessionId: String? = null
             private set
+
+        // TD-038 (cold-launch/manual-tap half): a manual mic tap while
+        // VoiceActivity is foregrounded has to evict WakeWordManager's own
+        // AudioRecord from the microphone, and that hand-off race is what
+        // produces "onReadyForSpeech then silence then NO_MATCH". Written
+        // from VoiceActivity.onStart()/onStop() (guarded against rotation
+        // the same way onStop()'s existing session-close logic already is);
+        // combined with voiceSessionRepository.current in the pause/resume
+        // collector below via an OR-gate, not by calling
+        // pauseForVoiceSession()/resumeAfterVoiceSession() directly from
+        // VoiceActivity -- doing so would let backgrounding mid-conversation
+        // prematurely resume wake-word listening while a real VoiceSession
+        // is still open.
+        val voiceActivityForegrounded = MutableStateFlow(false)
 
         @Volatile
         var serviceCreatedAtMs: Long? = null

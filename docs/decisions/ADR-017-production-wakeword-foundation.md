@@ -192,6 +192,11 @@ conditions, unchanged from the brief.
 
 ## References
 
+- **Amended by `ADR-034-wakeword-pause-on-voiceactivity-foreground.md`
+  (2026-08-03)**: pause/resume is no longer driven solely by
+  `VoiceSessionRepository.current` — `WakeWordManager` also pauses
+  whenever `VoiceActivity` is foregrounded, to close a real-device-found
+  microphone hand-off race (TD-038).
 - `ARCHITECTURE.md` §7 (Voice Architecture), §9 (Android Companion)
 - `SESSION.md`, Milestone 9B.5 (D5 spike, closed 2026-07-16), Milestone
   9B.6 (this decision)
