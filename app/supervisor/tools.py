@@ -624,8 +624,8 @@ class ToolRegistry:
         return "\n".join(lines)
 
     def _register_all(self) -> None:
-        self._register("get_attention", "Get summary of everything needing user attention", {"type": "object", "properties": {}, "required": []}, self._get_attention)
-        self._register("list_tasks", "List all active, waiting, and recent tasks", {"type": "object", "properties": {}, "required": []}, self._list_tasks)
+        self._register("get_attention", "Get summary of everything needing user attention. The context block already includes 'Pending questions:' and 'Pending permissions:' -- only call this if those sections are missing or you need more detail than they show.", {"type": "object", "properties": {}, "required": []}, self._get_attention)
+        self._register("list_tasks", "List all active, waiting, and recent tasks. The context block already includes 'Active tasks:' -- only call this if you need waiting/recent tasks beyond what's already shown there.", {"type": "object", "properties": {}, "required": []}, self._list_tasks)
         self._register("get_task_status", "Get detailed status for a specific task", {"type": "object", "properties": {"task_id": {"type": "string", "description": "Task ID to inspect"}}, "required": ["task_id"]}, self._get_task_status)
         self._register("get_task_result", "Get the substantive result of a completed or failed task -- what the delegated agent actually found or did, not just its status. Use this to answer follow-up questions about finished work instead of starting a new task.", {"type": "object", "properties": {"task_id": {"type": "string", "description": "Task ID to get the result for"}}, "required": ["task_id"]}, self._get_task_result)
         self._register("start_opencode_task", "Start a new OpenCode task in a safe project. NEVER accept or invent filesystem paths — always use the project_alias.", {"type": "object", "properties": {"project_alias": {"type": "string", "description": "Project alias"}, "instruction": {"type": "string", "description": "Instruction for OpenCode"}}, "required": ["project_alias", "instruction"]}, self._start_opencode_task)
@@ -633,8 +633,8 @@ class ToolRegistry:
         self._register("answer_question", "Answer a pending question", {"type": "object", "properties": {"question_id": {"type": "string", "description": "Question ID"}, "answer": {"type": "string", "description": "Answer text"}}, "required": ["question_id", "answer"]}, self._answer_question)
         self._register("resolve_permission", "Approve or reject a permission request", {"type": "object", "properties": {"permission_id": {"type": "string", "description": "Permission ID"}, "decision": {"type": "string", "enum": ["approve", "reject"], "description": "Decision"}}, "required": ["permission_id", "decision"]}, self._resolve_permission)
         self._register("cancel_task", "Cancel a running task", {"type": "object", "properties": {"task_id": {"type": "string", "description": "Task ID"}}, "required": ["task_id"]}, self._cancel_task)
-        self._register("recent_activity", "Get recent meaningful events", {"type": "object", "properties": {"count": {"type": "integer", "description": "Number of events (max 50)", "default": 5}}, "required": []}, self._recent_activity)
-        self._register("get_projects", "List configured safe project aliases", {"type": "object", "properties": {}, "required": []}, self._get_projects)
+        self._register("recent_activity", "Get recent meaningful events across all projects. The context block already includes a 'Recent activity' section -- only call this if you need more events than it shows, or a different count. For 'what happened' / 'catch me up' style questions, use catch_me_up instead -- it summarizes, this just lists raw events.", {"type": "object", "properties": {"count": {"type": "integer", "description": "Number of events (max 50)", "default": 5}}, "required": []}, self._recent_activity)
+        self._register("get_projects", "List configured safe project aliases. The context block already includes a 'Safe projects:' line -- only call this if that's missing or you need to double-check an alias.", {"type": "object", "properties": {}, "required": []}, self._get_projects)
         self._register("list_attention_requests", "List all unresolved AttentionRequests (pending/contacting/deferred/resolving)", {"type": "object", "properties": {}, "required": []}, self._list_attention_requests)
         self._register("get_attention_request", "Get full detail for a specific AttentionRequest by ID", {"type": "object", "properties": {"attention_request_id": {"type": "string", "description": "Attention request ID"}}, "required": ["attention_request_id"]}, self._get_attention_request)
         self._register("defer_attention", "Defer an AttentionRequest until a specific ISO-8601 UTC timestamp. Never answers or cancels the underlying source.", {"type": "object", "properties": {"attention_request_id": {"type": "string", "description": "Attention request ID"}, "deferred_until": {"type": "string", "description": "ISO-8601 UTC timestamp to re-contact at"}}, "required": ["attention_request_id", "deferred_until"]}, self._defer_attention)
@@ -730,7 +730,7 @@ class ToolRegistry:
         )
         self._register(
             "what_do_you_remember",
-            "List recent memories. Optionally filter to a specific project.",
+            "List facts the user explicitly asked to be remembered (via 'remember that...'), optionally filtered to a specific project. This is NOT for project activity or history -- it only returns what the user told you to remember, never task/plan results. For 'tell me about project X' or 'what did we do on project X', use catch_me_up with a project filter instead.",
             {
                 "type": "object",
                 "properties": {
@@ -746,7 +746,10 @@ class ToolRegistry:
             "Summarize what happened recently — completed/failed plans, "
             "finished tasks, and anything needing the user's attention. Use "
             "this when the user says things like 'what happened', 'catch me "
-            "up', 'what did I miss', 'status update', or similar. If the user "
+            "up', 'what did I miss', 'status update', or similar. Also use "
+            "this (with `project` set) for 'tell me about project X' or "
+            "'what's the last thing we did on project X' -- it is the "
+            "activity-history tool, not what_do_you_remember. If the user "
             "specifies a time reference (e.g. 'since yesterday', 'while I was "
             "at lunch', 'in the last hour'), resolve it yourself to an ISO "
             "8601 UTC datetime string and pass it as `since`. If you cannot "

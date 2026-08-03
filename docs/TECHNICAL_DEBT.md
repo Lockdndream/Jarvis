@@ -556,8 +556,55 @@ the installed OpenCode version (1.15.10):
   command) as a zero-tool acknowledgment rather than falling through to
   the full LLM loop. Explicit user decision this milestone: document
   only, do not fix mid-Step-5.
-- **Status**: Open, newly discovered and documented this milestone — not
-  fixed.
+- **Status**: **Fixed 2026-08-03** — prompt-engineering fix only, per the
+  explicit brief for this defect (`SYSTEM_PROMPT` in
+  `app/supervisor/supervisor.py` and tool descriptions in
+  `app/supervisor/tools.py`; no tool implementation, `MAX_TOOL_CALLS`, or
+  tool-removal changes). Root cause: Rule 6 told the model to use
+  `get_attention` "or" `list_tasks` "first" (inviting a chain), no rule
+  told the model an empty tool result was a complete answer, no rule
+  recognized a plain conversational close, and nothing told the model
+  the per-turn context block (Safe projects / Active tasks / Pending
+  questions / Pending permissions / Recent activity) already answers
+  most of what Cluster A (`catch_me_up`, `recent_activity`,
+  `list_tasks`, `what_do_you_remember`, `get_projects`) exists to fetch.
+  Reconstructing the real transcript directly from `conversations` (not
+  just the log) showed the actual failure was worse than "12 tool
+  calls": both turns exhausted `MAX_TOOL_CALLS` (a **round** counter,
+  not a raw-invocation counter — one round can carry several parallel
+  calls) without ever producing a real answer, only the generic
+  "reached the maximum number of actions" fallback, twice in a row.
+  Fix added a "Before You Call Any Tool" section (context-first check,
+  explicit zero-tool-call permission, conversational-closing
+  recognition, corrected tool-selection guidance, budget-not-target
+  framing, no-identical-repeat-call rule, empty-result-is-an-answer
+  rule) and sharpened the Cluster A tool descriptions to point back at
+  the context block. One correction made during review: the obvious
+  mapping "tell me about project X → `what_do_you_remember`" is wrong —
+  that tool only returns facts the user explicitly asked to be
+  remembered, never task/plan history; `catch_me_up` with a `project`
+  filter is what actually answers that question, confirmed by reading
+  its implementation and by every live-LLM test.
+  Verification: full suite 920 passed / `ruff check` clean / `mypy`
+  clean (no regressions — no test asserts on prompt text). Live-LLM
+  testing (real OpenRouter-backed model, isolated temp DB, `git show
+  HEAD` used to load the pre-fix prompt for comparison) against the 5
+  scenarios plus the exact two real reported messages: with the new
+  prompt, the plain decline ("No, that's all. Thank you.") produced
+  zero tool calls in every run tested (3/3), and the project-history
+  query never hit the round ceiling in any run (2-4 tool calls,
+  narrowing to 2 with a populated DB, versus the real incident's 6-7
+  calls and two ceiling hits). Honest limitation: I could not force
+  the pre-fix prompt to reproduce the original ceiling-hit failure on
+  demand today (same faithfully-seeded DB, same live model) — both old
+  and new prompts behaved acceptably in that specific replay, most
+  likely because live-model sampling isn't identical run-to-run. The
+  strongest evidence for the fix is therefore the direct database
+  reconstruction of what actually happened on 2026-07-31 (ground truth:
+  the old prompt did hit the ceiling twice, with no real answer either
+  time) plus the new prompt never once reproducing that failure across
+  every condition tested, rather than a clean controlled A/B of the
+  exact original failure.
 
 ### TD-038 — Repeated audio-focus re-requests within one conversation cause self-inflicted focus loss, and the system TTS engine independently steals focus back after speaking once
 
@@ -1115,7 +1162,7 @@ the installed OpenCode version (1.15.10):
 | TD-024 | Control Center event-shape handling relies on an unenforced naming convention | Implementation | Low |
 | TD-025 | Control Center's `currentTurn` cannot represent two concurrent turns | Architecture | Low |
 | TD-026 | `project_dir` provides no real containment; zero permission gate for sandbox escape | Operational | High (was Critical) |
-| TD-027 | Supervisor tool-calling loop repeats identical calls; doesn't recognize a plain decline | Implementation | High |
+| TD-027 | Supervisor tool-calling loop repeats identical calls; doesn't recognize a plain decline | Implementation | Resolved (2026-08-03) |
 | TD-028 | Raw audio capture has no speaker isolation; any nearby voice is transcribed as the user | Architecture | High |
 | TD-029 | Silence detection fails under ordinary ambient noise (e.g. a room fan), silently losing the recording | Architecture | **Critical** |
 
