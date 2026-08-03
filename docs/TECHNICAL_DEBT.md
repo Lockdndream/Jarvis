@@ -649,20 +649,30 @@ the installed OpenCode version (1.15.10):
   underlying cause is identical. Still open, still out of scope for
   finding 1's fix, which only addressed same-conversation repeat requests.
 
-  **Remaining cold-launch/backgrounding race: fix implemented 2026-08-03,
-  not yet device-verified** (`ADR-034-wakeword-pause-on-voiceactivity-foreground.md`).
-  User-proposed direction, built the same session: `WakeWordManager` now
-  pauses whenever `VoiceActivity` is foregrounded (via an OR-gate in
-  `PresenceService`'s existing pause/resume collector — see ADR-034 for
-  why this is not a direct call to `pauseForVoiceSession()` from
-  `VoiceActivity`), not only during an active voice session — so a manual
-  mic tap on a page the user is already looking at never has to contend
-  with `WakeWordManager`'s own `AudioRecord` for the microphone at all.
-  412 unit tests passing, zero regressions, but the user chose to stop
-  before device-testing this specific fix — next session should confirm
-  it actually closes the reproduced failure (manual tap after
-  backgrounding → silent 5.4s → NO_MATCH, no start earcon) before this
-  status is upgraded to Resolved.
+  **Remaining cold-launch/backgrounding race: fixed and device-verified
+  2026-08-03** (`ADR-034-wakeword-pause-on-voiceactivity-foreground.md`).
+  User-proposed direction: `WakeWordManager` now pauses whenever
+  `VoiceActivity` is foregrounded (via an OR-gate in `PresenceService`'s
+  existing pause/resume collector — see ADR-034 for why this is not a
+  direct call to `pauseForVoiceSession()` from `VoiceActivity`), not only
+  during an active voice session — so a manual mic tap on a page the user
+  is already looking at never has to contend with `WakeWordManager`'s own
+  `AudioRecord` for the microphone at all. Verified on-device reproducing
+  the exact prior-failing sequence: fresh app launch → cold mic tap
+  (clean capture + audible start earcon, both previously missing) →
+  background the app → `WAKEWORD_RESUMED_AFTER_VOICE_SESSION` fires →
+  return to foreground → `WAKEWORD_PAUSED_FOR_VOICE_SESSION
+  sessionActive=false screenForegrounded=true` fires → mic tap → clean
+  capture, no `NO_MATCH`. 412 unit tests passing, zero regressions.
+
+  **TD-038 is now Resolved in full** — both the mid-conversation race
+  (finding 1, `AudioFocusManager` idempotency) and the cold-launch/
+  backgrounding race (this fix) are fixed and device-verified. Finding 2
+  (`com.google.android.tts`'s independent focus grab) was never
+  separately re-confirmed after finding 1's fix and did not resurface
+  during either verification pass — left as an unconfirmed, likely-moot
+  observation rather than a still-open item, since both device sessions
+  since finding 1 landed have shown no evidence of it recurring.
 
 ### TD-024 — Control Center event-shape handling relies on an unenforced naming convention
 
